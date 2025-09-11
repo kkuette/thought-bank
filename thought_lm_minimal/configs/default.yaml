@@ -1,0 +1,69 @@
+seed: 42
+run:
+  device: auto  # auto|cuda|cpu
+  precision: bf16 # bf16|fp16|fp32
+  log_interval: 5
+  save_every: 0  # steps; 0 disables
+  save_dir: checkpoints
+  enable_tb: true
+  tb_log_dir: runs
+  run_name: default
+  tb_heatmap_max_rows: 8
+  tb_heatmap_row_scale: 20
+  tb_heatmap_col_scale: 8
+  metrics_file: metrics.jsonl
+
+data:
+  train_dir: null  # path with .txt files. If null or empty, use synthetic code samples
+  seq_len: 1024
+  batch_size: 4
+  num_workers: 1
+  synthetic_samples: 20000
+  hf_dataset:
+    name: bigcode/the-stack-smol
+    split: train
+    text_field: content
+    languages: [python]
+    streaming: true
+    shuffle_buffer: 10000
+    max_samples: null
+    filter_long: true
+
+model:
+  vocab_size: 260  # will be overridden by tokenizer size if tokenizer.kind=hf
+  d_model: 1024
+  n_layers: 8
+  n_heads: 4
+  d_ff: 2048  # ~4x d_model
+  dropout: 0.1
+  mem_dim: 64
+  max_mem: 16
+
+tokenizer:
+  kind: hf  # hf|byte
+  hf_name: codellama/CodeLlama-7b-hf
+  trust_remote_code: false
+  add_pad_if_missing: true
+
+loss:
+  r_target: 0.2   # target write rate (fraction of tokens)
+  lambda_budget: 0.1
+  lambda_pred: 0.1
+  lambda_margin: 0.1
+  k_future: 32
+  margin_delta: 0.05
+
+optim:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+  grad_clip: 1.0
+  steps: 200
+  warmup_steps: 5
+
+eval:
+  enabled: true
+  every: 50
+  max_batches: 1
+  hf_split: null
+
