@@ -1,0 +1,471 @@
+"""
+Two model variants:
+
+DeepSeekV4Mini  (single-stream, legacy)
+  Text stream only. Optional bolt-on thought memory from thought_lm_minimal.
+
+DualModalDeepSeekV4Mini  (dual-stream, recommended)
+  Text stream  [B, T, d_model]  processed by CSA/HCA blocks with mHC.
+  Thought stream [B, M, mem_dim] processed by its own CSA/HCA blocks with mHC.
+  The two streams interact at every text block via cross-modal attention
+  (text tokens read from processed thought representations).
+  After all text blocks the ThoughtStream writes a new vector to the bank,
+  triggering context-aware consolidation if the bank is full.
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .config import DeepSeekV4MiniConfig
+from .mhc import ManifoldHyperConnections, RMSNorm
+from .attention import CompressedSparseAttention, HeavilyCompressedAttention
+from .moe import DeepSeekMoE
+from .memory import ThoughtStream
+
+
+# ── Thought-memory components (ported from thought_lm_minimal) ───────────────
+
+class _MemoryCrossAttention(nn.Module):
+    """Read from a thought-vector memory bank via cross-attention."""
+
+    def __init__(self, dim: int, mem_dim: int, n_heads: int) -> None:
+        super().__init__()
+        assert dim % n_heads == 0
+        self.n_heads  = n_heads
+        self.head_dim = dim // n_heads
+        self.q  = nn.Linear(dim, dim, bias=False)
+        self.k  = nn.Linear(mem_dim, dim, bias=False)
+        self.v  = nn.Linear(mem_dim, dim, bias=False)
+        self.o  = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor, mem: Optional[torch.Tensor]) -> torch.Tensor:
+        if mem is None or mem.size(1) == 0:
+            return x
+        B, T, H = x.shape
+        M = mem.size(1)
+        scale = self.head_dim ** -0.5
+        q = self.q(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k(mem).view(B, M, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v(mem).view(B, M, self.n_heads, self.head_dim).transpose(1, 2)
+        w = F.softmax((q @ k.transpose(-2, -1)) * scale, dim=-1)
+        z = (w @ v).transpose(1, 2).contiguous().view(B, T, H)
+        return x + self.o(z)
+
+
+class _WriteGate(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.lin = nn.Linear(dim, 1, bias=True)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.lin(h))   # [B, 1]
+
+
+class _ThoughtHead(nn.Module):
+    def __init__(self, dim: int, mem_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(dim, mem_dim, bias=False)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.proj(h)                 # [B, mem_dim]
+
+
+# ── Single transformer block ──────────────────────────────────────────────────
+
+class DeepSeekV4Block(nn.Module):
+    """
+    One transformer block: two mHC-wrapped sub-layers (attention + MoE).
+    Even layer_idx → CSA; odd → HCA.
+    """
+
+    def __init__(self, cfg: DeepSeekV4MiniConfig, layer_idx: int) -> None:
+        super().__init__()
+        attn_cls = CompressedSparseAttention if layer_idx % 2 == 0 else HeavilyCompressedAttention
+
+        # Build attention sub-layer
+        if layer_idx % 2 == 0:
+            attn = attn_cls(
+                d_model=cfg.d_model, n_heads=cfg.n_heads, d_head=cfg.d_head,
+                csa_m=cfg.csa_m, top_k=cfg.top_k_csa, n_win=cfg.n_win,
+                d_latent_q=cfg.d_latent_q, n_groups=cfg.n_groups,
+                dropout=cfg.dropout,
+            )
+        else:
+            attn = attn_cls(
+                d_model=cfg.d_model, n_heads=cfg.n_heads, d_head=cfg.d_head,
+                hca_m=cfg.hca_m, n_win=cfg.n_win,
+                d_latent_q=cfg.d_latent_q, n_groups=cfg.n_groups,
+                dropout=cfg.dropout,
+            )
+
+        moe = DeepSeekMoE(
+            d_model=cfg.d_model, n_experts=cfg.n_experts,
+            n_shared=cfg.n_shared, top_k_experts=cfg.top_k_experts,
+            d_ff=cfg.d_ff, dropout=cfg.dropout,
+        )
+
+        self.norm_attn = RMSNorm(cfg.d_model)
+        self.norm_moe  = RMSNorm(cfg.d_model)
+
+        # Each sub-layer gets its own mHC wrapper
+        self.mhc_attn = ManifoldHyperConnections(cfg.d_model, cfg.n_hc, cfg.sinkhorn_iters)
+        self.mhc_moe  = ManifoldHyperConnections(cfg.d_model, cfg.n_hc, cfg.sinkhorn_iters)
+
+        self._attn = attn
+        self._moe  = moe
+
+    def forward(self, X: torch.Tensor):
+        """
+        X: [B, T, n_hc, d_model]
+        Returns: (X_new [B, T, n_hc, d_model], balance_loss scalar)
+        """
+        # Attention sub-layer
+        X = self.mhc_attn(X, lambda h: self._attn(self.norm_attn(h)))
+
+        # MoE sub-layer
+        bal = torch.zeros((), device=X.device)
+
+        def _moe_fn(h: torch.Tensor):
+            nonlocal bal
+            out, bl = self._moe(self.norm_moe(h))
+            bal = bl
+            return out
+
+        X = self.mhc_moe(X, _moe_fn)
+        return X, bal
+
+
+# ── Full model ────────────────────────────────────────────────────────────────
+
+class DeepSeekV4Mini(nn.Module):
+    """
+    Small DeepSeek-V4 reproduction with optional thought memory.
+
+    Forward pass returns a dict:
+      logits          [B, T, vocab_size]
+      balance_loss    scalar  – MoE load balancing auxiliary
+      mem_bank        [B, M, mem_dim] | None  – thought memory carry-out
+      p_gates         [B, T]  – thought write probability (if use_thought_memory)
+    """
+
+    def __init__(self, cfg: DeepSeekV4MiniConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+
+        # Token embedding
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.drop  = nn.Dropout(cfg.dropout)
+
+        # Transformer blocks
+        self.blocks = nn.ModuleList(
+            [DeepSeekV4Block(cfg, i) for i in range(cfg.n_layers)]
+        )
+
+        # Output projection: collapses n_hc streams → 1 (learned mixture)
+        # A_out ∈ R^{n_hc} (sigmoid-constrained, same spirit as mHC output mapping)
+        self.A_out = nn.Parameter(torch.ones(cfg.n_hc) / cfg.n_hc)
+        self.norm_out = RMSNorm(cfg.d_model)
+
+        # LM head (tied to embedding by default for smaller param count)
+        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight   # weight tying
+
+        # ── Optional thought memory ───────────────────────────────────────────
+        if cfg.use_thought_memory:
+            self.mem_attn  = _MemoryCrossAttention(cfg.d_model, cfg.mem_dim, cfg.n_heads)
+            self.gate      = _WriteGate(cfg.d_model)
+            self.thought   = _ThoughtHead(cfg.d_model, cfg.mem_dim)
+            self.norm_mem  = RMSNorm(cfg.d_model)
+
+    # ── Forward ───────────────────────────────────────────────────────────────
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        init_mem: Optional[torch.Tensor] = None,
+    ) -> dict:
+        B, T = input_ids.shape
+        cfg  = self.cfg
+
+        # 1. Embed → broadcast across n_hc streams
+        h = self.drop(self.embed(input_ids))              # [B, T, d]
+        X = h.unsqueeze(2).expand(-1, -1, cfg.n_hc, -1).contiguous()  # [B, T, n_hc, d]
+
+        # 2. Transformer blocks
+        total_balance = torch.zeros((), device=X.device)
+        for block in self.blocks:
+            X, bal = block(X)
+            total_balance = total_balance + bal
+        total_balance = total_balance / cfg.n_layers
+
+        # 3. Collapse n_hc → d via learned output weights
+        A = torch.sigmoid(self.A_out)                     # [n_hc]
+        H = torch.einsum("n,btnD->btD", A, X.reshape(B, T, cfg.n_hc, cfg.d_model))
+        # Equivalent: (A[None,None,:,None] * X).sum(dim=2)
+        H = self.norm_out(H)                              # [B, T, d]
+
+        # 4. Thought memory augmentation (sequential, causal)
+        p_gates  = None
+        mem_bank = init_mem
+
+        if cfg.use_thought_memory:
+            logits_list, p_list, mem_list = [], [], []
+            for t in range(T):
+                h_t = H[:, t:t+1, :]                     # [B, 1, d]
+                h_aug = self.mem_attn(h_t, mem_bank)      # [B, 1, d]
+                logits_list.append(self.lm_head(h_aug))   # [B, 1, V]
+                p_t   = self.gate(h_aug.squeeze(1))       # [B, 1]
+                m_t   = self.thought(h_aug.squeeze(1))    # [B, mem_dim]
+                p_list.append(p_t)
+                m_write = (p_t * m_t).unsqueeze(1)        # [B, 1, mem_dim]
+                mem_list.append(m_write)
+                mem_bank = m_write if mem_bank is None else torch.cat([mem_bank, m_write], dim=1)
+                if mem_bank.size(1) > cfg.max_mem:
+                    mem_bank = mem_bank[:, -cfg.max_mem:]
+
+            logits  = torch.cat(logits_list, dim=1)       # [B, T, V]
+            p_gates = torch.cat(p_list, dim=1).squeeze(-1)  # [B, T]
+        else:
+            logits = self.lm_head(H)                      # [B, T, V]
+
+        return {
+            "logits":       logits,
+            "balance_loss": total_balance,
+            "mem_bank":     mem_bank,
+            "p_gates":      p_gates,
+        }
+
+    # ── Convenience ───────────────────────────────────────────────────────────
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    @classmethod
+    def from_config(cls, cfg: DeepSeekV4MiniConfig) -> "DeepSeekV4Mini":
+        return cls(cfg)
+
+
+# ── Dual-stream text block ────────────────────────────────────────────────────
+
+class DualModalBlock(nn.Module):
+    """
+    Text transformer block with cross-modal injection from the thought stream.
+
+    Forward:
+      1. mHC(CSA or HCA)  – text self-attention
+      2. Cross-modal       – each text token attends to thought representations
+                             (standard cross-attention; M ≤ max_mem so cheap)
+      3. mHC(MoE)          – text FFN
+
+    The cross-modal is placed BETWEEN the attention and FFN sub-layers so that
+    thought context can influence how the FFN routes tokens.
+    The thought representations H_thought are injected as a gated residual
+    distributed uniformly across the n_hc residual streams.
+    """
+
+    def __init__(self, cfg: DeepSeekV4MiniConfig, layer_idx: int) -> None:
+        super().__init__()
+        d    = cfg.d_model
+        n_hc = cfg.n_hc
+
+        if layer_idx % 2 == 0:
+            attn: nn.Module = CompressedSparseAttention(
+                d_model=d, n_heads=cfg.n_heads, d_head=cfg.d_head,
+                csa_m=cfg.csa_m, top_k=cfg.top_k_csa, n_win=cfg.n_win,
+                d_latent_q=cfg.d_latent_q, n_groups=cfg.n_groups,
+                dropout=cfg.dropout,
+            )
+        else:
+            attn = HeavilyCompressedAttention(
+                d_model=d, n_heads=cfg.n_heads, d_head=cfg.d_head,
+                hca_m=cfg.hca_m, n_win=cfg.n_win,
+                d_latent_q=cfg.d_latent_q, n_groups=cfg.n_groups,
+                dropout=cfg.dropout,
+            )
+
+        moe = DeepSeekMoE(
+            d_model=d, n_experts=cfg.n_experts, n_shared=cfg.n_shared,
+            top_k_experts=cfg.top_k_experts, d_ff=cfg.d_ff, dropout=cfg.dropout,
+        )
+
+        self.norm_attn = RMSNorm(d)
+        self.norm_moe  = RMSNorm(d)
+        self.mhc_attn  = ManifoldHyperConnections(d, n_hc, cfg.sinkhorn_iters)
+        self.mhc_moe   = ManifoldHyperConnections(d, n_hc, cfg.sinkhorn_iters)
+        self._attn = attn
+        self._moe  = moe
+
+        # Cross-modal: text [B,T,d] reads from thought [B,M,mem_dim]
+        # Standard multi-head cross-attention (M is small)
+        assert d % cfg.n_heads == 0
+        self.cross_q    = nn.Linear(d, d, bias=False)
+        self.cross_k    = nn.Linear(cfg.mem_dim, d, bias=False)
+        self.cross_v    = nn.Linear(cfg.mem_dim, d, bias=False)
+        self.cross_o    = nn.Linear(d, d, bias=False)
+        self.norm_cross = RMSNorm(d)
+        self.n_heads    = cfg.n_heads
+        self.head_dim   = d // cfg.n_heads
+
+        # Learned weights for collapsing n_hc → d before cross-modal
+        self.A_cross = nn.Parameter(torch.ones(n_hc) / n_hc)
+
+    def _cross_modal(
+        self, h: torch.Tensor, H_thought: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        h         : [B, T, d]  – current text representations
+        H_thought : [B, M, mem_dim]
+        Returns   : [B, T, d]  – augmented text (residual added inside)
+        """
+        B, T, d = h.shape
+        M = H_thought.size(1)
+        nh, hd = self.n_heads, self.head_dim
+        scale  = hd ** -0.5
+
+        q = self.cross_q(h).view(B, T, nh, hd).transpose(1, 2)      # [B,nh,T,hd]
+        k = self.cross_k(H_thought).view(B, M, nh, hd).transpose(1, 2)  # [B,nh,M,hd]
+        v = self.cross_v(H_thought).view(B, M, nh, hd).transpose(1, 2)
+
+        w = F.softmax((q @ k.transpose(-2, -1)) * scale, dim=-1)     # [B,nh,T,M]
+        z = (w @ v).transpose(1, 2).contiguous().view(B, T, d)
+        return h + self.cross_o(z)
+
+    def forward(
+        self, X: torch.Tensor, H_thought: Optional[torch.Tensor]
+    ):
+        """
+        X         : [B, T, n_hc, d_model]
+        H_thought : [B, M, mem_dim] or None
+        Returns   : (X_new, balance_loss)
+        """
+        # 1. Text self-attention (mHC wrapped)
+        X = self.mhc_attn(X, lambda h: self._attn(self.norm_attn(h)))
+
+        # 2. Cross-modal injection (thought → text)
+        if H_thought is not None:
+            B, T, n_hc, d = X.shape
+            # Extract a representative text hidden state from the n_hc streams
+            A  = torch.sigmoid(self.A_cross)                          # [n_hc]
+            h  = (A.view(1, 1, n_hc, 1) * X).sum(dim=2)             # [B, T, d]
+            h  = self._cross_modal(self.norm_cross(h), H_thought)     # [B, T, d]
+            # Distribute the cross-modal delta back across all n_hc streams
+            delta = h - (A.view(1, 1, n_hc, 1) * X).sum(dim=2)      # [B, T, d]
+            X = X + delta.unsqueeze(2)                                # broadcast
+
+        # 3. MoE (mHC wrapped)
+        bal = torch.zeros((), device=X.device)
+
+        def _moe_fn(h: torch.Tensor) -> torch.Tensor:
+            nonlocal bal
+            out, bl = self._moe(self.norm_moe(h))
+            bal = bl
+            return out
+
+        X = self.mhc_moe(X, _moe_fn)
+        return X, bal
+
+
+# ── Dual-stream model ─────────────────────────────────────────────────────────
+
+class DualModalDeepSeekV4Mini(nn.Module):
+    """
+    Dual-stream architecture: text and thought streams both using CSA/HCA.
+
+    Forward flow
+    ────────────
+    1. Thought stream processes the current mem_bank → H_thought [B,M,mem_dim]
+       (if bank is empty, H_thought = None and we skip cross-modal).
+    2. Text blocks process input tokens; at each block the cross-modal reads
+       H_thought so every layer is aware of the current thought context.
+    3. After all text blocks, ThoughtStream.forward writes a new thought vector,
+       triggering context-aware consolidation if max_mem is reached.
+    4. LM head produces logits from the final text hidden states.
+
+    The bank is returned as mem_bank and should be passed back as init_mem on
+    the next forward call for multi-turn / streaming generation.
+
+    Returns a dict:
+      logits        [B, T, vocab_size]
+      balance_loss  scalar – combined text + thought MoE auxiliary loss
+      mem_bank      [B, M', mem_dim] – updated bank (M' ≤ max_mem)
+    """
+
+    def __init__(self, cfg: DeepSeekV4MiniConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.drop  = nn.Dropout(cfg.dropout)
+
+        self.blocks = nn.ModuleList(
+            [DualModalBlock(cfg, i) for i in range(cfg.n_layers)]
+        )
+
+        # Collapse mHC residual stream → [B, T, d_model]
+        self.A_out    = nn.Parameter(torch.ones(cfg.n_hc) / cfg.n_hc)
+        self.norm_out = RMSNorm(cfg.d_model)
+
+        # LM head (weight-tied to embedding)
+        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight
+
+        # Thought stream
+        self.thought_stream = ThoughtStream(cfg)
+
+    # ── Forward ───────────────────────────────────────────────────────────────
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        init_mem: Optional[torch.Tensor] = None,
+    ) -> dict:
+        B, T  = input_ids.shape
+        cfg   = self.cfg
+        n_hc  = cfg.n_hc
+
+        # ── Step 1: process existing thought bank (runs before text blocks) ───
+        # This gives H_thought [B, M, mem_dim] for cross-modal injection.
+        # Also writes one new thought + consolidates if needed.
+        # Note: we pass a dummy H_text (zeros) for the thought→text cross-modal
+        # here because text hasn't been processed yet; the real injection happens
+        # *inside* the text blocks (text←thought direction).
+        # The thought stream will be called again after text blocks to write.
+        H_thought_pre: Optional[torch.Tensor] = None
+        if init_mem is not None and init_mem.size(1) > 0:
+            # Only process (no write) to get H_thought for cross-modal
+            H_thought_pre, _, _ = self.thought_stream._process_only(init_mem)
+
+        # ── Step 2: embed text and run dual-modal text blocks ─────────────────
+        h = self.drop(self.embed(input_ids))                               # [B,T,d]
+        X = h.unsqueeze(2).expand(-1, -1, n_hc, -1).contiguous()          # [B,T,n_hc,d]
+
+        total_bal = torch.zeros((), device=X.device)
+        for block in self.blocks:
+            X, bal = block(X, H_thought_pre)
+            total_bal = total_bal + bal
+        total_bal = total_bal / cfg.n_layers
+
+        # ── Step 3: collapse mHC → text hidden states ─────────────────────────
+        A = torch.sigmoid(self.A_out)
+        H_text = (A.view(1, 1, n_hc, 1) * X).sum(dim=2)                  # [B,T,d]
+        H_text = self.norm_out(H_text)
+
+        # ── Step 4: thought stream write + consolidation ───────────────────────
+        _, mem_bank, thought_bal = self.thought_stream(H_text, init_mem)
+        total_bal = total_bal + thought_bal
+
+        # ── Step 5: LM head ───────────────────────────────────────────────────
+        logits = self.lm_head(H_text)                                      # [B,T,V]
+
+        return {
+            "logits":       logits,
+            "balance_loss": total_bal,
+            "mem_bank":     mem_bank,
+        }
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
