@@ -1,0 +1,64 @@
+# DeepSeekV4Mini – small config (~50M params, single RTX 3090)
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/small.yaml
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+vocab_size: 50257
+d_model: 256
+n_layers: 6              # 3 CSA (layers 0,2,4) + 3 HCA (layers 1,3,5)
+n_heads: 4
+d_head: 64
+dropout: 0.05
+max_seq_len: 2048
+
+# mHC
+n_hc: 2
+sinkhorn_iters: 5
+
+# Attention
+csa_m: 4
+hca_m: 32
+top_k_csa: 8
+n_win: 16
+d_latent_q: 64
+n_groups: 2
+
+# MoE
+n_experts: 8
+n_shared: 1
+top_k_experts: 2
+d_ff: 512
+
+# Thought memory
+use_thought_memory: true
+mem_dim: 64
+max_mem: 32
+
+# Auxiliary loss weight
+balance_loss_weight: 1.0e-3
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  device: auto
+  seed: 42
+  tokenizer: gpt2
+  lr: 2.0e-4
+  weight_decay: 0.1
+  steps: 50000
+  warmup_steps: 500
+  grad_clip: 1.0
+  precision: bf16
+  log_every: 100
+  save_every: 5000
+  save_dir: checkpoints/small
+  run_name: dsv4mini_small
+  tb_dir: runs
+  tensorboard: true
+  metrics_file: runs/dsv4mini_small/metrics.jsonl
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  name: roneneldan/TinyStories
+  text_field: text
+  split: train
+  seq_len: 2048
+  batch_size: 4
