@@ -1,21 +1,27 @@
 """
-Memory bank diagnostic for DualModalDeepSeekV4Mini.
+Architecture comparison: DeepSeekV4Mini (no bank) vs DualModalDeepSeekV4Mini (with bank).
 
-Measures:
-  1. PPL delta  — perplexity with_memory vs no_memory across successive chunks
-  2. Write gate — are thought vectors actually written (gate near 1) or suppressed?
-  3. Bank norms — are thought vectors non-trivial or near zero?
-  4. Diversity  — mean pairwise cosine sim within bank (low = diverse = good)
-  5. Logit drift — how much do logits shift when memory is provided vs not?
-  6. Consolidation events
+Measures per chunk of text:
+  - PPL (no_mem)      : DualModal with init_mem=None each chunk (no carry-over)
+  - PPL (with_mem)    : DualModal with accumulated memory bank (carry-over)
+  - PPL (no_bank)     : baseline DeepSeekV4Mini (no memory at all)
+  - logit_drift       : ||logits_with_mem - logits_no_mem||  per token
+  - bank diagnostics  : size, vector norms, intra-bank cosine similarity
 
 Usage:
-    python -m deepseek_v4_mini.eval_memory [config.yaml] [checkpoint.pt]
+    # Random weights (mechanism test):
+    python -m deepseek_v4_mini.eval_memory
 
-Without a checkpoint, runs on random weights to verify the mechanism works.
+    # With checkpoints (both architectures trained separately):
+    python -m deepseek_v4_mini.eval_memory \\
+        --cfg_mem  deepseek_v4_mini/configs/tiny_with_mem.yaml \\
+        --cfg_base deepseek_v4_mini/configs/tiny_no_mem.yaml \\
+        --ckpt_mem checkpoints/tiny_with_mem/final.pt \\
+        --ckpt_base checkpoints/tiny_no_mem/final.pt
 """
 from __future__ import annotations
 
+import argparse
 import math
 import sys
 from pathlib import Path
@@ -25,10 +31,10 @@ import torch
 import torch.nn.functional as F
 
 from .config import DeepSeekV4MiniConfig
-from .model import DualModalDeepSeekV4Mini
+from .model import DeepSeekV4Mini, DualModalDeepSeekV4Mini
 
 
-# ── Synthetic text (always available, no external deps needed) ────────────────
+# ── Synthetic text ────────────────────────────────────────────────────────────
 
 _SYNTHETIC = (
     "The capital of France is Paris. Paris is known for the Eiffel Tower. "
@@ -41,20 +47,17 @@ _SYNTHETIC = (
     "France is also famous for its cuisine and wine production. "
     "The capital of France is Paris, a major European hub. "
     "The Eiffel Tower in Paris receives millions of tourists every year. "
-) * 8   # repeat to give the model multiple chunks to process
+) * 8
 
 
-# ── Hooks ─────────────────────────────────────────────────────────────────────
+# ── Write-gate capture ────────────────────────────────────────────────────────
 
 class _WriteGateCapture:
-    """Register a hook on ThoughtStream.write_gate to capture sigmoid outputs."""
-
     def __init__(self, thought_stream) -> None:
         self.values: list[float] = []
         self._h = thought_stream.write_gate.register_forward_hook(self._hook)
 
     def _hook(self, module, inp, out):
-        # out is the raw linear output; sigmoid is applied afterwards in _new_thought
         p = torch.sigmoid(out).detach().float()
         self.values.append(float(p.mean()))
 
@@ -68,239 +71,313 @@ class _WriteGateCapture:
         self.values.clear()
 
 
-# ── Tokenisation (minimal, char-level fallback if no transformers) ────────────
+# ── Tokenisation ──────────────────────────────────────────────────────────────
 
 def _tokenise(text: str, vocab_size: int) -> torch.LongTensor:
     try:
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained("gpt2")
         ids = tok.encode(text)
-        # Clip any id that exceeds the model's vocab (e.g. tiny uses 32k, gpt2 has 50k)
         ids = [min(i, vocab_size - 1) for i in ids]
     except Exception:
         ids = [ord(c) % vocab_size for c in text]
     return torch.tensor(ids, dtype=torch.long)
 
 
-# ── Core evaluation ───────────────────────────────────────────────────────────
-
-@torch.no_grad()
-def evaluate(
-    model: DualModalDeepSeekV4Mini,
-    tokens: torch.LongTensor,
-    seq_len: int,
-    device: torch.device,
-) -> dict:
-    """
-    Process `tokens` in non-overlapping chunks of `seq_len`.
-
-    Returns a dict of per-chunk statistics:
-      ppl_with_mem   perplexity using memory from previous chunk
-      ppl_no_mem     perplexity with fresh start (no memory)
-      logit_drift    mean L2 distance between logits with / without memory
-      bank_size      how many slots are in the bank at end of each chunk
-      bank_norm_mean mean L2 norm of thought vectors in the bank
-      bank_diversity mean pairwise cosine similarity within the bank (lower = more diverse)
-      write_gate     mean write-gate probability
-    """
-    model.eval()
-    tokens = tokens.to(device)
-
-    n_chunks = (len(tokens) - 1) // seq_len
-    if n_chunks < 2:
-        raise ValueError(f"Need at least 2 chunks; got {n_chunks} (seq_len={seq_len}, tokens={len(tokens)})")
-
-    gate_capture = _WriteGateCapture(model.thought_stream)
-
-    records: list[dict] = []
-    mem_bank: Optional[torch.Tensor] = None   # carry-over bank
-
-    for i in range(n_chunks):
-        start = i * seq_len
-        x = tokens[start : start + seq_len].unsqueeze(0)          # [1, T]
-        y = tokens[start + 1 : start + seq_len + 1].unsqueeze(0)  # [1, T]
-
-        # ── Pass WITH memory from previous chunk ──────────────────────────────
-        gate_capture.reset()
-        out_mem  = model(x, init_mem=mem_bank)
-        gate_mem = gate_capture.mean()
-
-        ppl_with = _ppl(out_mem["logits"], y)
-        new_bank  = out_mem["mem_bank"]
-
-        # ── Pass WITHOUT memory (fresh start) ────────────────────────────────
-        gate_capture.reset()
-        out_nomem = model(x, init_mem=None)
-
-        ppl_no   = _ppl(out_nomem["logits"], y)
-
-        # ── Logit drift ───────────────────────────────────────────────────────
-        drift = (out_mem["logits"] - out_nomem["logits"]).norm(dim=-1).mean().item()
-
-        # ── Bank diagnostics ──────────────────────────────────────────────────
-        bank_size, norm_mean, diversity = _bank_stats(new_bank)
-
-        records.append({
-            "chunk":         i,
-            "ppl_with_mem":  ppl_with,
-            "ppl_no_mem":    ppl_no,
-            "ppl_delta":     ppl_no - ppl_with,   # positive = memory helps
-            "logit_drift":   drift,
-            "bank_size":     bank_size,
-            "bank_norm":     norm_mean,
-            "bank_diversity": diversity,
-            "write_gate":    gate_mem,
-        })
-
-        mem_bank = new_bank   # carry the bank forward
-
-    gate_capture.remove()
-    return records
-
+# ── Per-chunk helpers ─────────────────────────────────────────────────────────
 
 def _ppl(logits: torch.Tensor, targets: torch.LongTensor) -> float:
-    """Cross-entropy → perplexity."""
     B, T, V = logits.shape
     ce = F.cross_entropy(logits.reshape(B * T, V), targets.reshape(B * T))
-    return float(math.exp(min(float(ce), 20)))   # cap at e^20 for sanity
+    return float(math.exp(min(float(ce), 20)))
 
 
 def _bank_stats(bank: Optional[torch.Tensor]):
     """Returns (size, mean_norm, mean_cosine_similarity)."""
     if bank is None or bank.size(1) == 0:
         return 0, 0.0, 0.0
-    bank = bank[0].float()      # [M, mem_dim]
-    M    = bank.size(0)
+    bank = bank[0].float()
+    M = bank.size(0)
     norm_mean = float(bank.norm(dim=-1).mean())
-
     if M < 2:
         return M, norm_mean, 0.0
-
-    # Pairwise cosine similarity
-    normed = F.normalize(bank, dim=-1)            # [M, mem_dim]
-    sim    = normed @ normed.T                    # [M, M]
-    mask   = ~torch.eye(M, dtype=torch.bool, device=sim.device)
-    diversity = float(sim[mask].mean())           # lower = more diverse
-
-    return M, norm_mean, diversity
+    normed = F.normalize(bank, dim=-1)
+    sim = normed @ normed.T
+    mask = ~torch.eye(M, dtype=torch.bool, device=sim.device)
+    return M, norm_mean, float(sim[mask].mean())
 
 
-# ── Pretty printing ───────────────────────────────────────────────────────────
+# ── Core evaluation ───────────────────────────────────────────────────────────
 
-def _print_report(records: list[dict], cfg: DeepSeekV4MiniConfig) -> None:
-    print("\n" + "="*72)
-    print(" Memory Bank Diagnostic Report")
-    print("="*72)
-    print(f" Model: DualModalDeepSeekV4Mini  |  max_mem={cfg.max_mem}  "
-          f"consolidate_k={cfg.consolidate_k}  mem_dim={cfg.mem_dim}")
-    print("-"*72)
+@torch.no_grad()
+def evaluate(
+    dual_model: DualModalDeepSeekV4Mini,
+    base_model: Optional[DeepSeekV4Mini],
+    tokens: torch.LongTensor,
+    seq_len: int,
+    device: torch.device,
+) -> list[dict]:
+    """
+    Process tokens in non-overlapping chunks of seq_len.
 
-    header = (
-        f"{'Chunk':>5}  {'PPL(mem)':>9}  {'PPL(no)':>8}  "
-        f"{'Δ PPL':>7}  {'Drift':>6}  "
-        f"{'Bank':>4}  {'Norm':>6}  {'Sim↓':>6}  {'Gate':>6}"
-    )
-    print(header)
-    print("-"*72)
+    For each chunk records:
+      ppl_with_mem    DualModal with accumulated bank
+      ppl_no_mem      DualModal cold-start (no bank)
+      ppl_no_bank     baseline DeepSeekV4Mini (if provided)
+      logit_drift     mean L2 between with/without memory logits
+      bank_size / bank_norm / bank_diversity  memory bank health
+      write_gate      mean write-gate probability
+    """
+    dual_model.eval()
+    if base_model is not None:
+        base_model.eval()
+    tokens = tokens.to(device)
 
-    for r in records:
-        delta_str = f"{r['ppl_delta']:+.2f}"
-        print(
-            f"{r['chunk']:>5}  {r['ppl_with_mem']:>9.2f}  {r['ppl_no_mem']:>8.2f}  "
-            f"{delta_str:>7}  {r['logit_drift']:>6.3f}  "
-            f"{r['bank_size']:>4}  {r['bank_norm']:>6.3f}  "
-            f"{r['bank_diversity']:>6.3f}  {r['write_gate']:>6.3f}"
+    n_chunks = (len(tokens) - 1) // seq_len
+    if n_chunks < 2:
+        raise ValueError(
+            f"Need at least 2 chunks; got {n_chunks} (seq_len={seq_len}, tokens={len(tokens)})"
         )
 
-    print("-"*72)
+    gate_capture = _WriteGateCapture(dual_model.thought_stream)
+    records: list[dict] = []
+    mem_bank: Optional[torch.Tensor] = None
 
-    # Summary stats
-    ppl_deltas   = [r["ppl_delta"] for r in records[1:]]   # skip first (no prior mem)
-    drifts       = [r["logit_drift"] for r in records]
-    norms        = [r["bank_norm"] for r in records]
-    gates        = [r["write_gate"] for r in records]
-    diversities  = [r["bank_diversity"] for r in records if r["bank_size"] >= 2]
+    for i in range(n_chunks):
+        start = i * seq_len
+        x = tokens[start : start + seq_len].unsqueeze(0)
+        y = tokens[start + 1 : start + seq_len + 1].unsqueeze(0)
 
-    print(f"\n Chunks evaluated    : {len(records)}")
-    print(f" Mean PPL delta      : {_mean(ppl_deltas):+.3f}  "
-          f"({'memory helps' if _mean(ppl_deltas) > 0 else 'memory hurts / neutral'} on untrained model)")
-    print(f" Mean logit drift    : {_mean(drifts):.4f}  "
-          f"({'memory influences predictions' if _mean(drifts) > 0.01 else 'memory has little effect'})")
-    print(f" Mean bank norm      : {_mean(norms):.4f}  "
-          f"({'active' if _mean(norms) > 0.05 else 'near-zero — check write gate'})")
-    print(f" Mean write gate     : {_mean(gates):.4f}  "
-          f"({'writing' if _mean(gates) > 0.3 else 'suppressed — model not writing'})")
-    print(f" Mean intra-bank sim : {_mean(diversities):.4f}  "
-          f"({'diverse' if _mean(diversities) < 0.7 else 'redundant slots'})")
+        # DualModal — with accumulated memory
+        gate_capture.reset()
+        out_mem  = dual_model(x, init_mem=mem_bank)
+        ppl_with = _ppl(out_mem["logits"], y)
+        new_bank  = out_mem["mem_bank"]
+        gate_val  = gate_capture.mean()
 
-    # Consolidation count
-    max_size = max(r["bank_size"] for r in records) if records else 0
-    n_consol  = sum(1 for i in range(1, len(records))
-                    if records[i]["bank_size"] <= records[i-1]["bank_size"])
-    print(f" Peak bank size      : {max_size}  (max_mem={cfg.max_mem})")
-    print(f" Consolidation events: {n_consol}")
+        # DualModal — cold start (no memory)
+        out_cold = dual_model(x, init_mem=None)
+        ppl_cold = _ppl(out_cold["logits"], y)
 
-    print("="*72)
+        # Logit drift: how much does the memory change predictions?
+        drift = (out_mem["logits"] - out_cold["logits"]).norm(dim=-1).mean().item()
+
+        # Baseline: DeepSeekV4Mini (no bank at all)
+        ppl_base = None
+        if base_model is not None:
+            out_base = base_model(x)
+            ppl_base = _ppl(out_base["logits"], y)
+
+        # Bank diagnostics
+        bank_size, norm_mean, diversity = _bank_stats(new_bank)
+
+        records.append({
+            "chunk":          i,
+            "ppl_with_mem":   ppl_with,
+            "ppl_no_mem":     ppl_cold,
+            "ppl_delta":      ppl_cold - ppl_with,
+            "ppl_no_bank":    ppl_base,
+            "logit_drift":    drift,
+            "bank_size":      bank_size,
+            "bank_norm":      norm_mean,
+            "bank_diversity": diversity,
+            "write_gate":     gate_val,
+        })
+
+        mem_bank = new_bank
+
+    gate_capture.remove()
+    return records
+
+
+# ── Reporting ─────────────────────────────────────────────────────────────────
+
+def _mean(xs: list) -> float:
+    xs = [v for v in xs if v is not None]
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _print_report(
+    records: list[dict],
+    dual_cfg: DeepSeekV4MiniConfig,
+    dual_params: int,
+    base_params: Optional[int],
+) -> None:
+    has_base = records[0]["ppl_no_bank"] is not None
+
+    print("\n" + "=" * 76)
+    print("  Architecture Comparison: DeepSeekV4Mini vs DualModalDeepSeekV4Mini")
+    print("=" * 76)
+    print(
+        f"  DualModal  : {dual_params:,} params  |  max_mem={dual_cfg.max_mem}"
+        f"  consolidate_k={dual_cfg.consolidate_k}  mem_dim={dual_cfg.mem_dim}"
+    )
+    if base_params is not None:
+        print(f"  Baseline   : {base_params:,} params  (no memory bank)")
+    print("-" * 76)
+
+    # Header
+    base_col = f"{'PPL(base)':>10}" if has_base else ""
+    print(
+        f"{'Chunk':>5}  {'PPL(mem)':>9}  {'PPL(cold)':>9}  "
+        f"{'ΔPPL':>7}  {base_col}  "
+        f"{'Drift':>6}  {'Bank':>4}  {'Norm':>6}  {'Sim↓':>6}  {'Gate':>6}"
+    )
+    print("-" * 76)
+
+    for r in records:
+        base_str = f"{r['ppl_no_bank']:>10.2f}" if has_base and r["ppl_no_bank"] is not None else " " * (10 if has_base else 0)
+        print(
+            f"{r['chunk']:>5}  {r['ppl_with_mem']:>9.2f}  {r['ppl_no_mem']:>9.2f}  "
+            f"{r['ppl_delta']:>+7.2f}  {base_str}  "
+            f"{r['logit_drift']:>6.3f}  {r['bank_size']:>4}  "
+            f"{r['bank_norm']:>6.3f}  {r['bank_diversity']:>6.3f}  {r['write_gate']:>6.3f}"
+        )
+
+    print("-" * 76)
+
+    ppl_deltas  = [r["ppl_delta"]   for r in records[1:]]
+    drifts      = [r["logit_drift"] for r in records]
+    norms       = [r["bank_norm"]   for r in records]
+    gates       = [r["write_gate"]  for r in records]
+    divs        = [r["bank_diversity"] for r in records if r["bank_size"] >= 2]
+    ppls_base   = [r["ppl_no_bank"] for r in records if r["ppl_no_bank"] is not None]
+    ppls_mem    = [r["ppl_with_mem"] for r in records]
+
+    print(f"\n  Chunks evaluated      : {len(records)}")
+    print(
+        f"  Mean PPL (with mem)   : {_mean(ppls_mem):.2f}  vs  "
+        f"cold-start {_mean([r['ppl_no_mem'] for r in records]):.2f}"
+        + (f"  vs  no-bank {_mean(ppls_base):.2f}" if has_base else "")
+    )
+    print(
+        f"  Mean PPL delta (mem)  : {_mean(ppl_deltas):+.3f}  "
+        f"({'memory helps' if _mean(ppl_deltas) > 0 else 'memory hurts / neutral'})"
+    )
+    print(
+        f"  Mean logit drift      : {_mean(drifts):.4f}  "
+        f"({'memory influences predictions' if _mean(drifts) > 0.01 else 'marginal effect'})"
+    )
+    print(
+        f"  Mean bank norm        : {_mean(norms):.4f}  "
+        f"({'active' if _mean(norms) > 0.05 else 'near-zero — check write gate'})"
+    )
+    print(
+        f"  Mean write gate       : {_mean(gates):.4f}  "
+        f"({'writing' if _mean(gates) > 0.3 else 'suppressed'})"
+    )
+    print(
+        f"  Mean intra-bank sim   : {_mean(divs):.4f}  "
+        f"({'diverse' if _mean(divs) < 0.7 else 'redundant slots'})"
+    )
+
+    max_size  = max(r["bank_size"] for r in records) if records else 0
+    n_consol  = sum(
+        1 for i in range(1, len(records))
+        if records[i]["bank_size"] <= records[i - 1]["bank_size"]
+    )
+    print(f"  Peak bank size        : {max_size}  (max_mem={dual_cfg.max_mem})")
+    print(f"  Consolidation events  : {n_consol}")
+    print("=" * 76)
 
     # Verdict
     drift_ok = _mean(drifts) > 1e-3
-    gate_ok  = _mean(gates) > 0.05
-    norm_ok  = _mean(norms) > 1e-3
+    gate_ok  = _mean(gates)  > 0.05
+    norm_ok  = _mean(norms)  > 1e-3
 
-    print("\n VERDICT")
-    print(f"  Write gate active  : {'✓' if gate_ok else '✗'}  ({_mean(gates):.3f})")
-    print(f"  Bank non-trivial   : {'✓' if norm_ok else '✗'}  (mean norm {_mean(norms):.4f})")
-    print(f"  Memory shifts logits: {'✓' if drift_ok else '✗'}  (mean drift {_mean(drifts):.4f})")
-    print()
+    print("\n  VERDICT")
+    print(f"    Write gate active   : {'✓' if gate_ok else '✗'}  ({_mean(gates):.3f})")
+    print(f"    Bank non-trivial    : {'✓' if norm_ok else '✗'}  (norm {_mean(norms):.4f})")
+    print(f"    Memory shifts logits: {'✓' if drift_ok else '✗'}  (drift {_mean(drifts):.4f})")
+
     if gate_ok and norm_ok and drift_ok:
-        print("  → Bank is ACTIVE and influences predictions.")
-        print("    PPL delta on an untrained model is noisy — train to see real effect.")
+        print("\n    → Bank is ACTIVE and influences predictions.")
+        print("      Train both configs to see real PPL gap (random weights are noisy).")
     elif not gate_ok:
-        print("  → Write gate stuck near 0: model is not writing to the bank.")
-        print("    Consider lowering write_gate bias init or adding a write-loss term.")
+        print("\n    → Write gate stuck near 0. Bank is not being written.")
     elif not norm_ok:
-        print("  → Thought vectors are near-zero: the write head is collapsed.")
+        print("\n    → Thought vectors near zero: write head may have collapsed.")
     else:
-        print("  → Bank is written but has marginal effect on logits.")
+        print("\n    → Bank is written but has marginal effect on logits so far.")
     print()
-
-
-def _mean(xs: list) -> float:
-    return sum(xs) / len(xs) if xs else 0.0
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
-    args = sys.argv[1:]
-    cfg_path  = Path(args[0]) if len(args) > 0 else None
-    ckpt_path = Path(args[1]) if len(args) > 1 else None
+def _parse_args():
+    p = argparse.ArgumentParser(description="Compare memory vs no-memory architectures")
+    p.add_argument("--cfg_mem",  type=Path, default=None,
+                   help="Config for DualModalDeepSeekV4Mini (with memory bank)")
+    p.add_argument("--cfg_base", type=Path, default=None,
+                   help="Config for DeepSeekV4Mini baseline (no bank)")
+    p.add_argument("--ckpt_mem",  type=Path, default=None,
+                   help="Checkpoint for the DualModal model")
+    p.add_argument("--ckpt_base", type=Path, default=None,
+                   help="Checkpoint for the baseline model")
+    p.add_argument("--seq_len", type=int, default=64,
+                   help="Chunk length for evaluation (default 64)")
+    # Legacy positional args for backwards compatibility
+    p.add_argument("legacy_cfg",  nargs="?", type=Path)
+    p.add_argument("legacy_ckpt", nargs="?", type=Path)
+    return p.parse_args()
 
-    if cfg_path and cfg_path.exists():
-        cfg = DeepSeekV4MiniConfig.from_yaml(cfg_path)
-        print(f"Config loaded from {cfg_path}")
-    else:
-        cfg = DeepSeekV4MiniConfig.tiny()
-        print("Using tiny config (random weights — mechanism test only)")
+
+def main() -> None:
+    args = _parse_args()
+
+    # Backwards-compatible: if positional args used, treat as cfg_mem / ckpt_mem
+    cfg_mem_path  = args.cfg_mem  or args.legacy_cfg
+    ckpt_mem_path = args.ckpt_mem or args.legacy_ckpt
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = DualModalDeepSeekV4Mini(cfg).to(device)
 
-    if ckpt_path and ckpt_path.exists():
-        state = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(state["model"])
-        print(f"Checkpoint loaded from {ckpt_path}")
+    # ── DualModal (with memory bank) ──────────────────────────────────────────
+    if cfg_mem_path and cfg_mem_path.exists():
+        dual_cfg = DeepSeekV4MiniConfig.from_yaml(cfg_mem_path)
+        print(f"DualModal config loaded from {cfg_mem_path}")
     else:
-        print("No checkpoint — using random weights")
+        dual_cfg = DeepSeekV4MiniConfig.tiny()
+        dual_cfg.use_dual_stream = True
+        print("DualModal: using tiny config (random weights — mechanism test only)")
 
-    tokens  = _tokenise(_SYNTHETIC, cfg.vocab_size)
-    seq_len = min(64, cfg.max_seq_len)
+    dual_model = DualModalDeepSeekV4Mini(dual_cfg).to(device)
 
-    print(f"Tokens: {len(tokens)}  |  Chunks: {(len(tokens)-1)//seq_len}  "
-          f"|  Seq len: {seq_len}  |  Device: {device}\n")
+    if ckpt_mem_path and ckpt_mem_path.exists():
+        state = torch.load(ckpt_mem_path, map_location=device)
+        dual_model.load_state_dict(state["model"])
+        print(f"DualModal checkpoint loaded from {ckpt_mem_path}")
+    else:
+        print("DualModal: no checkpoint — using random weights")
 
-    records = evaluate(model, tokens, seq_len, device)
-    _print_report(records, cfg)
+    # ── Baseline (no memory bank) ─────────────────────────────────────────────
+    base_model: Optional[DeepSeekV4Mini] = None
+    if args.cfg_base and args.cfg_base.exists():
+        base_cfg   = DeepSeekV4MiniConfig.from_yaml(args.cfg_base)
+        base_model = DeepSeekV4Mini(base_cfg).to(device)
+        if args.ckpt_base and args.ckpt_base.exists():
+            state = torch.load(args.ckpt_base, map_location=device)
+            base_model.load_state_dict(state["model"])
+            print(f"Baseline checkpoint loaded from {args.ckpt_base}")
+        else:
+            print("Baseline: no checkpoint — using random weights")
+    else:
+        print("Baseline: no config provided — skipping no-bank column")
+
+    tokens  = _tokenise(_SYNTHETIC, dual_cfg.vocab_size)
+    seq_len = min(args.seq_len, dual_cfg.max_seq_len)
+
+    print(
+        f"\nTokens: {len(tokens)}  |  Chunks: {(len(tokens)-1)//seq_len}"
+        f"  |  Seq len: {seq_len}  |  Device: {device}\n"
+    )
+
+    records = evaluate(dual_model, base_model, tokens, seq_len, device)
+    _print_report(
+        records,
+        dual_cfg,
+        dual_model.num_params(),
+        base_model.num_params() if base_model is not None else None,
+    )
 
 
 if __name__ == "__main__":

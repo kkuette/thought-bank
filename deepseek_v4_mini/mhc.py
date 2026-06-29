@@ -50,8 +50,8 @@ class ManifoldHyperConnections(nn.Module):
         self.W_post = nn.Linear(flat, n_hc, bias=False)
 
         # Learnable static biases (initialised so B ≈ identity)
-        self.S_pre = nn.Parameter(torch.zeros(n_hc))
-        self.S_res = nn.Parameter(torch.eye(n_hc).flatten())
+        self.S_pre  = nn.Parameter(torch.zeros(n_hc))
+        self.S_res  = nn.Parameter(torch.eye(n_hc).flatten())
         self.S_post = nn.Parameter(torch.full((n_hc,), 1.0 / n_hc))
 
         # Gating scalars – start near 0 so dynamic component is initially small
@@ -87,9 +87,9 @@ class ManifoldHyperConnections(nn.Module):
         B_raw = self.alpha_res.tanh() * self.W_res(X_hat) + self.S_res   # [BT, n_hc²]
         C_raw = self.alpha_post.tanh() * self.W_post(X_hat) + self.S_post # [BT, n_hc]
 
-        # ── Apply constraints ─────────────────────────────────────────────────
-        A = torch.sigmoid(A_raw)                                    # non-negative, bounded
-        C = 2.0 * torch.sigmoid(C_raw)                             # non-negative, bounded ≤2
+        # ── Apply constraints (DeepSeek-V4 §2.2 eqs. 6-8) ──────────────────────
+        A    = torch.sigmoid(A_raw)                                # [BT, n_hc] non-neg, bounded
+        C    = 2.0 * torch.sigmoid(C_raw)                         # [BT, n_hc] non-neg, ≤ 2
         B_ds = self._sinkhorn(B_raw.view(BT, n_hc, n_hc).exp())   # doubly stochastic
 
         # ── Compute layer input: h_in = A ⊗ X (weighted sum of n_hc streams) ─

@@ -114,19 +114,24 @@ class CompressedSparseAttention(nn.Module):
         self.n_groups = n_groups
         hpg = n_heads // n_groups
 
-        # Overlapping KV compression – two series (Ca from current, Cb from previous block)
+        # Overlapping KV compression – two series (Ca/Cb = values, Za/Zb = gates)
+        # Positional biases are applied to Z (gates) only, NOT to C (values) – §2.3.1 eq. 9-12
         self.W_kv_a = nn.Linear(d_model, d_head, bias=False)
         self.W_kv_b = nn.Linear(d_model, d_head, bias=False)
         self.W_z_a  = nn.Linear(d_model, d_head, bias=False)
         self.W_z_b  = nn.Linear(d_model, d_head, bias=False)
-        self.pos_a  = nn.Parameter(torch.zeros(csa_m, d_head))
-        self.pos_b  = nn.Parameter(torch.zeros(csa_m, d_head))
+        self.pos_a  = nn.Parameter(torch.zeros(csa_m, d_head))  # bias for Za only
+        self.pos_b  = nn.Parameter(torch.zeros(csa_m, d_head))  # bias for Zb only
 
         # Low-rank queries: d → d_latent_q → n_heads * d_head
         self.W_dq = nn.Linear(d_model, d_latent_q, bias=False)
         self.W_uq = nn.Linear(d_latent_q, n_heads * d_head, bias=False)
-        # Indexer query (single head for efficiency)
-        self.W_iq = nn.Linear(d_latent_q, d_head, bias=False)
+        # Lightning indexer (§2.3.1 eqs. 13-16): multi-head indexer queries + head weights
+        # W_IUQ: latent → n_idx_heads * d_head  (shared latent c_Q from W_dq)
+        # W_w  : d_model → n_idx_heads  (per-head scalar weights for score aggregation)
+        self.n_idx_heads = max(1, n_heads // 4)  # lightweight: n_h/4 heads
+        self.W_iq = nn.Linear(d_latent_q, self.n_idx_heads * d_head, bias=False)
+        self.W_w  = nn.Linear(d_model, self.n_idx_heads, bias=False)
 
         # Sliding window KV (uncompressed local tokens)
         self.W_wk = nn.Linear(d_model, d_head, bias=False)
@@ -160,9 +165,11 @@ class CompressedSparseAttention(nn.Module):
         n_blocks = T_pad // m
         H_b = H_pad.view(B, n_blocks, m, -1)
 
-        Ca = self.W_kv_a(H_b) + self.pos_a    # [B, n_blocks, m, d_head] – pos bias added
-        Cb = self.W_kv_b(H_b) + self.pos_b
-        Za = self.W_z_a(H_b) + self.pos_a
+        # Values (Ca, Cb): no positional bias (eq. 9)
+        # Gates (Za, Zb): add learnable positional bias (eq. 10-11)
+        Ca = self.W_kv_a(H_b)                 # [B, n_blocks, m, d_head]
+        Cb = self.W_kv_b(H_b)
+        Za = self.W_z_a(H_b) + self.pos_a     # bias on gates only
         Zb = self.W_z_b(H_b) + self.pos_b
 
         # Shift Cb by 1 block; mask block-0 predecessor with -∞
@@ -193,9 +200,8 @@ class CompressedSparseAttention(nn.Module):
         # 1. Compress KV
         CComp = self._compress_kv(H_pad)           # [B, n_blocks, d_head]
 
-        # 2. Low-rank queries
+        # 2. Low-rank queries (shared latent c_Q for both indexer and core attention)
         cQ  = self.W_dq(H)                         # [B, T, d_latent_q]
-        qI  = self.W_iq(cQ)                        # [B, T, d_head]  – indexer
         q   = self.W_uq(cQ).view(B, T, self.n_heads, self.d_head)
 
         # RoPE on queries
@@ -203,8 +209,16 @@ class CompressedSparseAttention(nn.Module):
         q = _apply_rope(q.permute(0, 2, 1, 3), cos, sin).permute(0, 2, 1, 3)
         q = self.q_norm(q)                         # [B, T, n_heads, d_head]
 
-        # 3. Indexer scores → top-k causal block selection
-        idx_scores = torch.einsum("btd,bnd->btn", qI, CComp) / math.sqrt(self.d_head)  # [B,T,nb]
+        # 3. Lightning indexer (§2.3.1 eqs. 13-16): multi-head with head weights + ReLU
+        #    I_{t,s} = Σ_h  w_{t,h} · ReLU(q_I_{t,h} · K_IComp_s)
+        n_ih = self.n_idx_heads
+        qI   = self.W_iq(cQ).view(B, T, n_ih, self.d_head)    # [B, T, n_ih, d_head]
+        w_h  = self.W_w(H)                                     # [B, T, n_ih] head weights
+        # [B, T, n_ih, n_blocks]  via ReLU dot product
+        idx_scores_h = F.relu(
+            torch.einsum("bthd,bnd->bthn", qI, CComp) / math.sqrt(self.d_head)
+        )
+        idx_scores = torch.einsum("bth,bthn->btn", w_h, idx_scores_h)  # [B, T, n_blocks]
 
         # Causal block mask: token t can see block j only if j < t//m
         block_of_t = torch.arange(T, device=H.device) // m          # [T]

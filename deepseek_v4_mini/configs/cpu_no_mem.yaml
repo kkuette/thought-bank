@@ -1,0 +1,54 @@
+# DeepSeekV4Mini – CPU smoke-test, NO memory bank
+vocab_size: 50257
+d_model: 64
+n_layers: 2
+n_heads: 2
+d_head: 16
+dropout: 0.0
+max_seq_len: 128
+
+n_hc: 2
+sinkhorn_iters: 5
+
+csa_m: 4
+hca_m: 8
+top_k_csa: 2
+n_win: 4
+d_latent_q: 16
+n_groups: 1
+
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 128
+
+use_dual_stream: false
+use_thought_memory: false
+
+balance_loss_weight: 1.0e-3
+
+training:
+  device: cpu
+  seed: 42
+  tokenizer: gpt2
+  lr: 3.0e-4
+  muon_lr: 0.02
+  weight_decay: 0.1
+  steps: 200
+  warmup_steps: 20
+  grad_clip: 1.0
+  precision: fp32
+  log_every: 20
+  save_every: 0
+  save_dir: checkpoints/cpu_no_mem
+  run_name: cpu_no_mem
+  tb_dir: runs
+  tensorboard: false
+  metrics_file: runs/cpu_no_mem/metrics.jsonl
+
+data:
+  name: roneneldan/TinyStories
+  text_field: text
+  split: train
+  seq_len: 64
+  batch_size: 2
