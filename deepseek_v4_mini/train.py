@@ -28,23 +28,28 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 from .config import DeepSeekV4MiniConfig
-from .model import DeepSeekV4Mini
+from .model import DeepSeekV4Mini, DualModalDeepSeekV4Mini
 
 
 # ── Muon optimiser ────────────────────────────────────────────────────────────
 
-def _zeropower_via_newtonschulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
+def _zeropower_via_newtonschulz(G: torch.Tensor, steps: int = 10) -> torch.Tensor:
     """
-    Newton-Schulz iteration to compute G / ||G||_F  ≈  G (G^T G)^{-1/2}.
-    Operates on a 2-D matrix. Converges in ~5 steps for well-conditioned G.
-    Coefficients (a, b, c) follow the quintic polynomial from the Muon paper.
+    Hybrid Newton-Schulz orthogonalisation (DeepSeek-V4 §2.4 eq. 28).
+
+    Two-stage schedule:
+      - First (steps-2) iterations: (a,b,c) = (3.4445, -4.7750, 2.0315)
+        drives singular values rapidly toward 1.
+      - Final 2 iterations: (a,b,c) = (2, -1.5, 0.5)
+        stabilises singular values precisely at 1.
     """
     assert G.ndim == 2
-    a, b, c = 3.4445, -4.7750, 2.0315
     X = G / (G.norm() + 1e-7)
     if G.size(0) > G.size(1):
         X = X.T
-    for _ in range(steps):
+    fast_steps = max(steps - 2, 0)
+    for i in range(steps):
+        a, b, c = (3.4445, -4.7750, 2.0315) if i < fast_steps else (2.0, -1.5, 0.5)
         A = X @ X.T
         X = a * X + (b * A + c * A @ A) @ X
     if G.size(0) > G.size(1):
@@ -143,14 +148,24 @@ def _split_muon_params(model: nn.Module):
     """
     Split model parameters into:
       - muon_params : 2-D weight matrices that benefit from orthogonalisation
-      - adam_params : everything else (biases, embeddings, norms, 1-D)
+      - adam_params : everything else
+
+    Per DeepSeek-V4 §2.4: AdamW is used for embedding, prediction head, RMSNorm
+    weights, AND the static biases (S_pre, S_res, S_post) and gating scalars
+    (alpha_pre, alpha_res, alpha_post) of mHC modules.  These are 1-D or scalar
+    parameters and fall into adam_params naturally via the ndim != 2 check.
     """
     muon, adam = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        # Embeddings are 2-D but should NOT be orthogonalised (lookup tables)
-        if p.ndim == 2 and "embed" not in name and "pos_embed" not in name:
+        # 2-D matrices go to Muon, except lookup tables and mHC dynamic generators
+        # are excluded by name when they are embedding-like.
+        is_matrix = p.ndim == 2
+        is_embed  = "embed" in name          # nn.Embedding weight
+        is_mhc_static = any(k in name for k in ("S_pre", "S_res", "S_post",
+                                                  "alpha_pre", "alpha_res", "alpha_post"))
+        if is_matrix and not is_embed and not is_mhc_static:
             muon.append(p)
         else:
             adam.append(p)
@@ -205,12 +220,10 @@ def compute_loss(
     out: dict,
     targets: torch.LongTensor,
     balance_weight: float,
-    margin_delta: float = 0.0,
-    lambda_margin: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     logits       = out["logits"]          # [B, T, V]
     balance_loss = out["balance_loss"]
-    p_gates      = out["p_gates"]        # [B, T] or None
+    p_gates      = out.get("p_gates")    # [B, T] or None (legacy model only)
 
     ce = F.cross_entropy(
         logits[:, :-1, :].transpose(1, 2),
@@ -226,8 +239,7 @@ def compute_loss(
     }
 
     if p_gates is not None:
-        r_hat = float(p_gates.mean().detach())
-        logs["r_hat"] = r_hat
+        logs["r_hat"] = float(p_gates.mean().detach())
 
     return loss, logs
 
@@ -269,7 +281,12 @@ def main() -> None:
     model_cfg.vocab_size = len(tokenizer)
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = DeepSeekV4Mini(model_cfg).to(device)
+    if model_cfg.use_dual_stream:
+        model = DualModalDeepSeekV4Mini(model_cfg).to(device)
+        tqdm.write("Architecture: DualModalDeepSeekV4Mini (with memory bank)")
+    else:
+        model = DeepSeekV4Mini(model_cfg).to(device)
+        tqdm.write("Architecture: DeepSeekV4Mini (no memory bank)")
     tqdm.write(f"Model: {model.num_params():,} parameters")
 
     # ── Optimiser ─────────────────────────────────────────────────────────────
@@ -283,7 +300,7 @@ def main() -> None:
         f"Adam params: {sum(p.numel() for p in adam_params):,}"
     )
     opt = Muon(
-        muon_params, lr=muon_lr, momentum=0.95, nesterov=True, ns_steps=5, wd=0.0,
+        muon_params, lr=muon_lr, momentum=0.95, nesterov=True, ns_steps=10, wd=wd,
         adam_params=adam_params, adam_lr=adam_lr, adam_betas=(0.9, 0.95), adam_wd=wd,
     )
 

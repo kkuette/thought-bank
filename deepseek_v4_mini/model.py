@@ -165,10 +165,10 @@ class DeepSeekV4Mini(nn.Module):
             [DeepSeekV4Block(cfg, i) for i in range(cfg.n_layers)]
         )
 
-        # Output projection: collapses n_hc streams → 1 (learned mixture)
-        # A_out ∈ R^{n_hc} (sigmoid-constrained, same spirit as mHC output mapping)
-        self.A_out = nn.Parameter(torch.ones(cfg.n_hc) / cfg.n_hc)
-        self.norm_out = RMSNorm(cfg.d_model)
+        # Dynamic output collapse: token-dependent softmax mixture over n_hc streams.
+        # A_out_net maps the per-token mean-stream summary to mixture weights.
+        self.A_out_net = nn.Linear(cfg.d_model, cfg.n_hc, bias=False)
+        self.norm_out  = RMSNorm(cfg.d_model)
 
         # LM head (tied to embedding by default for smaller param count)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
@@ -202,11 +202,11 @@ class DeepSeekV4Mini(nn.Module):
             total_balance = total_balance + bal
         total_balance = total_balance / cfg.n_layers
 
-        # 3. Collapse n_hc → d via learned output weights
-        A = torch.sigmoid(self.A_out)                     # [n_hc]
-        H = torch.einsum("n,btnD->btD", A, X.reshape(B, T, cfg.n_hc, cfg.d_model))
-        # Equivalent: (A[None,None,:,None] * X).sum(dim=2)
-        H = self.norm_out(H)                              # [B, T, d]
+        # 3. Dynamic collapse n_hc → d
+        X_mean = X.mean(dim=2)                                     # [B, T, d]
+        A = torch.softmax(self.A_out_net(X_mean), dim=-1)          # [B, T, n_hc]
+        H = (A.unsqueeze(-1) * X).sum(dim=2)                       # [B, T, d]
+        H = self.norm_out(H)
 
         # 4. Thought memory augmentation (sequential, causal)
         p_gates  = None
@@ -310,8 +310,8 @@ class DualModalBlock(nn.Module):
         self.n_heads    = cfg.n_heads
         self.head_dim   = d // cfg.n_heads
 
-        # Learned weights for collapsing n_hc → d before cross-modal
-        self.A_cross = nn.Parameter(torch.ones(n_hc) / n_hc)
+        # Dynamic collapse for cross-modal: same principle as A_out_net
+        self.A_cross_net = nn.Linear(d, n_hc, bias=False)
 
     def _cross_modal(
         self, h: torch.Tensor, H_thought: torch.Tensor
@@ -348,12 +348,9 @@ class DualModalBlock(nn.Module):
         # 2. Cross-modal injection (thought → text)
         if H_thought is not None:
             B, T, n_hc, d = X.shape
-            # Extract a representative text hidden state from the n_hc streams
-            A  = torch.sigmoid(self.A_cross)                          # [n_hc]
-            h  = (A.view(1, 1, n_hc, 1) * X).sum(dim=2)             # [B, T, d]
-            h  = self._cross_modal(self.norm_cross(h), H_thought)     # [B, T, d]
-            # Distribute the cross-modal delta back across all n_hc streams
-            delta = h - (A.view(1, 1, n_hc, 1) * X).sum(dim=2)      # [B, T, d]
+            h0 = (torch.softmax(self.A_cross_net(X.mean(dim=2)), dim=-1).unsqueeze(-1) * X).sum(dim=2)
+            h1 = self._cross_modal(self.norm_cross(h0), H_thought)    # [B, T, d]
+            delta = h1 - h0                                           # [B, T, d]
             X = X + delta.unsqueeze(2)                                # broadcast
 
         # 3. MoE (mHC wrapped)
@@ -405,9 +402,9 @@ class DualModalDeepSeekV4Mini(nn.Module):
             [DualModalBlock(cfg, i) for i in range(cfg.n_layers)]
         )
 
-        # Collapse mHC residual stream → [B, T, d_model]
-        self.A_out    = nn.Parameter(torch.ones(cfg.n_hc) / cfg.n_hc)
-        self.norm_out = RMSNorm(cfg.d_model)
+        # Dynamic output collapse (same as DeepSeekV4Mini)
+        self.A_out_net = nn.Linear(cfg.d_model, cfg.n_hc, bias=False)
+        self.norm_out  = RMSNorm(cfg.d_model)
 
         # LM head (weight-tied to embedding)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
@@ -427,17 +424,13 @@ class DualModalDeepSeekV4Mini(nn.Module):
         cfg   = self.cfg
         n_hc  = cfg.n_hc
 
-        # ── Step 1: process existing thought bank (runs before text blocks) ───
-        # This gives H_thought [B, M, mem_dim] for cross-modal injection.
-        # Also writes one new thought + consolidates if needed.
-        # Note: we pass a dummy H_text (zeros) for the thought→text cross-modal
-        # here because text hasn't been processed yet; the real injection happens
-        # *inside* the text blocks (text←thought direction).
-        # The thought stream will be called again after text blocks to write.
+        # ── Step 1: process existing thought bank (runs ONCE before text blocks) ─
+        # H_thought_pre is injected into every text layer via cross-modal.
+        # After text blocks we reuse it (via _write) to avoid re-running blocks.
         H_thought_pre: Optional[torch.Tensor] = None
+        thought_bal = torch.zeros((), device=input_ids.device)
         if init_mem is not None and init_mem.size(1) > 0:
-            # Only process (no write) to get H_thought for cross-modal
-            H_thought_pre, _, _ = self.thought_stream._process_only(init_mem)
+            H_thought_pre, thought_bal = self.thought_stream._process_only(init_mem)
 
         # ── Step 2: embed text and run dual-modal text blocks ─────────────────
         h = self.drop(self.embed(input_ids))                               # [B,T,d]
@@ -447,16 +440,21 @@ class DualModalDeepSeekV4Mini(nn.Module):
         for block in self.blocks:
             X, bal = block(X, H_thought_pre)
             total_bal = total_bal + bal
-        total_bal = total_bal / cfg.n_layers
+        total_bal = (total_bal / cfg.n_layers) + thought_bal
 
-        # ── Step 3: collapse mHC → text hidden states ─────────────────────────
-        A = torch.sigmoid(self.A_out)
-        H_text = (A.view(1, 1, n_hc, 1) * X).sum(dim=2)                  # [B,T,d]
+        # ── Step 3: dynamic collapse mHC → text hidden states ────────────────
+        X_mean = X.mean(dim=2)                                            # [B,T,d]
+        A = torch.softmax(self.A_out_net(X_mean), dim=-1)                 # [B,T,n_hc]
+        H_text = (A.unsqueeze(-1) * X).sum(dim=2)                        # [B,T,d]
         H_text = self.norm_out(H_text)
 
-        # ── Step 4: thought stream write + consolidation ───────────────────────
-        _, mem_bank, thought_bal = self.thought_stream(H_text, init_mem)
-        total_bal = total_bal + thought_bal
+        # ── Step 4: thought stream write + consolidation (no re-run of blocks) ─
+        if init_mem is None or init_mem.size(1) == 0:
+            # First forward: write the very first thought vector
+            _, mem_bank, _ = self.thought_stream(H_text, init_mem)
+        else:
+            # Reuse H_thought_pre; only do cross-modal update + consolidation + write
+            mem_bank = self.thought_stream._write(H_text, init_mem, H_thought_pre)
 
         # ── Step 5: LM head ───────────────────────────────────────────────────
         logits = self.lm_head(H_text)                                      # [B,T,V]

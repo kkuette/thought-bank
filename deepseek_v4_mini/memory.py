@@ -181,17 +181,22 @@ class ThoughtStream(nn.Module):
             [ThoughtBlock(cfg, i) for i in range(cfg.n_mem_layers)]
         )
 
-        # mHC collapse: learned mixture over n_hc streams → single d vector
-        self.A_out    = nn.Parameter(torch.ones(n_hc) / n_hc)
-        self.norm_out = RMSNorm(d)
+        # Dynamic mHC collapse: token-dependent softmax mixture over n_hc streams
+        # Input is the mean across streams (cheap summary); output is n_hc weights.
+        self.A_out_net = nn.Linear(d, n_hc, bias=False)
+        self.norm_out  = RMSNorm(d)
 
         # Cross-modal: thought ← text  (gated residual from text summary)
         self.text_proj = nn.Linear(cfg.d_model, d, bias=False)
         self.text_gate = nn.Linear(d, d, bias=False)   # per-dim gate
         self.norm_tm   = RMSNorm(d)
 
-        # Write head: produces new thought vector from last text hidden state
-        self.write_gate  = nn.Linear(cfg.d_model, 1, bias=True)
+        # Write head: attention-pooled context → per-dim gate + thought vector.
+        # write_ctx_q projects each text token to a scalar score for the pool.
+        # write_gate is per-dim (mem_dim) so each feature dimension can be
+        # written independently — analogous to an LSTM input gate.
+        self.write_ctx_q  = nn.Linear(cfg.d_model, 1, bias=False)
+        self.write_gate   = nn.Linear(cfg.d_model, d, bias=True)
         self.thought_head = nn.Linear(cfg.d_model, d, bias=False)
         self.norm_write   = RMSNorm(d)
 
@@ -223,9 +228,11 @@ class ThoughtStream(nn.Module):
             total_bal = total_bal + bal
         total_bal = total_bal / max(1, len(self.blocks))
 
-        # 4. Collapse mHC → [B, M, d]
-        A = torch.sigmoid(self.A_out)                          # [n_hc]
-        H = (A.view(1, 1, n_hc, 1) * X).sum(dim=2)           # [B, M, d]
+        # 4. Dynamic mHC collapse → [B, M, d]
+        # Use the per-slot mean as a cheap summary to compute mixture weights.
+        X_mean = X.mean(dim=2)                                     # [B, M, d]
+        A = torch.softmax(self.A_out_net(X_mean), dim=-1)          # [B, M, n_hc]
+        H = (A.unsqueeze(-1) * X).sum(dim=2)                       # [B, M, d]
         H = self.norm_out(H)
 
         return H, total_bal
@@ -234,15 +241,51 @@ class ThoughtStream(nn.Module):
 
     def _process_only(
         self, mem_bank: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Run thought blocks + cross-modal update WITHOUT writing a new vector.
-        Used to produce H_thought before text blocks have run (so H_text is not
-        yet available for the thought→text update; that update is skipped here).
-        Returns (H_thought, mem_bank_unchanged, zero_balance).
+        Run thought blocks WITHOUT cross-modal update, consolidation, or write.
+        Used by DualModalDeepSeekV4Mini to get H_thought BEFORE text blocks run,
+        so the result can be injected into every text layer via cross-modal.
+
+        Returns (H_thought [B, M, mem_dim], balance_loss scalar).
         """
-        H_thought, bal = self._process(mem_bank)
-        return H_thought, mem_bank, bal
+        return self._process(mem_bank)
+
+    # ── Write-only (consolidation + append, skips re-running thought blocks) ──
+
+    def _write(
+        self,
+        H_text: torch.Tensor,           # [B, T, d_model]
+        mem_bank: torch.Tensor,         # [B, M, mem_dim]
+        H_thought: torch.Tensor,        # [B, M, mem_dim]  pre-computed by _process_only
+    ) -> torch.Tensor:
+        """
+        Apply cross-modal update to pre-computed H_thought, run consolidation
+        if needed, and append a new thought vector.
+
+        Called by DualModalDeepSeekV4Mini after text blocks, reusing H_thought
+        already computed before text blocks to avoid running thought-stream
+        blocks twice per forward pass.
+
+        Returns updated mem_bank [B, M', mem_dim].
+        """
+        cfg = self.cfg
+
+        # Cross-modal: thoughts absorb text summary (gated)
+        h_text_summary = H_text.mean(dim=1, keepdim=True)        # [B, 1, d_model]
+        h_proj = self.text_proj(h_text_summary)                   # [B, 1, mem_dim]
+        gate   = torch.sigmoid(self.text_gate(self.norm_tm(H_thought)))
+        # H_thought updated in place (not returned — caller already has it)
+        _ = H_thought + gate * h_proj
+
+        # Consolidation
+        if mem_bank.size(1) >= cfg.max_mem:
+            mem_bank = self.consolidator(mem_bank, H_text)
+
+        # Append new thought
+        m_new    = self._new_thought(H_text)
+        mem_bank = torch.cat([mem_bank, m_new], dim=1)
+        return mem_bank
 
     # ── Main forward ──────────────────────────────────────────────────────────
 
@@ -287,10 +330,16 @@ class ThoughtStream(nn.Module):
     def _new_thought(self, H_text: torch.Tensor) -> torch.Tensor:
         """
         Produce a new thought vector from the current text.
-        Uses the last token hidden state gated by a write probability.
-        Gate near 0 → near-zero vector (soft no-write).
+
+        Context: soft attention pool over all positions (vs. last-token only).
+        Gate: per-dim sigmoid in [0,1]^mem_dim so each feature can be written
+        independently — near-zero gate dims suppress uninformative features.
         """
-        h_last = H_text[:, -1, :]                              # [B, d_model]
-        p      = torch.sigmoid(self.write_gate(h_last))        # [B, 1]
-        m      = self.norm_write(self.thought_head(h_last))    # [B, mem_dim]
+        # Attention-pooled summary: learned scalar score per position → softmax
+        scores  = self.write_ctx_q(H_text).squeeze(-1)         # [B, T]
+        weights = torch.softmax(scores, dim=-1)                 # [B, T]
+        h_ctx   = (weights.unsqueeze(-1) * H_text).sum(dim=1)  # [B, d_model]
+
+        p = torch.sigmoid(self.write_gate(h_ctx))              # [B, mem_dim]
+        m = self.norm_write(self.thought_head(h_ctx))          # [B, mem_dim]
         return (p * m).unsqueeze(1)                            # [B, 1, mem_dim]

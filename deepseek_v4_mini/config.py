@@ -20,7 +20,7 @@ class DeepSeekV4MiniConfig:
 
     # ── mHC: Manifold-Constrained Hyper-Connections (§2.2) ───────────────────
     n_hc: int = 2              # residual stream expansion factor
-    sinkhorn_iters: int = 5    # Sinkhorn-Knopp iterations for Birkhoff projection
+    sinkhorn_iters: int = 20   # Sinkhorn-Knopp iterations (paper uses t_max=20)
 
     # ── Attention (§2.3) ──────────────────────────────────────────────────────
     csa_m: int = 4             # CSA: compress every m tokens (overlapping)
@@ -58,8 +58,11 @@ class DeepSeekV4MiniConfig:
     mem_top_k_experts: int = 1 # activated routed experts per thought token
     mem_d_ff: int = 64         # FFN dim in thought MoE
 
+    # ── Legacy single-stream thought memory (DeepSeekV4Mini only) ───────────
+    use_thought_memory: bool = False    # bolt-on sequential memory for the legacy model
+
     # ── Training ──────────────────────────────────────────────────────────────
-    balance_loss_weight: float = 1e-3   # MoE sequence-balance auxiliary loss
+    balance_loss_weight: float = 1e-4   # MoE balance loss weight (paper §4.2.2: 0.0001)
 
     # ── Factory helpers ───────────────────────────────────────────────────────
     @classmethod

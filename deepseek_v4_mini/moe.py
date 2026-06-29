@@ -30,6 +30,10 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         a, b = self.w12(x).chunk(2, dim=-1)
+        # SwiGLU clamping for training stability (§4.2.3):
+        # linear branch ∈ [-10, 10], gate branch upper-bounded at 10
+        a = a.clamp(-10.0, 10.0)
+        b = b.clamp(max=10.0)
         return self.w3(self.drop(F.silu(a) * b))
 
 
