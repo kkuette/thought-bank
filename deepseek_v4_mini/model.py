@@ -9,8 +9,8 @@ DualModalDeepSeekV4Mini  (dual-stream, recommended)
   Thought stream [B, M, mem_dim] processed by its own CSA/HCA blocks with mHC.
   The two streams interact at every text block via cross-modal attention
   (text tokens read from processed thought representations).
-  After all text blocks the ThoughtStream writes a new vector to the bank,
-  triggering context-aware consolidation if the bank is full.
+  After all text blocks the ThoughtStream writes a new (gated) vector to the
+  bank, FIFO-evicting the oldest slot once the bank exceeds max_mem.
 """
 from __future__ import annotations
 
@@ -174,6 +174,12 @@ class DeepSeekV4Mini(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight   # weight tying
 
+        # Embedding init: nn.Embedding defaults to N(0,1), which (with the tied
+        # head and RMSNorm'd hidden states) makes logits std ~= sqrt(d_model) and
+        # blows up the init CE far above ln(vocab). Scale down to std=0.02 so the
+        # model starts near uniform predictions.
+        nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
+
         # ── Optional thought memory ───────────────────────────────────────────
         if cfg.use_thought_memory:
             self.mem_attn  = _MemoryCrossAttention(cfg.d_model, cfg.mem_dim, cfg.n_heads)
@@ -187,6 +193,7 @@ class DeepSeekV4Mini(nn.Module):
         self,
         input_ids: torch.LongTensor,
         init_mem: Optional[torch.Tensor] = None,
+        compute_logits: bool = True,
     ) -> dict:
         B, T = input_ids.shape
         cfg  = self.cfg
@@ -213,11 +220,11 @@ class DeepSeekV4Mini(nn.Module):
         mem_bank = init_mem
 
         if cfg.use_thought_memory:
-            logits_list, p_list, mem_list = [], [], []
+            h_aug_list, p_list, mem_list = [], [], []
             for t in range(T):
                 h_t = H[:, t:t+1, :]                     # [B, 1, d]
                 h_aug = self.mem_attn(h_t, mem_bank)      # [B, 1, d]
-                logits_list.append(self.lm_head(h_aug))   # [B, 1, V]
+                h_aug_list.append(h_aug)
                 p_t   = self.gate(h_aug.squeeze(1))       # [B, 1]
                 m_t   = self.thought(h_aug.squeeze(1))    # [B, mem_dim]
                 p_list.append(p_t)
@@ -227,17 +234,22 @@ class DeepSeekV4Mini(nn.Module):
                 if mem_bank.size(1) > cfg.max_mem:
                     mem_bank = mem_bank[:, -cfg.max_mem:]
 
-            logits  = torch.cat(logits_list, dim=1)       # [B, T, V]
+            H_final = torch.cat(h_aug_list, dim=1)        # [B, T, d]
             p_gates = torch.cat(p_list, dim=1).squeeze(-1)  # [B, T]
         else:
-            logits = self.lm_head(H)                      # [B, T, V]
+            H_final = H                                   # [B, T, d]
 
-        return {
-            "logits":       logits,
+        out = {
             "balance_loss": total_balance,
             "mem_bank":     mem_bank,
             "p_gates":      p_gates,
         }
+        if compute_logits:
+            out["logits"] = self.lm_head(H_final)         # [B, T, V]
+        else:
+            out["hidden"]         = H_final
+            out["lm_head_weight"] = self.lm_head.weight
+        return out
 
     # ── Convenience ───────────────────────────────────────────────────────────
 
@@ -378,8 +390,8 @@ class DualModalDeepSeekV4Mini(nn.Module):
        (if bank is empty, H_thought = None and we skip cross-modal).
     2. Text blocks process input tokens; at each block the cross-modal reads
        H_thought so every layer is aware of the current thought context.
-    3. After all text blocks, ThoughtStream.forward writes a new thought vector,
-       triggering context-aware consolidation if max_mem is reached.
+    3. After all text blocks, ThoughtStream writes a new (gated) thought vector,
+       FIFO-evicting the oldest slot once the bank exceeds max_mem.
     4. LM head produces logits from the final text hidden states.
 
     The bank is returned as mem_bank and should be passed back as init_mem on
@@ -410,6 +422,12 @@ class DualModalDeepSeekV4Mini(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
 
+        # Embedding init: nn.Embedding defaults to N(0,1), which (with the tied
+        # head and RMSNorm'd hidden states) makes logits std ~= sqrt(d_model) and
+        # blows up the init CE far above ln(vocab). Scale down to std=0.02 so the
+        # model starts near uniform predictions.
+        nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
+
         # Thought stream
         self.thought_stream = ThoughtStream(cfg)
 
@@ -419,6 +437,7 @@ class DualModalDeepSeekV4Mini(nn.Module):
         self,
         input_ids: torch.LongTensor,
         init_mem: Optional[torch.Tensor] = None,
+        compute_logits: bool = True,
     ) -> dict:
         B, T  = input_ids.shape
         cfg   = self.cfg
@@ -448,22 +467,27 @@ class DualModalDeepSeekV4Mini(nn.Module):
         H_text = (A.unsqueeze(-1) * X).sum(dim=2)                        # [B,T,d]
         H_text = self.norm_out(H_text)
 
-        # ── Step 4: thought stream write + consolidation (no re-run of blocks) ─
+        # ── Step 4: gated thought write + FIFO eviction (no re-run of blocks) ──
         if init_mem is None or init_mem.size(1) == 0:
             # First forward: write the very first thought vector
             _, mem_bank, _ = self.thought_stream(H_text, init_mem)
         else:
-            # Reuse H_thought_pre; only do cross-modal update + consolidation + write
-            mem_bank = self.thought_stream._write(H_text, init_mem, H_thought_pre)
+            # Blocks already ran in _process_only; only append the new thought.
+            mem_bank = self.thought_stream._write(H_text, init_mem)
 
         # ── Step 5: LM head ───────────────────────────────────────────────────
-        logits = self.lm_head(H_text)                                      # [B,T,V]
-
-        return {
-            "logits":       logits,
+        out = {
             "balance_loss": total_bal,
             "mem_bank":     mem_bank,
         }
+        if compute_logits:
+            out["logits"] = self.lm_head(H_text)                           # [B,T,V]
+        else:
+            # Defer the head to a memory-efficient fused cross-entropy: hand back
+            # the hidden states and the tied head weight instead of [B,T,V] logits.
+            out["hidden"]        = H_text
+            out["lm_head_weight"] = self.lm_head.weight
+        return out
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
