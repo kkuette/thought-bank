@@ -35,14 +35,16 @@ Pass k
                ThoughtStream.write()
                        │
           ┌────────────┴────────────┐
-          │  bank full?             │
-          │  yes → consolidate      │  MemoryConsolidator:
-          │        (oldest k → 1)   │  query  = proj(mean(H_text))
-          │        then append      │  kv     = old thought vectors
-          │  no  → append directly  │  output = context-aware summary
+          │  gated write            │  m_new = α · p · m
+          │   α = σ(write_decision) │   α : scalar write/skip choice
+          │   p = σ(write_gate)     │   p : per-dim content gate
+          │   m = thought_head(ctx) │   m : the thought vector
+          │  append, then FIFO-evict│
+          │  oldest if > max_mem    │
           └────────────────────────┘
                        │
-              Banque [B, M', mem_dim]  →  pass k+1
+              Bank [B, M', mem_dim]  →  pass k+1
+              (carried across passes; persists across sequences if enabled)
 ```
 
 **Even-indexed layers** use **CSA** (Compressed Sparse Attention).  
@@ -96,16 +98,38 @@ An auxiliary sequence-balance loss prevents expert collapse.
 
 A second transformer (CSA/HCA + mHC) that operates on the memory bank `[B, M, mem_dim]`. Uses **slot index as temporal encoding** — `nn.Embedding(max_mem, mem_dim)` indexed by position in the bank, so slot 0 = oldest, slot M-1 = newest.
 
-### Memory consolidation (`memory.py`)
+### Gated write + FIFO eviction (`memory.py`)
 
-When the bank reaches `max_mem`, instead of dropping old vectors:
+After the text blocks, each segment writes one thought vector to the bank:
 
-1. Take the `consolidate_k` oldest vectors.
-2. Cross-attend them with a query derived from the current text summary.
-3. Produce **one condensed vector** that blends past knowledge with present context.
-4. Replace the `k` old slots with this single vector.
+```
+ctx   = attention-pool over the segment's H_text     # [B, d_model]
+m     = norm(thought_head(ctx))                      # the thought  [B, mem_dim]
+p     = sigmoid(write_gate(ctx))                     # per-dim content gate
+α     = sigmoid(write_decision(ctx))                 # scalar write/skip choice
+m_new = α · p · m                                     # gated thought  [B, 1, mem_dim]
+```
 
-The bank therefore grows to `max_mem`, consolidates back to `max_mem - k + 1`, then grows again — staying bounded while never discarding information cold.
+The vector is appended; if the bank exceeds `max_mem` the **oldest slot is
+FIFO-evicted**. The scalar `α` is the model's *modality choice* — write this
+thought or skip it — learned end-to-end through the LM loss. (An earlier
+cross-attention consolidator was removed in favour of this simpler, trainable
+write; the `consolidate_k` field now only sizes the slot positional embedding.)
+
+**Training the write head requires `mem_bptt_window ≥ 2`.** The write is a pure
+*output* of a segment — the segment's own loss never depends on it (the write
+happens after the LM head); its only consumer is the *next* segment's read. With
+a per-segment detach (`window = 1`) the write head gets zero gradient and the
+bank is filled by an untrained projection. `window ≥ 2` keeps the graph across a
+boundary so segment i+1's loss trains segment i's write.
+
+### Persistence across sequences (`train.py`)
+
+By default the bank is reset every sequence, so it only spans the in-sequence
+segments. With `data.persist: true` each batch lane streams one source file in
+order and the bank is **carried across training steps** (reset at file
+boundaries) — the "remember earlier context" use case. This is what makes the
+memory actually useful (see the root README's Findings).
 
 ---
 
@@ -118,10 +142,14 @@ The bank therefore grows to `max_mem`, consolidates back to `max_mem - k + 1`, t
 
 ### Parameter counts
 
-| Config | Text stream | Thought stream | Total |
-|---|---|---|---|
-| tiny | ~6M | ~50k | ~6.5M |
-| small | ~31M | ~256k | ~32M |
+Dominated by the token embedding (`vocab_size × d_model`), so the total depends
+on the tokenizer. Examples:
+
+| Config | vocab | Total |
+|---|---|---|
+| `tiny()` preset | 32k | ~6.5M |
+| `tiny.yaml` (DeepSeek-V3 tokenizer) | ~129k | ~19M |
+| `small.yaml` | ~129k | ~32M |
 
 ---
 
@@ -136,10 +164,11 @@ model = DualModalDeepSeekV4Mini(cfg)
 
 ids = torch.randint(0, cfg.vocab_size, (2, 64))
 
-# First pass — no memory
+# First pass — empty bank
 out = model(ids)
-print(out["logits"].shape)   # [2, 64, 32000]
-print(out["mem_bank"].shape) # [2, 1, 32]
+print(out["logits"].shape)    # [2, 64, vocab_size]
+print(out["mem_bank"].shape)  # [2, 1, mem_dim]
+print(out["write_alpha"])     # mean write probability α (write/skip telemetry)
 
 # Subsequent passes — carry the bank across calls
 out2 = model(ids, init_mem=out["mem_bank"])
@@ -148,11 +177,22 @@ out2 = model(ids, init_mem=out["mem_bank"])
 ### Training
 
 ```bash
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/tiny.yaml
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/small.yaml
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/tiny.yaml          # TinyStories
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code.yaml          # code, bank reset/seq
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist.yaml  # code, bank persists
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/synth_recall.yaml  # addressable-recall test
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/gist.yaml          # latent-context test
 ```
 
-The training script streams from HuggingFace datasets (default: `roneneldan/TinyStories`), logs to TensorBoard, and saves checkpoints. Edit the YAML to change dataset, learning rate, precision, etc.
+The script streams from HuggingFace datasets (default `roneneldan/TinyStories`),
+or generates synthetic data for `task: associative_recall` / `task: latent_context`.
+It logs to `runs/<run_name>/metrics.jsonl` and saves checkpoints.
+
+**Memory probes** run during training (every `mem_probe_every` steps):
+`mem_ablation_gap` (CE without vs with the bank), `mem_diversity` (slot spread),
+`mem_write_rate` (mean α), and — for persistent runs — `persist_gap` (CE with the
+bank carried across chunks of one file vs reset each chunk). Offline PPL with/without
+the bank: `python -m deepseek_v4_mini.eval_memory`.
 
 ---
 
@@ -167,8 +207,7 @@ cfg = DeepSeekV4MiniConfig(
     csa_m=4, hca_m=32, top_k_csa=8, n_win=16,
     n_experts=8, top_k_experts=2, d_ff=512,
     # Thought stream
-    mem_dim=64, max_mem=32, consolidate_k=8,
-    n_mem_layers=2,
+    mem_dim=64, max_mem=32, n_mem_layers=2,
 )
 
 # Or from YAML
@@ -190,9 +229,17 @@ Key parameters:
 | `top_k_csa` | Compressed blocks attended per token in CSA |
 | `n_win` | Sliding window size (both CSA and HCA) |
 | `mem_dim` | Thought vector dimension |
-| `max_mem` | Bank size that triggers consolidation |
-| `consolidate_k` | Old vectors compressed into 1 at each consolidation |
+| `max_mem` | Bank capacity; oldest slot is FIFO-evicted past this |
 | `n_mem_layers` | Depth of the thought-stream transformer |
+
+Memory training knobs live in the YAML `training:` / `data:` sections:
+
+| Parameter | Description |
+|---|---|
+| `mem_segment_len` | Attention window per segment; smaller ⇒ more reliance on the bank |
+| `mem_bptt_window` | TBPTT span; **≥2 required** to train the write head |
+| `mem_probe_every` | How often to run the ablation / persistence probes |
+| `data.persist` | `true` ⇒ per-file ordered lanes + carry the bank across steps |
 
 ---
 
@@ -204,12 +251,17 @@ deepseek_v4_mini/
   mhc.py         — ManifoldHyperConnections + RMSNorm
   attention.py   — CompressedSparseAttention, HeavilyCompressedAttention, RoPE
   moe.py         — SwiGLU, DeepSeekMoE
-  memory.py      — MemoryConsolidator, ThoughtBlock, ThoughtStream
+  memory.py      — ThoughtBlock, ThoughtStream (gated write + FIFO)
   model.py       — DeepSeekV4Mini, DualModalDeepSeekV4Mini
-  train.py       — Training loop (HF datasets, TensorBoard, checkpointing)
+  train.py       — Training loop, memory/persistence probes, synthetic tasks
+  eval_memory.py — Offline PPL with vs without the bank
   configs/
-    tiny.yaml    — ~6M params, fast iteration
-    small.yaml   — ~32M params, single RTX 3090
+    tiny.yaml          — TinyStories, fast iteration
+    small.yaml         — TinyStories, single RTX 3090
+    code.yaml          — code (Python), bank reset per sequence
+    code_persist.yaml  — code (Python), bank persists across sequences
+    synth_recall.yaml  — synthetic addressable-recall diagnostic
+    gist.yaml          — synthetic latent-context (gist) diagnostic
 ```
 
 ---
