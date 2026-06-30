@@ -479,6 +479,7 @@ class DualModalDeepSeekV4Mini(nn.Module):
         out = {
             "balance_loss": total_bal,
             "mem_bank":     mem_bank,
+            "write_alpha":  self.thought_stream.last_write_alpha,  # mean α (write prob)
         }
         if compute_logits:
             out["logits"] = self.lm_head(H_text)                           # [B,T,V]

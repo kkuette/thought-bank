@@ -1,0 +1,75 @@
+# Same architecture/segmentation as tiny.yaml, but on a CODE dataset (Python).
+# Goal: a clean A/B vs TinyStories — does the thought memory earn its keep when
+# the data has genuine long-range structure (a symbol defined early, used far
+# later; imports; current scope) that a 64-token attention window cannot span?
+# Watch mem_probe's ablation_gap: if it climbs well above the TinyStories ~0.05,
+# the gist memory is actually helping on code.
+#
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code.yaml
+
+# ── Model (identical to tiny.yaml) ─────────────────────────────────────────────
+vocab_size: 50257        # set from tokenizer at runtime
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.1
+max_seq_len: 512
+
+# mHC
+n_hc: 2
+sinkhorn_iters: 20
+
+# Attention
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+
+# MoE
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+
+# Thought memory
+use_thought_memory: true
+mem_dim: 32
+max_mem: 16
+
+balance_loss_weight: 1.0e-3
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  device: auto
+  seed: 42
+  tokenizer: deepseek-ai/DeepSeek-V3   # handles code well
+  lr: 3.0e-4
+  muon_lr: 0.003
+  weight_decay: 0.1
+  steps: 5000
+  warmup_steps: 100
+  grad_clip: 1.0
+  precision: bf16
+  # 512 / 64 = 8 segments. Attention spans ~1–2 lines of code; anything beyond
+  # (a function defined in an earlier segment, an import at the top) can only
+  # reach the current segment through the thought bank.
+  mem_segment_len: 64
+  mem_bptt_window: 2
+  mem_probe_every: 200
+  log_every: 50
+  save_every: 1000
+  save_dir: checkpoints/code
+  run_name: dsv4mini_code
+  tensorboard: false
+  metrics_file: runs/dsv4mini_code/metrics.jsonl
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  name: codeparrot/codeparrot-clean-valid   # pure-Python, streams quickly
+  text_field: content
+  split: train
+  seq_len: 512
+  batch_size: 8

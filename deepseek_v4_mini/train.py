@@ -188,8 +188,168 @@ def _set_seed(seed: int) -> None:
 
 # ── Data helpers (HF streaming) ───────────────────────────────────────────────
 
+def _build_synthetic_recall(cfg_dict: dict):
+    """Procedural associative-recall task that *requires* cross-segment memory.
+
+    Layout per sequence (small synthetic vocab):
+        [BOS] k1 v1 k2 v2 ... kM vM [SEP] kq vq kq vq ...
+    The M key→value pairs (keys distinct) sit in the first segments; the query
+    section repeats already-seen keys whose value must be reproduced. Because the
+    text stream only attends within one `mem_segment_len` window, a query landing
+    in a later segment than its pair can ONLY be answered through the thought bank.
+    So `ablation_gap` (CE without − CE with memory) is a near-binary verdict on
+    whether the memory works.
+
+    Vocab layout: 0=PAD 1=BOS 2=SEP, keys=[3, 3+n_keys), values=[3+n_keys, ...).
+    Set the model's `vocab_size` to at least 3 + n_keys + n_values.
+    """
+    from torch.utils.data import IterableDataset, DataLoader
+
+    d        = cfg_dict["data"]
+    seq_len  = d["seq_len"]
+    bs       = d["batch_size"]
+    n_keys   = int(d.get("n_keys", 40))
+    n_values = int(d.get("n_values", 16))
+    n_pairs  = min(int(d.get("n_pairs", n_keys)), n_keys)   # distinct keys
+    PAD, BOS, SEP, KEY_OFF = 0, 1, 2, 3
+    VAL_OFF = KEY_OFF + n_keys
+
+    class SynthDS(IterableDataset):
+        def __iter__(self):
+            while True:
+                keys = torch.randperm(n_keys)[:n_pairs]
+                vals = torch.randint(0, n_values, (n_pairs,))
+                kv   = {int(k): int(v) for k, v in zip(keys.tolist(), vals.tolist())}
+                klist = list(kv.keys())
+
+                seq = [BOS]
+                for k, v in zip(keys.tolist(), vals.tolist()):
+                    seq.append(KEY_OFF + k)
+                    seq.append(VAL_OFF + v)
+                seq.append(SEP)
+                while len(seq) < seq_len + 1:                  # query section
+                    qk = klist[int(torch.randint(0, len(klist), (1,)))]
+                    seq.append(KEY_OFF + qk)
+                    if len(seq) < seq_len + 1:
+                        seq.append(VAL_OFF + kv[qk])
+
+                chunk = torch.tensor(seq[:seq_len + 1], dtype=torch.long)
+                yield chunk[:-1], chunk[1:]
+
+    return DataLoader(SynthDS(), batch_size=bs, num_workers=0)
+
+
+def _build_latent_context(cfg_dict: dict):
+    """Procedural 'gist memory' task: a persistent latent context beyond the
+    attention window.
+
+    Layout per sequence:
+        [BOS] [CTX_c] s s s s ...        (symbols s ~ P_c, a FIXED per-context dist)
+    The context token c appears once at the start (segment 0). Every later symbol
+    is drawn from a distribution P_c that depends on c, so predicting symbols in
+    segments >0 is far easier IF the model still 'knows' c — but attention only
+    spans one `mem_segment_len` window, so after segment 0 the ONLY way to keep c
+    is the thought bank. This is the gist/summary use-case (remember *broadly*
+    what's going on), not exact recall.
+
+    CE floor per symbol: ~H(P_c) with the gist carried vs ~ln(n_symbols) without,
+    so ablation_gap ≈ ln(S) − H(P_c), large and *sustained* if the memory works.
+
+    Vocab: 0=PAD 1=BOS, contexts=[2, 2+C), symbols=[2+C, 2+C+S).
+    Set vocab_size >= 2 + n_contexts + n_symbols.
+    """
+    from torch.utils.data import IterableDataset, DataLoader
+
+    d        = cfg_dict["data"]
+    seq_len  = d["seq_len"]
+    bs       = d["batch_size"]
+    C        = int(d.get("n_contexts", 8))
+    S        = int(d.get("n_symbols", 64))
+    p_pref   = float(d.get("pref_mass", 0.9))      # prob mass on a context's block
+    PAD, BOS, CTX_OFF = 0, 1, 2
+    SYM_OFF  = CTX_OFF + C
+
+    # Fixed context→distribution map (shared across all sequences, so it is
+    # learnable): each context concentrates p_pref on a disjoint block of symbols.
+    k = max(1, S // C)
+    dists = torch.empty(C, S)
+    for c in range(C):
+        dists[c].fill_((1.0 - p_pref) / max(1, S - k))
+        dists[c, c * k: c * k + k] = p_pref / k
+    dists = dists / dists.sum(dim=1, keepdim=True)
+
+    class CtxDS(IterableDataset):
+        def __iter__(self):
+            n_sym = seq_len + 1 - 2                 # minus BOS and the context token
+            while True:
+                c    = int(torch.randint(0, C, (1,)))
+                syms = torch.multinomial(dists[c], n_sym, replacement=True)
+                seq  = torch.cat([
+                    torch.tensor([BOS, CTX_OFF + c], dtype=torch.long),
+                    SYM_OFF + syms,
+                ])
+                yield seq[:-1], seq[1:]
+
+    return DataLoader(CtxDS(), batch_size=bs, num_workers=0)
+
+
+def _build_persistent_file_loader(cfg_dict: dict, tokenizer, split: str = "train"):
+    """Ordered loader for cross-sequence memory persistence.
+
+    Unlike the default loader (independent random chunks), each of the B batch
+    lanes streams ONE source file at a time, emitting its consecutive seq_len
+    chunks IN ORDER. The training loop carries the thought bank across steps, so
+    within a file the bank accumulates state ("what was defined earlier"); at a
+    file boundary that lane is reset. Yields (x, y, reset) where reset[b] is True
+    on the first chunk of a new file in lane b.
+
+    The persistence signal comes from long files (> ~2*seq_len tokens give a
+    continuation chunk); short files reset immediately and behave like the
+    baseline. The codeparrot stream is not repo-contiguous, so the file is the
+    natural unit of coherence here.
+    """
+    from datasets import load_dataset
+
+    hf      = cfg_dict["data"]
+    seq_len = hf["seq_len"]
+    B       = hf["batch_size"]
+    field   = hf.get("text_field", "text")
+    name    = hf["name"]
+
+    class PersistDS:
+        def __iter__(self):
+            it = iter(load_dataset(name, split=split, streaming=True))
+            bufs  = [[] for _ in range(B)]   # remaining tokens of each lane's file
+            fresh = [True] * B               # is the next chunk the start of a file?
+
+            def next_file(b):
+                ex = next(it)
+                bufs[b] = tokenizer.encode(ex.get(field, "") or "")
+                fresh[b] = True
+
+            while True:
+                xs, ys, rs = [], [], []
+                for b in range(B):
+                    while len(bufs[b]) < seq_len + 1:   # current file exhausted
+                        next_file(b)                    # -> reset this lane
+                    chunk   = bufs[b][:seq_len + 1]
+                    bufs[b] = bufs[b][seq_len + 1:]
+                    xs.append(chunk[:-1]); ys.append(chunk[1:]); rs.append(fresh[b])
+                    fresh[b] = False                    # later chunks continue the file
+                yield (torch.tensor(xs), torch.tensor(ys), torch.tensor(rs, dtype=torch.bool))
+
+    return PersistDS()
+
+
 def _build_dataloader(cfg_dict: dict, tokenizer, split: str = "train"):
     """Thin wrapper around HF streaming dataset → fixed-length batches."""
+    if cfg_dict["data"].get("task") == "associative_recall":
+        return _build_synthetic_recall(cfg_dict)
+    if cfg_dict["data"].get("task") == "latent_context":
+        return _build_latent_context(cfg_dict)
+    if cfg_dict["data"].get("persist"):
+        return _build_persistent_file_loader(cfg_dict, tokenizer, split)
+
     from datasets import load_dataset
     from torch.utils.data import IterableDataset, DataLoader
 
@@ -242,9 +402,11 @@ def fused_cross_entropy(
     checkpointing each chunk so peak memory is O(chunk_tokens * V) rather than
     O(B * T * V).
     """
+    # targets are ALREADY next-token shifted by the dataloader (y=chunk[1:]),
+    # aligned position-for-position with `hidden`. Do NOT shift again.
     d   = hidden.size(-1)
-    h   = hidden[:, :-1, :].reshape(-1, d)               # [N, d]
-    tgt = targets[:, 1:].reshape(-1)                     # [N]
+    h   = hidden.reshape(-1, d)                          # [N, d]
+    tgt = targets.reshape(-1)                            # [N]
     N   = h.size(0)
     if chunk_tokens <= 0:
         chunk_tokens = N
@@ -272,9 +434,11 @@ def compute_loss(
 
     if out.get("logits") is not None:
         logits = out["logits"]            # [B, T, V]
+        # targets are ALREADY next-token shifted by the dataloader (y=chunk[1:]),
+        # aligned position-for-position with the model input x. Do NOT shift again.
         ce = F.cross_entropy(
-            logits[:, :-1, :].transpose(1, 2),
-            targets[:, 1:],
+            logits.transpose(1, 2),       # [B, V, T]
+            targets,                      # [B, T]
         )
     else:
         # Memory-efficient path: model returned hidden states + tied head weight.
@@ -294,6 +458,10 @@ def compute_loss(
     if p_gates is not None:
         logs["r_hat"] = float(p_gates.mean().detach())
 
+    write_alpha = out.get("write_alpha")
+    if write_alpha is not None:
+        logs["write_alpha"] = float(write_alpha)  # mean write prob α (write/skip)
+
     return loss, logs
 
 
@@ -312,8 +480,13 @@ def forward_backward(
     amp_dtype: torch.dtype,
     use_amp: bool,
     bptt_window: int = 2,
-) -> dict:
-    """Forward + backward for one micro-batch, returning averaged logs.
+    init_mem: Optional[torch.Tensor] = None,
+) -> tuple[dict, Optional[torch.Tensor]]:
+    """Forward + backward for one micro-batch, returning (averaged logs, final bank).
+
+    `init_mem` seeds the thought bank at the first segment (for cross-sequence
+    persistence the caller passes the previous step's detached bank). The returned
+    bank is detached and can be carried into the next step.
 
     When `seg_len` is set and shorter than the sequence, the sequence is split
     into segments processed in order while the thought-memory bank is carried
@@ -340,7 +513,7 @@ def forward_backward(
     n_seg = len(xs)
     W = max(1, bptt_window)
 
-    mem: Optional[torch.Tensor] = None
+    mem: Optional[torch.Tensor] = init_mem   # seeded bank (persistence) or None
     agg: dict = {}
     window_loss = None          # sum of per-segment losses over the current window
     win_count = 0
@@ -365,7 +538,8 @@ def forward_backward(
         for k, v in logs.items():
             agg[k] = agg.get(k, 0.0) + v
     agg["mem_slots"] = float(mem.size(1)) if mem is not None else 0.0
-    return {k: (v / n_seg if k != "mem_slots" else v) for k, v in agg.items()}
+    logs = {k: (v / n_seg if k != "mem_slots" else v) for k, v in agg.items()}
+    return logs, mem        # mem is detached (last segment is always a boundary)
 
 
 @torch.no_grad()
@@ -399,11 +573,13 @@ def memory_probe(
     ys = y.split(seg_len, dim=1) if (seg_len and 0 < seg_len < y.size(1)) else (y,)
 
     mem: Optional[torch.Tensor] = None
-    ce_with, ce_without = [], []
+    ce_with, ce_without, alphas = [], [], []
     for x_s, y_s in zip(xs, ys):
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             out_w = model(x_s, init_mem=mem, compute_logits=not fused_ce)
             _, logs_w = compute_loss(out_w, y_s, balance_w, ce_chunk)
+            if out_w.get("write_alpha") is not None:
+                alphas.append(float(out_w["write_alpha"]))
             if mem is not None and mem.size(1) > 0:
                 out_o = model(x_s, init_mem=None, compute_logits=not fused_ce)
                 _, logs_o = compute_loss(out_o, y_s, balance_w, ce_chunk)
@@ -419,11 +595,94 @@ def memory_probe(
         float(mem.float().std(dim=1).mean()) if mem is not None and mem.size(1) > 1 else 0.0
     )
     bank_norm = float(mem.float().norm(dim=-1).mean()) if mem is not None else 0.0
+    write_rate = sum(alphas) / len(alphas) if alphas else 0.0
     return {
         "mem_ablation_gap": gap,        # CE_without - CE_with  (>0 => memory helps)
         "mem_diversity":    diversity,  # std across slots (~0 => collapsed/useless)
         "mem_bank_norm":    bank_norm,
         "mem_slots_final":  float(mem.size(1)) if mem is not None else 0.0,
+        "mem_write_rate":   write_rate, # mean α: how strongly the model commits writes
+    }
+
+
+@torch.no_grad()
+def persistence_probe(
+    model: nn.Module,
+    tokenizer,
+    cfg_dict: dict,
+    *,
+    n_chunks: int,
+    fused_ce: bool,
+    ce_chunk: int,
+    balance_w: float,
+    seg_len: int,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+) -> dict:
+    """Does carrying the bank ACROSS chunks of the same file lower later-chunk CE?
+
+    Finds one long file, splits it into `n_chunks` consecutive chunks, and runs it
+    twice: (a) carrying the bank from chunk to chunk, (b) resetting the bank every
+    chunk. The gap on chunks k>0 (CE_reset − CE_carried) is the persistence value —
+    the real verdict for the 'remember earlier context' use case. ~0 means
+    cross-sequence memory is not helping.
+    """
+    from datasets import load_dataset
+
+    hf = cfg_dict["data"]
+    field, seq_len = hf.get("text_field", "text"), hf["seq_len"]
+    need = (seq_len + 1) * n_chunks
+    toks = None
+    for ex in load_dataset(hf["name"], split=hf.get("split", "train"), streaming=True):
+        t = tokenizer.encode(ex.get(field, "") or "")
+        if len(t) >= need:
+            toks = t[:need]
+            break
+    if toks is None:
+        return {}
+
+    chunks = [
+        torch.tensor(toks[i * (seq_len + 1):(i + 1) * (seq_len + 1)],
+                     dtype=torch.long).unsqueeze(0).to(device)
+        for i in range(n_chunks)
+    ]
+    was_training = model.training
+    model.eval()
+
+    def run_chunk(x, init_mem):
+        """One chunk in segments (carrying within-chunk), returns (mean_ce, end_mem)."""
+        xs = x.split(seg_len, dim=1) if (seg_len and 0 < seg_len < x.size(1)) else (x,)
+        mem = init_mem
+        ces = []
+        for x_s in xs:
+            y_s = x_s[:, 1:]
+            x_in = x_s[:, :-1]
+            if x_in.size(1) == 0:
+                continue
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                out = model(x_in, init_mem=mem, compute_logits=not fused_ce)
+                _, logs = compute_loss(out, y_s, balance_w, ce_chunk)
+            mem = out["mem_bank"].detach()
+            ces.append(logs["ce"])
+        return (sum(ces) / max(1, len(ces))), mem
+
+    mem_carried = None
+    ce_carried, ce_reset = [], []
+    for k, c in enumerate(chunks):
+        ce_c, mem_carried = run_chunk(c, mem_carried)   # carried across chunks
+        ce_r, _           = run_chunk(c, None)          # bank reset this chunk
+        if k > 0:                                        # persistence only matters past chunk 0
+            ce_carried.append(ce_c)
+            ce_reset.append(ce_r)
+
+    if was_training:
+        model.train()
+
+    gap = (sum(ce_reset) - sum(ce_carried)) / len(ce_carried) if ce_carried else 0.0
+    return {
+        "persist_gap":     gap,                          # CE_reset - CE_carried (>0 => persistence helps)
+        "persist_chunks":  float(len(ce_carried) + 1),
     }
 
 
@@ -456,12 +715,17 @@ def main() -> None:
     _set_seed(train_cfg.get("seed", 42))
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
-    tok_name = train_cfg.get("tokenizer", "gpt2")
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tok_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model_cfg.vocab_size = len(tokenizer)
+    # Synthetic tasks have no text: keep vocab_size from the yaml, no tokenizer.
+    if data_cfg.get("task") in ("associative_recall", "latent_context"):
+        tokenizer = None
+        tqdm.write(f"Synthetic task: {data_cfg['task']}  (vocab_size={model_cfg.vocab_size})")
+    else:
+        tok_name = train_cfg.get("tokenizer", "gpt2")
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tok_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model_cfg.vocab_size = len(tokenizer)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     if model_cfg.use_dual_stream:
@@ -536,6 +800,8 @@ def main() -> None:
     # forward_backward). W=1 keeps the old behaviour (write head never trains).
     mem_bptt_window = max(1, int(train_cfg.get("mem_bptt_window", 2)))
     mem_probe_every = int(train_cfg.get("mem_probe_every", 0))  # 0 = off
+    mem_persist     = bool(data_cfg.get("persist", False))      # carry bank across steps
+    persist_chunks  = int(train_cfg.get("persist_probe_chunks", 6))
     log_every   = int(train_cfg.get("log_every", 50))
     save_every  = int(train_cfg.get("save_every", 1000))
     save_dir    = Path(train_cfg.get("save_dir", f"checkpoints/{run_name}"))
@@ -547,18 +813,32 @@ def main() -> None:
     t0    = time.perf_counter()
     toks  = 0          # tokens accumulated across the current optimiser step
     pbar  = tqdm(total=total_steps, desc="Training")
+    persist_mem: Optional[torch.Tensor] = None   # bank carried across steps
 
-    for x, y in dl:
+    for batch in dl:
+        if mem_persist:
+            x, y, reset = batch
+            reset = reset.to(device)
+        else:
+            x, y = batch
+            reset = None
         x, y = x.to(device), y.to(device)
         toks += x.numel()
 
-        logs = forward_backward(
+        init_mem = persist_mem
+        if mem_persist and init_mem is not None and reset is not None and reset.any():
+            # zero the slots of lanes that just started a new file (fresh context)
+            init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
+
+        logs, mem_out = forward_backward(
             model, x, y,
             fused_ce=fused_ce, ce_chunk=ce_chunk, balance_w=balance_w,
             scaler=scaler, seg_len=mem_seg_len, grad_accum=grad_accum,
             device=device, amp_dtype=amp_dtype, use_amp=use_amp,
-            bptt_window=mem_bptt_window,
+            bptt_window=mem_bptt_window, init_mem=init_mem,
         )
+        if mem_persist:
+            persist_mem = mem_out      # detached; carried into next step
         micro += 1
         if micro % grad_accum != 0:
             continue
@@ -592,8 +872,23 @@ def main() -> None:
                 f"  [mem-probe] ablation_gap(CE↓)={probe['mem_ablation_gap']:+.4f}"
                 f"  diversity={probe['mem_diversity']:.4f}"
                 f"  bank_norm={probe['mem_bank_norm']:.3f}"
+                f"  write_rate(α)={probe['mem_write_rate']:.3f}"
                 f"  slots={probe['mem_slots_final']:.0f}"
             )
+            # Cross-sequence persistence: does carrying the bank across chunks of
+            # the same file lower later-chunk CE? (the real use-case verdict)
+            if mem_persist:
+                pp = persistence_probe(
+                    model, tokenizer, raw, n_chunks=persist_chunks, fused_ce=fused_ce,
+                    ce_chunk=ce_chunk, balance_w=balance_w, seg_len=mem_seg_len,
+                    device=device, amp_dtype=amp_dtype, use_amp=use_amp,
+                )
+                logs.update(pp)
+                if pp:
+                    tqdm.write(
+                        f"  [persist-probe] persist_gap(CE↓)={pp['persist_gap']:+.4f}"
+                        f"  over {pp['persist_chunks']:.0f} chunks of one file"
+                    )
 
         if step % log_every == 0 or step == 1:
             tqdm.write(
@@ -601,6 +896,7 @@ def main() -> None:
                 f"  balance={logs['balance']:.4f}"
                 + (f"  r_hat={logs.get('r_hat', 0):.3f}" if "r_hat" in logs else "")
                 + (f"  mem={logs['mem_slots']:.0f}" if "mem_slots" in logs else "")
+                + (f"  α={logs['write_alpha']:.3f}" if "write_alpha" in logs else "")
                 + (f"  gap={logs['mem_ablation_gap']:+.3f}" if "mem_ablation_gap" in logs else "")
                 + f"  lr={opt.param_groups[0]['lr']:.2e}  tok/s={tok_s:.0f}"
             )

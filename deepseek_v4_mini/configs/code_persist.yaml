@@ -1,0 +1,72 @@
+# Same as code.yaml, but the thought bank PERSISTS across steps: each batch lane
+# streams one source file in order, and the bank is carried from chunk to chunk
+# (reset only at a file boundary). This finally tests the actual use case —
+# remembering earlier context that has scrolled out of the attention window —
+# instead of resetting the memory every sequence.
+#
+# A/B baseline = code.yaml (per-sequence reset). Watch the new persist-probe:
+# persist_gap > 0 means carrying the bank across chunks lowers later-chunk CE.
+#
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist.yaml
+
+# ── Model (identical to code.yaml) ─────────────────────────────────────────────
+vocab_size: 50257
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.1
+max_seq_len: 512
+
+n_hc: 2
+sinkhorn_iters: 20
+
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+
+use_thought_memory: true
+mem_dim: 32
+max_mem: 16
+
+balance_loss_weight: 1.0e-3
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  device: auto
+  seed: 42
+  tokenizer: deepseek-ai/DeepSeek-V3
+  lr: 3.0e-4
+  muon_lr: 0.003
+  weight_decay: 0.1
+  steps: 5000
+  warmup_steps: 100
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 64
+  mem_bptt_window: 2
+  mem_probe_every: 200
+  persist_probe_chunks: 6     # persistence probe runs on one >=6-chunk file
+  log_every: 50
+  save_every: 1000
+  save_dir: checkpoints/code_persist
+  run_name: dsv4mini_code_persist
+  tensorboard: false
+  metrics_file: runs/dsv4mini_code_persist/metrics.jsonl
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  name: codeparrot/codeparrot-clean-valid
+  text_field: content
+  split: train
+  seq_len: 512
+  batch_size: 8
+  persist: true               # ordered per-file lanes + cross-step bank carry
