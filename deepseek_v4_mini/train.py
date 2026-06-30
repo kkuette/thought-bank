@@ -436,12 +436,82 @@ def _build_multiturn_loader(cfg_dict: dict, tokenizer, split: str = "train_sft")
     return MultiTurnBatchedDS()
 
 
+_GIST_DISTS_CACHE: dict = {}
+
+
+def _gist_dists(C: int, S: int, p_pref: float) -> torch.Tensor:
+    """Fixed context→symbol distribution map shared by the synthetic gist loader
+    and its probe (so both agree on P_c). Each context puts p_pref on a disjoint
+    block of k = S//C symbols and spreads the rest uniformly."""
+    key = (C, S, round(p_pref, 6))
+    if key not in _GIST_DISTS_CACHE:
+        k = max(1, S // C)
+        d = torch.full((C, S), (1.0 - p_pref) / max(1, S - k))
+        for c in range(C):
+            d[c, c * k: c * k + k] = p_pref / k
+        _GIST_DISTS_CACHE[key] = d / d.sum(dim=1, keepdim=True)
+    return _GIST_DISTS_CACHE[key]
+
+
+def _build_synthetic_multiturn(cfg_dict: dict):
+    """Synthetic multi-turn GIST task: a latent context set in turn 0 that later,
+    NON-overlapping short turns can only get from memory.
+
+    Each conversation (FIXED turn count, so the B lanes stay turn-aligned and reset
+    together):
+        turn 0 : [BOS, CTX_c]              -> establishes context c (loss-masked)
+        turn t : [Q] -> predict s_t ~ P_c  -> answer depends ONLY on c
+    Turn t's attention window is a single [Q] segment: no symbol and no c are in
+    view, so the ONLY path to c is the thought bank written at turn 0. Predicting
+    s_t from [Q] alone costs ~ln(S); with the gist carried it costs ~H(P_c). So
+    content_gap ≈ ln(S) - H(P_c) is LARGE and SUSTAINED iff the bank carries the
+    gist across turns — the clean pass/fail UltraChat (self-contained turns) never
+    produced.
+
+    Yields the SAME contract as the real multiturn loader, one turn-slot at a time:
+        (x [B,L], y [B,L], loss_mask [B,L] bool, reset [B] bool)
+
+    Vocab: 0=PAD 1=BOS 2=Q, contexts=[3, 3+C), symbols=[3+C, 3+C+S).
+    Set vocab_size >= 3 + n_contexts + n_symbols.
+    """
+    d      = cfg_dict["data"]
+    bs     = int(d["batch_size"])
+    C      = int(d.get("n_contexts", 8))
+    S      = int(d.get("n_symbols", 64))
+    p_pref = float(d.get("pref_mass", 0.9))
+    turns  = int(d.get("turns_per_conv", 6))     # 1 context turn + (turns-1) answers
+    BOS, Q, CTX_OFF = 1, 2, 3
+    SYM_OFF = CTX_OFF + C
+    dists   = _gist_dists(C, S, p_pref)
+
+    class GistDS:
+        def __iter__(self):
+            while True:
+                cs = torch.randint(0, C, (bs,))                  # fresh context per lane
+                # turn 0: [BOS, CTX_c] — loss-masked, only writes c into the bank
+                x = torch.stack([torch.tensor([BOS, CTX_OFF + int(c)]) for c in cs])
+                yield (x, x.clone(),
+                       torch.zeros((bs, 2), dtype=torch.bool),
+                       torch.ones(bs, dtype=torch.bool))
+                # answer turns: predict one symbol ~ P_c from [Q] (needs the bank)
+                for _ in range(turns - 1):
+                    s = torch.stack([torch.multinomial(dists[int(c)], 1) for c in cs]).view(bs)
+                    yield (torch.full((bs, 1), Q, dtype=torch.long),
+                           (SYM_OFF + s).view(bs, 1),
+                           torch.ones((bs, 1), dtype=torch.bool),
+                           torch.zeros(bs, dtype=torch.bool))
+
+    return GistDS()
+
+
 def _build_dataloader(cfg_dict: dict, tokenizer, split: str = "train"):
     """Thin wrapper around HF streaming dataset → fixed-length batches."""
     if cfg_dict["data"].get("task") == "associative_recall":
         return _build_synthetic_recall(cfg_dict)
     if cfg_dict["data"].get("task") == "latent_context":
         return _build_latent_context(cfg_dict)
+    if cfg_dict["data"].get("task") == "multiturn_gist":
+        return _build_synthetic_multiturn(cfg_dict)
     if cfg_dict["data"].get("task") == "multiturn":
         return _build_multiturn_loader(cfg_dict, tokenizer, cfg_dict["data"].get("split", "train_sft"))
     if cfg_dict["data"].get("persist"):
@@ -954,6 +1024,90 @@ def multiturn_probe(
     }
 
 
+def synthetic_multiturn_probe(
+    model: nn.Module,
+    cfg_dict: dict,
+    *,
+    fused_ce: bool,
+    ce_chunk: int,
+    balance_w: float,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+    n_conv: int = 16,
+) -> dict:
+    """Gist probe for the synthetic multi-turn task: averages CE over the answer
+    turns (t>0) of n_conv fresh conversations under three arms.
+      real   : bank carried from turn 0, real writes
+      zero   : bank carried, writes zeroed (slots kept) -> isolates content
+      ablate : no bank at all (init_mem=None each turn)
+    content_gap = ce_zero - ce_real is the verdict: ≈ ln(S) - H(P_c) if the gist is
+    carried, ~0 if the bank can't hold one context across turns.
+    """
+    d      = cfg_dict["data"]
+    C      = int(d.get("n_contexts", 8))
+    S      = int(d.get("n_symbols", 64))
+    p_pref = float(d.get("pref_mass", 0.9))
+    turns  = int(d.get("turns_per_conv", 6))
+    BOS, Q, CTX_OFF = 1, 2, 3
+    SYM_OFF = CTX_OFF + C
+    dists   = _gist_dists(C, S, p_pref)
+
+    was_training = model.training
+    model.eval()
+    ts = getattr(model, "thought_stream", None)
+    orig_new = ts._new_thought if ts is not None else None
+
+    # Same conversations across the three arms for a low-variance gap.
+    convs = []
+    for _ in range(n_conv):
+        c = int(torch.randint(0, C, (1,)))
+        syms = [int(torch.multinomial(dists[c], 1)) for _ in range(turns - 1)]
+        convs.append((c, syms))
+
+    def run(zero_content: bool, ablate: bool):
+        if ts is not None:
+            ts._new_thought = (
+                (lambda H, b=None, p=None: torch.zeros_like(orig_new(H, b, p))) if zero_content else orig_new
+            )
+        ces, last_mem = [], None
+        for c, syms in convs:
+            mem = None
+            x0 = torch.tensor([[BOS, CTX_OFF + c]], device=device)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                out = model(x0, init_mem=None, compute_logits=not fused_ce)
+            if not ablate:
+                mem = out["mem_bank"].detach()
+            for s in syms:
+                xq = torch.tensor([[Q]], device=device)
+                yq = torch.tensor([[SYM_OFF + s]], device=device)
+                init = None if ablate else mem
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    out = model(xq, init_mem=init, compute_logits=not fused_ce)
+                    _, lg = compute_loss(out, yq, balance_w, ce_chunk)
+                if not ablate:
+                    mem = out["mem_bank"].detach()
+                ces.append(lg["ce"])
+            last_mem = mem
+        if ts is not None:
+            ts._new_thought = orig_new
+        return (sum(ces) / max(1, len(ces)) if ces else 0.0), last_mem
+
+    ce_real, mem = run(zero_content=False, ablate=False)
+    ce_zero, _   = run(zero_content=True,  ablate=False)
+    ce_abl,  _   = run(zero_content=False, ablate=True)
+
+    if was_training:
+        model.train()
+    return {
+        "mem_ablation_gap": ce_abl - ce_real,
+        "content_gap":      ce_zero - ce_real,
+        "mem_eff_rank":     _effective_rank(mem) if mem is not None else 0.0,
+        "mem_slots_final":  float(mem.size(1)) if mem is not None else 0.0,
+        "mem_turns":        float(turns),
+    }
+
+
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 
 def _save(path: Path, model: nn.Module, opt: "Muon", step: int) -> None:
@@ -984,7 +1138,7 @@ def main() -> None:
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
     # Synthetic tasks have no text: keep vocab_size from the yaml, no tokenizer.
-    if data_cfg.get("task") in ("associative_recall", "latent_context"):
+    if data_cfg.get("task") in ("associative_recall", "latent_context", "multiturn_gist"):
         tokenizer = None
         tqdm.write(f"Synthetic task: {data_cfg['task']}  (vocab_size={model_cfg.vocab_size})")
     else:
@@ -1069,7 +1223,8 @@ def main() -> None:
     mem_bptt_window = max(1, int(train_cfg.get("mem_bptt_window", 2)))
     mem_probe_every = int(train_cfg.get("mem_probe_every", 0))  # 0 = off
     mem_persist     = bool(data_cfg.get("persist", False))      # carry bank across steps
-    mem_multiturn   = data_cfg.get("task") == "multiturn"        # segment by turn, bank/conversation
+    mem_multiturn   = data_cfg.get("task") in ("multiturn", "multiturn_gist")  # per-turn forward, bank/conversation
+    mem_synth_mt    = data_cfg.get("task") == "multiturn_gist"   # synthetic gist probe (no tokenizer)
     persist_chunks  = int(train_cfg.get("persist_probe_chunks", 6))
     log_every   = int(train_cfg.get("log_every", 50))
     save_every  = int(train_cfg.get("save_every", 1000))
@@ -1163,10 +1318,16 @@ def main() -> None:
 
         # Multi-turn probe: turn-cadenced content_gap + effective rank
         if mem_probe_every and mem_multiturn and step % mem_probe_every == 0:
-            mp = multiturn_probe(
-                model, tokenizer, raw, fused_ce=fused_ce, ce_chunk=ce_chunk,
-                balance_w=balance_w, device=device, amp_dtype=amp_dtype, use_amp=use_amp,
-            )
+            if mem_synth_mt:
+                mp = synthetic_multiturn_probe(
+                    model, raw, fused_ce=fused_ce, ce_chunk=ce_chunk,
+                    balance_w=balance_w, device=device, amp_dtype=amp_dtype, use_amp=use_amp,
+                )
+            else:
+                mp = multiturn_probe(
+                    model, tokenizer, raw, fused_ce=fused_ce, ce_chunk=ce_chunk,
+                    balance_w=balance_w, device=device, amp_dtype=amp_dtype, use_amp=use_amp,
+                )
             logs.update(mp)
             if mp:
                 tqdm.write(
