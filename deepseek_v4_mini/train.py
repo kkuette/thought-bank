@@ -24,6 +24,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
+from torch.utils.checkpoint import checkpoint
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
@@ -216,25 +217,77 @@ def _build_dataloader(cfg_dict: dict, tokenizer, split: str = "train"):
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 
+def _ce_chunk(h_c: torch.Tensor, weight: torch.Tensor, t_c: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy (summed) for one chunk of flattened tokens.
+
+    Logits [chunk, V] are produced here and consumed by cross_entropy without
+    leaving the function, so under checkpointing they are never stored for the
+    backward pass — they get recomputed instead.
+    """
+    logits = F.linear(h_c, weight)                       # [chunk, V]
+    return F.cross_entropy(logits.float(), t_c, reduction="sum")
+
+
+def fused_cross_entropy(
+    hidden: torch.Tensor,        # [B, T, d]
+    weight: torch.Tensor,        # [V, d]  (tied LM-head weight)
+    targets: torch.LongTensor,   # [B, T]
+    chunk_tokens: int = 1024,
+) -> torch.Tensor:
+    """Memory-efficient next-token cross-entropy.
+
+    Materialising the full [B, T, V] logits (and their fp32 upcast inside
+    cross_entropy) is the memory bottleneck with a ~129k vocab. Here we flatten
+    the predicted positions and run cross-entropy over chunks of `chunk_tokens`,
+    checkpointing each chunk so peak memory is O(chunk_tokens * V) rather than
+    O(B * T * V).
+    """
+    d   = hidden.size(-1)
+    h   = hidden[:, :-1, :].reshape(-1, d)               # [N, d]
+    tgt = targets[:, 1:].reshape(-1)                     # [N]
+    N   = h.size(0)
+    if chunk_tokens <= 0:
+        chunk_tokens = N
+
+    total = h.new_zeros(())
+    for s in range(0, N, chunk_tokens):
+        h_c = h[s:s + chunk_tokens]
+        t_c = tgt[s:s + chunk_tokens]
+        if torch.is_grad_enabled() and h_c.requires_grad:
+            loss_c = checkpoint(_ce_chunk, h_c, weight, t_c, use_reentrant=False)
+        else:
+            loss_c = _ce_chunk(h_c, weight, t_c)
+        total = total + loss_c
+    return total / max(1, N)
+
+
 def compute_loss(
     out: dict,
     targets: torch.LongTensor,
     balance_weight: float,
+    ce_chunk_tokens: int = 1024,
 ) -> tuple[torch.Tensor, dict]:
-    logits       = out["logits"]          # [B, T, V]
     balance_loss = out["balance_loss"]
     p_gates      = out.get("p_gates")    # [B, T] or None (legacy model only)
 
-    ce = F.cross_entropy(
-        logits[:, :-1, :].transpose(1, 2),
-        targets[:, 1:],
-    )
+    if out.get("logits") is not None:
+        logits = out["logits"]            # [B, T, V]
+        ce = F.cross_entropy(
+            logits[:, :-1, :].transpose(1, 2),
+            targets[:, 1:],
+        )
+    else:
+        # Memory-efficient path: model returned hidden states + tied head weight.
+        ce = fused_cross_entropy(
+            out["hidden"], out["lm_head_weight"], targets, ce_chunk_tokens,
+        )
 
     loss = ce + balance_weight * balance_loss
 
+    ce_val = float(ce.detach())
     logs: dict = {
-        "ce":      float(ce.detach()),
-        "ppl":     float(math.exp(float(ce.detach()))),
+        "ce":      ce_val,
+        "ppl":     float(math.exp(min(ce_val, 30.0))),
         "balance": float(balance_loss.detach()),
     }
 
@@ -242,6 +295,136 @@ def compute_loss(
         logs["r_hat"] = float(p_gates.mean().detach())
 
     return loss, logs
+
+
+def forward_backward(
+    model: nn.Module,
+    x: torch.LongTensor,
+    y: torch.LongTensor,
+    *,
+    fused_ce: bool,
+    ce_chunk: int,
+    balance_w: float,
+    scaler,
+    seg_len: int,
+    grad_accum: int,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+    bptt_window: int = 2,
+) -> dict:
+    """Forward + backward for one micro-batch, returning averaged logs.
+
+    When `seg_len` is set and shorter than the sequence, the sequence is split
+    into segments processed in order while the thought-memory bank is carried
+    forward as `init_mem` (truncated BPTT). With `seg_len <= 0` this is a single
+    pass and the memory bank never grows past one slot.
+
+    BPTT window (`bptt_window`, W): why it matters for the WRITE path. The memory
+    write is a pure *output* of a segment — the segment's own loss never depends
+    on it (the write happens after the LM head). The only consumer of a written
+    bank is the *next* segment's read. So with W=1 (detach every boundary, the
+    old behaviour) the write head — write_ctx_q, write_gate, thought_head,
+    write_decision — receives ZERO gradient and can never learn; the bank is
+    filled by an untrained projection. With W>=2 the graph is kept across W-1 boundaries
+    and backward runs once per window, so segment i+1's loss flows back into
+    segment i's write. Memory cost is W segments of activations live at once
+    (still bounded). W=2 is the minimal value that trains the write head.
+    """
+    T = x.size(1)
+    if seg_len and 0 < seg_len < T:
+        xs = x.split(seg_len, dim=1)
+        ys = y.split(seg_len, dim=1)
+    else:
+        xs, ys = (x,), (y,)
+    n_seg = len(xs)
+    W = max(1, bptt_window)
+
+    mem: Optional[torch.Tensor] = None
+    agg: dict = {}
+    window_loss = None          # sum of per-segment losses over the current window
+    win_count = 0
+    for i, (x_s, y_s) in enumerate(zip(xs, ys)):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            out = model(x_s, init_mem=mem, compute_logits=not fused_ce)
+            loss, logs = compute_loss(out, y_s, balance_w, ce_chunk)
+        # Scale so accumulated grads match a single large batch averaged over
+        # both gradient-accumulation micro-batches and segments.
+        seg_loss = scaler.scale(loss / (grad_accum * n_seg))
+        window_loss = seg_loss if window_loss is None else window_loss + seg_loss
+        win_count += 1
+        # Carry the bank WITH its graph so the next segment's read connects back
+        # to this segment's write; only detach at a window boundary (truncation).
+        mem = out["mem_bank"]
+        is_boundary = (win_count == W) or (i == n_seg - 1)
+        if is_boundary:
+            window_loss.backward()       # one backward for the whole window
+            mem = mem.detach()
+            window_loss = None
+            win_count = 0
+        for k, v in logs.items():
+            agg[k] = agg.get(k, 0.0) + v
+    agg["mem_slots"] = float(mem.size(1)) if mem is not None else 0.0
+    return {k: (v / n_seg if k != "mem_slots" else v) for k, v in agg.items()}
+
+
+@torch.no_grad()
+def memory_probe(
+    model: nn.Module,
+    x: torch.LongTensor,
+    y: torch.LongTensor,
+    *,
+    fused_ce: bool,
+    ce_chunk: int,
+    balance_w: float,
+    seg_len: int,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+) -> dict:
+    """Is the memory bank actually useful? Ablation probe.
+
+    Runs the sequence in segments, carrying the bank as in training. For every
+    segment that has a non-empty bank we measure CE twice on the *same* tokens:
+      - with the carried bank injected (init_mem = bank)
+      - with no memory at all       (init_mem = None)
+    The gap `CE_without - CE_with` is how much the memory lowers the loss
+    (positive = the bank helps prediction). We also report slot diversity (std
+    across slots; ~0 means the slots collapsed to the same vector = useless).
+    """
+    was_training = model.training
+    model.eval()
+
+    xs = x.split(seg_len, dim=1) if (seg_len and 0 < seg_len < x.size(1)) else (x,)
+    ys = y.split(seg_len, dim=1) if (seg_len and 0 < seg_len < y.size(1)) else (y,)
+
+    mem: Optional[torch.Tensor] = None
+    ce_with, ce_without = [], []
+    for x_s, y_s in zip(xs, ys):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            out_w = model(x_s, init_mem=mem, compute_logits=not fused_ce)
+            _, logs_w = compute_loss(out_w, y_s, balance_w, ce_chunk)
+            if mem is not None and mem.size(1) > 0:
+                out_o = model(x_s, init_mem=None, compute_logits=not fused_ce)
+                _, logs_o = compute_loss(out_o, y_s, balance_w, ce_chunk)
+                ce_with.append(logs_w["ce"])
+                ce_without.append(logs_o["ce"])
+        mem = out_w["mem_bank"].detach()
+
+    if was_training:
+        model.train()
+
+    gap = (sum(ce_without) - sum(ce_with)) / len(ce_with) if ce_with else 0.0
+    diversity = (
+        float(mem.float().std(dim=1).mean()) if mem is not None and mem.size(1) > 1 else 0.0
+    )
+    bank_norm = float(mem.float().norm(dim=-1).mean()) if mem is not None else 0.0
+    return {
+        "mem_ablation_gap": gap,        # CE_without - CE_with  (>0 => memory helps)
+        "mem_diversity":    diversity,  # std across slots (~0 => collapsed/useless)
+        "mem_bank_norm":    bank_norm,
+        "mem_slots_final":  float(mem.size(1)) if mem is not None else 0.0,
+    }
 
 
 # ── Checkpointing ─────────────────────────────────────────────────────────────
@@ -345,24 +528,41 @@ def main() -> None:
     scaler    = torch.cuda.amp.GradScaler(enabled=(train_cfg.get("precision") == "fp16"))
 
     grad_clip   = float(train_cfg.get("grad_clip", 1.0))
+    grad_accum  = max(1, int(train_cfg.get("grad_accum", 1)))
+    fused_ce    = bool(train_cfg.get("fused_ce", True))
+    ce_chunk    = int(train_cfg.get("ce_chunk_tokens", 1024))
+    mem_seg_len = int(train_cfg.get("mem_segment_len", 0))   # 0 = single pass
+    # TBPTT window: W>=2 lets gradient reach the memory write head (see
+    # forward_backward). W=1 keeps the old behaviour (write head never trains).
+    mem_bptt_window = max(1, int(train_cfg.get("mem_bptt_window", 2)))
+    mem_probe_every = int(train_cfg.get("mem_probe_every", 0))  # 0 = off
     log_every   = int(train_cfg.get("log_every", 50))
     save_every  = int(train_cfg.get("save_every", 1000))
     save_dir    = Path(train_cfg.get("save_dir", f"checkpoints/{run_name}"))
     balance_w   = float(model_cfg.balance_loss_weight)
 
     model.train()
-    step = 0
-    pbar = tqdm(total=total_steps, desc="Training")
+    step  = 0          # optimiser steps (one per grad_accum micro-batches)
+    micro = 0          # micro-batches seen since the last optimiser step
+    t0    = time.perf_counter()
+    toks  = 0          # tokens accumulated across the current optimiser step
+    pbar  = tqdm(total=total_steps, desc="Training")
 
     for x, y in dl:
-        t0 = time.perf_counter()
         x, y = x.to(device), y.to(device)
+        toks += x.numel()
 
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            out = model(x)
-            loss, logs = compute_loss(out, y, balance_w)
+        logs = forward_backward(
+            model, x, y,
+            fused_ce=fused_ce, ce_chunk=ce_chunk, balance_w=balance_w,
+            scaler=scaler, seg_len=mem_seg_len, grad_accum=grad_accum,
+            device=device, amp_dtype=amp_dtype, use_amp=use_amp,
+            bptt_window=mem_bptt_window,
+        )
+        micro += 1
+        if micro % grad_accum != 0:
+            continue
 
-        scaler.scale(loss).backward()
         if hasattr(scaler, "unscale_"):
             scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -373,16 +573,35 @@ def main() -> None:
 
         step += 1
         dt    = time.perf_counter() - t0
-        tok_s = x.numel() / dt
+        tok_s = toks / dt
+        t0    = time.perf_counter()
+        toks  = 0
 
         pbar.set_postfix(loss=f"{logs['ce']:.3f}", ppl=f"{logs['ppl']:.1f}", tok_s=f"{tok_s:.0f}")
         pbar.update(1)
+
+        # Memory usefulness probe (ablation: CE with vs without the bank)
+        if mem_probe_every and mem_seg_len and step % mem_probe_every == 0:
+            probe = memory_probe(
+                model, x, y, fused_ce=fused_ce, ce_chunk=ce_chunk,
+                balance_w=balance_w, seg_len=mem_seg_len, device=device,
+                amp_dtype=amp_dtype, use_amp=use_amp,
+            )
+            logs.update(probe)
+            tqdm.write(
+                f"  [mem-probe] ablation_gap(CE↓)={probe['mem_ablation_gap']:+.4f}"
+                f"  diversity={probe['mem_diversity']:.4f}"
+                f"  bank_norm={probe['mem_bank_norm']:.3f}"
+                f"  slots={probe['mem_slots_final']:.0f}"
+            )
 
         if step % log_every == 0 or step == 1:
             tqdm.write(
                 f"step={step:>6}  ce={logs['ce']:.4f}  ppl={logs['ppl']:.2f}"
                 f"  balance={logs['balance']:.4f}"
                 + (f"  r_hat={logs.get('r_hat', 0):.3f}" if "r_hat" in logs else "")
+                + (f"  mem={logs['mem_slots']:.0f}" if "mem_slots" in logs else "")
+                + (f"  gap={logs['mem_ablation_gap']:+.3f}" if "mem_ablation_gap" in logs else "")
                 + f"  lr={opt.param_groups[0]['lr']:.2e}  tok/s={tok_s:.0f}"
             )
             rec = {"step": step, "lr": opt._adam.param_groups[0]["lr"], **logs}

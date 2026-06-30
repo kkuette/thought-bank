@@ -12,7 +12,7 @@ max_seq_len: 512
 
 # mHC
 n_hc: 2
-sinkhorn_iters: 3
+sinkhorn_iters: 20      # more Sinkhorn => B closer to doubly-stochastic, ||B||2<=1
 
 # Attention
 csa_m: 4
@@ -40,13 +40,21 @@ balance_loss_weight: 1.0e-3
 training:
   device: auto
   seed: 42
-  tokenizer: gpt2
+  tokenizer: deepseek-ai/DeepSeek-V3   # modern ~129k BPE tokenizer
   lr: 3.0e-4
+  muon_lr: 0.003         # Muon LR; 0.005 still NaN'd ~step 525 with multi-pass
   weight_decay: 0.1
   steps: 5000
   warmup_steps: 100
   grad_clip: 1.0
   precision: bf16        # bf16 | fp16 | fp32
+  # Thought-memory training. Multi-pass (TBPTT) is what actually trains the
+  # thought stream and fills the bank; without it the bank stays at 1 slot and
+  # the write head gets no gradient. 512 / 64 = 8 segments => 8 thought writes
+  # per sequence (bank fills to 8; max_mem=16 so no FIFO eviction here).
+  mem_segment_len: 64
+  mem_bptt_window: 2     # >=2 lets gradient reach the write head (see train.py)
+  mem_probe_every: 200   # ablation probe: is the bank lowering CE? + bank stats
   log_every: 50
   save_every: 1000
   save_dir: checkpoints/tiny

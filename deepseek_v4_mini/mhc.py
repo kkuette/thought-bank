@@ -27,7 +27,13 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.weight * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        # Compute the variance in fp32: under bf16 autocast, x.pow(2) overflows
+        # once |x| > ~256 (bf16 max ~6.5e4), giving mean=inf -> rsqrt=0 (a finite
+        # forward) but a NaN gradient in the backward pass. fp32 avoids this.
+        dtype = x.dtype
+        xf = x.float()
+        normed = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        return self.weight * normed.to(dtype)
 
 
 class ManifoldHyperConnections(nn.Module):
@@ -62,8 +68,17 @@ class ManifoldHyperConnections(nn.Module):
         self.norm = RMSNorm(flat)
 
     # ── Sinkhorn-Knopp projection onto the Birkhoff polytope ─────────────────
-    def _sinkhorn(self, M: torch.Tensor) -> torch.Tensor:
-        """M: [BT, n_hc, n_hc], positive.  Returns doubly stochastic matrix."""
+    def _sinkhorn(self, logits: torch.Tensor) -> torch.Tensor:
+        """logits: [BT, n_hc, n_hc] (pre-exp scores). Returns doubly stochastic M.
+
+        We exponentiate here with a per-matrix max subtraction (log-sum-exp
+        stabilisation). Sinkhorn normalisation is invariant to a global positive
+        rescale of M, so subtracting a constant before exp leaves the result
+        unchanged while keeping exp inputs <= 0 (so exp <= 1, no bf16 overflow).
+        Exponentiating the raw scores directly made exp(B_raw) — and hence its
+        gradient, which equals exp — blow up to inf/NaN as weights grew.
+        """
+        M = (logits - logits.amax(dim=(-2, -1), keepdim=True)).exp()
         for _ in range(self.sinkhorn_iters):
             M = M / (M.sum(dim=-1, keepdim=True) + 1e-8)   # row normalise
             M = M / (M.sum(dim=-2, keepdim=True) + 1e-8)   # column normalise
@@ -84,13 +99,18 @@ class ManifoldHyperConnections(nn.Module):
 
         # ── Generate raw (unconstrained) A, B, C ─────────────────────────────
         A_raw = self.alpha_pre.tanh() * self.W_pre(X_hat) + self.S_pre   # [BT, n_hc]
-        B_raw = self.alpha_res.tanh() * self.W_res(X_hat) + self.S_res   # [BT, n_hc²]
+        # The dynamic B logits feed exp()→Sinkhorn. A and C are bounded by sigmoid,
+        # but B_raw was not: nothing capped W_res's magnitude, so it ran away
+        # (W_res → ∞), making the exp/Sinkhorn backward Jacobian explode into NaN.
+        # Bound the dynamic part with tanh (∈(-1,1)); S_res (init = identity) keeps
+        # B near-identity at start. exp inputs stay O(1) → stable forward & backward.
+        B_raw = self.alpha_res.tanh() * self.W_res(X_hat).tanh() + self.S_res  # [BT, n_hc²]
         C_raw = self.alpha_post.tanh() * self.W_post(X_hat) + self.S_post # [BT, n_hc]
 
         # ── Apply constraints (DeepSeek-V4 §2.2 eqs. 6-8) ──────────────────────
         A    = torch.sigmoid(A_raw)                                # [BT, n_hc] non-neg, bounded
         C    = 2.0 * torch.sigmoid(C_raw)                         # [BT, n_hc] non-neg, ≤ 2
-        B_ds = self._sinkhorn(B_raw.view(BT, n_hc, n_hc).exp())   # doubly stochastic
+        B_ds = self._sinkhorn(B_raw.view(BT, n_hc, n_hc))         # doubly stochastic (exp inside)
 
         # ── Compute layer input: h_in = A ⊗ X (weighted sum of n_hc streams) ─
         X_r = X.reshape(BT, n_hc, d)

@@ -1,11 +1,15 @@
-# DeepSeekV4Mini – small config (~50M params, single RTX 3090)
+# DeepSeekV4Mini – small config (single RTX 3090, 24 GB)
 # python -m deepseek_v4_mini.train deepseek_v4_mini/configs/small.yaml
+#
+# Vocab note: the DeepSeek-V3 tokenizer has a ~129k vocabulary. With weight-tied
+# embeddings that single matrix is vocab*d_model params (~66M at d_model=512), so
+# d_model is widened here to keep the transformer body from being dwarfed by it.
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-vocab_size: 50257
-d_model: 256
-n_layers: 6              # 3 CSA (layers 0,2,4) + 3 HCA (layers 1,3,5)
-n_heads: 4
+vocab_size: 129280        # set automatically from tokenizer; kept here for clarity
+d_model: 512
+n_layers: 8               # 4 CSA (layers 0,2,4,6) + 4 HCA (layers 1,3,5,7)
+n_heads: 8
 d_head: 64
 dropout: 0.05
 max_seq_len: 2048
@@ -18,20 +22,37 @@ sinkhorn_iters: 5
 csa_m: 4
 hca_m: 32
 top_k_csa: 8
-n_win: 16
-d_latent_q: 64
+n_win: 32
+d_latent_q: 128
 n_groups: 2
 
 # MoE
 n_experts: 8
 n_shared: 1
 top_k_experts: 2
-d_ff: 512
+d_ff: 1024
 
-# Thought memory
+# Thought memory bank (dual-stream). Enlarged capacity:
+#   - mem_dim / n_mem_layers control the thought-stream width & depth
+#   - max_mem is the bank ceiling; when reached, the oldest consolidate_k slots
+#     are compressed into one (see memory.py MemoryConsolidator)
+# The realised bank size during training is ~ seq_len / mem_segment_len, capped
+# at max_mem. These only train when mem_segment_len > 0 (multi-pass / TBPTT).
 use_thought_memory: true
-mem_dim: 64
-max_mem: 32
+mem_dim: 128
+max_mem: 64
+consolidate_k: 8
+n_mem_layers: 4
+mem_n_heads: 4
+mem_d_head: 32
+mem_d_latent_q: 32
+mem_csa_m: 2
+mem_hca_m: 8
+mem_top_k: 4
+mem_n_win: 8
+mem_n_experts: 4
+mem_top_k_experts: 2
+mem_d_ff: 256
 
 # Auxiliary loss weight
 balance_loss_weight: 1.0e-3
@@ -40,13 +61,39 @@ balance_loss_weight: 1.0e-3
 training:
   device: auto
   seed: 42
-  tokenizer: gpt2
-  lr: 2.0e-4
+  tokenizer: deepseek-ai/DeepSeek-V3   # modern ~129k BPE tokenizer (fast, no remote code)
+  lr: 2.0e-4              # AdamW LR (embeddings, norms, mHC scalars)
+  muon_lr: 0.005         # Muon LR for 2-D weights. The 0.02 default is too high
+                         # at this scale: Muon scales updates by sqrt(fan_in), so
+                         # small projection heads run away and overflow to NaN.
   weight_decay: 0.1
   steps: 50000
-  warmup_steps: 500
+  warmup_steps: 1000
   grad_clip: 1.0
+  grad_accum: 4            # effective batch = batch_size * grad_accum = 48
   precision: bf16
+  # Memory-efficient fused cross-entropy: computes the ~129k-vocab logits in
+  # chunks of ce_chunk_tokens under activation checkpointing, so the full
+  # [B,T,V] logits are never materialised. This is what lets batch_size stay
+  # large despite the big vocab. Set fused_ce: false to fall back to dense CE.
+  fused_ce: true
+  ce_chunk_tokens: 1024
+  # Multi-pass / TBPTT: process each sequence in segments of this many tokens,
+  # carrying (and detaching) the thought-memory bank across them. This is what
+  # actually trains the thought stream and fills the bank. 0 = single pass (the
+  # bank stays at 1 slot and the thought stream gets no gradient).
+  # Bank fills to ~ seq_len / mem_segment_len = 2048 / 256 = 8 slots here.
+  # Bonus: peak VRAM drops, since each forward only spans one short segment.
+  mem_segment_len: 256
+  # TBPTT window. The memory write is a pure output of a segment, so its only
+  # consumer is the NEXT segment's read. With window 1 (detach every boundary)
+  # the write head — write_gate, thought_head, write_decision — gets ZERO
+  # gradient and never learns; the bank is filled by an untrained projection.
+  # Window 2 keeps the graph across one boundary so segment i+1's loss trains
+  # segment i's write. Cost: 2 segments of activations live at once (still
+  # bounded; each segment is short). Set to 1 only to reproduce the old (broken)
+  # write behaviour.
+  mem_bptt_window: 2
   log_every: 100
   save_every: 5000
   save_dir: checkpoints/small
@@ -60,5 +107,8 @@ data:
   name: roneneldan/TinyStories
   text_field: text
   split: train
+  # With multi-pass (mem_segment_len) the GPU only ever holds one segment at a
+  # time, so a long total seq_len is cheap. seq_len 2048 / segment 256 = 8
+  # memory slots per sequence. Tune batch_size to your VRAM (fused_ce on).
   seq_len: 2048
-  batch_size: 4
+  batch_size: 12

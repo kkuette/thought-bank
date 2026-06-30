@@ -14,14 +14,23 @@ directly: slot 0 = oldest surviving thought, slot M-1 = most recent.
 `nn.Embedding(max_mem, mem_dim)` provides learned slot-position embeddings so
 the thought-stream CSA/HCA can exploit this temporal structure.
 
-Consolidation
-─────────────
-When writing would exceed max_mem, the oldest `consolidate_k` vectors are
-compressed into ONE new vector via cross-attention where:
-  - Query  = projection of the current text summary (what matters NOW)
-  - Keys/Values = the vectors being evicted (what we knew BEFORE)
-The result carries information from both past and present, then the
-`consolidate_k` old slots are replaced by this single condensed vector.
+Eviction (FIFO)
+───────────────
+The bank is a strict rolling buffer: each pass appends one thought vector and,
+once the bank exceeds max_mem, the OLDEST slot is dropped (`mem_bank[:, -max_mem:]`).
+No learned consolidation module — this is the clean baseline so the memory's
+usefulness can be attributed to the bank content itself, not to an auxiliary
+compressor. Far-past information beyond max_mem segments is lost cold.
+
+Write as a modality choice (gated)
+──────────────────────────────────
+The write is no longer unconditional. `_new_thought` produces, alongside the
+per-dim content gate, a scalar write-decision α = sigmoid(write_decision(ctx))
+∈ [0,1] that multiplicatively scales the whole new vector. α≈0 means "nothing
+worth committing this pass" (a near-zero slot, soon evicted by FIFO); α≈1 means
+"commit this thought". The choice is fully differentiable and driven by the LM
+loss, so the model learns when to use memory vs. let the step pass — directly
+attacking the slot redundancy (near-duplicate writes) seen with forced writes.
 
 ThoughtBlock
 ────────────
@@ -40,55 +49,6 @@ from .mhc import ManifoldHyperConnections, RMSNorm
 from .attention import CompressedSparseAttention, HeavilyCompressedAttention
 from .moe import DeepSeekMoE
 from .config import DeepSeekV4MiniConfig
-
-
-# ── Memory consolidation ──────────────────────────────────────────────────────
-
-class MemoryConsolidator(nn.Module):
-    """
-    Compress the oldest `consolidate_k` thought vectors into one new vector
-    that is informed by the current text context.
-
-    Concretely:
-        query  = proj(mean(H_text))           # what the model currently cares about
-        keys   = old_vecs                      # what was known before
-        values = old_vecs
-        consolidated = cross_attn(Q, K, V)    # context-aware summary of old thoughts
-    """
-
-    def __init__(self, mem_dim: int, d_model: int, consolidate_k: int, n_heads: int = 2) -> None:
-        super().__init__()
-        self.k = consolidate_k
-        # Project text summary to mem_dim for the query
-        self.ctx_proj = nn.Linear(d_model, mem_dim, bias=False)
-        self.norm_q   = RMSNorm(mem_dim)
-        # Multi-head cross-attention (old thoughts → KV, text → Q)
-        assert mem_dim % n_heads == 0
-        self.attn   = nn.MultiheadAttention(mem_dim, n_heads, batch_first=True, dropout=0.0)
-        self.norm_o = RMSNorm(mem_dim)
-        self.out    = nn.Linear(mem_dim, mem_dim, bias=False)
-
-    def forward(self, mem_bank: torch.Tensor, H_text: torch.Tensor) -> torch.Tensor:
-        """
-        mem_bank : [B, M, mem_dim]  (M >= max_mem, consolidation triggered)
-        H_text   : [B, T, d_model]
-        Returns  : [B, M - k + 1, mem_dim]
-                   (oldest k slots replaced by 1 consolidated vector)
-        """
-        k        = self.k
-        old_vecs = mem_bank[:, :k, :]   # [B, k, mem_dim]  — to compress
-        kept     = mem_bank[:, k:, :]   # [B, M-k, mem_dim] — to keep
-
-        # Text summary as query
-        h_summary = H_text.mean(dim=1)                         # [B, d_model]
-        query     = self.norm_q(self.ctx_proj(h_summary)).unsqueeze(1)  # [B, 1, mem_dim]
-
-        # Cross-attention: what matters in old memories given the current context?
-        consolidated, _ = self.attn(query, old_vecs, old_vecs)  # [B, 1, mem_dim]
-        consolidated    = self.out(self.norm_o(consolidated))    # [B, 1, mem_dim]
-
-        # New bank: [consolidated_summary | kept_memories]
-        return torch.cat([consolidated, kept], dim=1)           # [B, M-k+1, mem_dim]
 
 
 # ── Thought-stream transformer block ─────────────────────────────────────────
@@ -159,11 +119,9 @@ class ThoughtStream(nn.Module):
       2. Expand to mHC residual format [B, M, n_hc, mem_dim].
       3. Run through n_mem_layers ThoughtBlocks (CSA alternates with HCA).
       4. Collapse mHC → [B, M, mem_dim]  (H_thought — for text blocks to read).
-      5. Cross-modal update: thoughts absorb text summary via a gated residual.
-      6. Consolidation: if bank is full, compress oldest k vectors using the
-         current text context into one richer vector (MemoryConsolidator).
-      7. Write gate: decide whether to append a new thought vector derived from
-         the current last-token text hidden state.
+      6. Gated write: produce a new thought vector from the current text,
+         scaled by a learned scalar write-decision α (modality choice).
+      7. Append it and FIFO-evict the oldest slot if the bank exceeds max_mem.
       8. Return updated bank and the processed thought representations.
     """
 
@@ -186,11 +144,6 @@ class ThoughtStream(nn.Module):
         self.A_out_net = nn.Linear(d, n_hc, bias=False)
         self.norm_out  = RMSNorm(d)
 
-        # Cross-modal: thought ← text  (gated residual from text summary)
-        self.text_proj = nn.Linear(cfg.d_model, d, bias=False)
-        self.text_gate = nn.Linear(d, d, bias=False)   # per-dim gate
-        self.norm_tm   = RMSNorm(d)
-
         # Write head: attention-pooled context → per-dim gate + thought vector.
         # write_ctx_q projects each text token to a scalar score for the pool.
         # write_gate is per-dim (mem_dim) so each feature dimension can be
@@ -200,12 +153,10 @@ class ThoughtStream(nn.Module):
         self.thought_head = nn.Linear(cfg.d_model, d, bias=False)
         self.norm_write   = RMSNorm(d)
 
-        # Consolidator
-        self.consolidator = MemoryConsolidator(
-            mem_dim=d, d_model=cfg.d_model,
-            consolidate_k=cfg.consolidate_k,
-            n_heads=max(1, cfg.mem_n_heads),
-        )
+        # Write-decision head: scalar α = sigmoid(.) ∈ [0,1] scaling the whole
+        # new thought vector — the model's "write or skip" modality choice.
+        # bias=0 → α≈0.5 at init (neutral); the LM loss then learns when to write.
+        self.write_decision = nn.Linear(cfg.d_model, 1, bias=True)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -257,34 +208,24 @@ class ThoughtStream(nn.Module):
         self,
         H_text: torch.Tensor,           # [B, T, d_model]
         mem_bank: torch.Tensor,         # [B, M, mem_dim]
-        H_thought: torch.Tensor,        # [B, M, mem_dim]  pre-computed by _process_only
     ) -> torch.Tensor:
         """
-        Apply cross-modal update to pre-computed H_thought, run consolidation
-        if needed, and append a new thought vector.
+        Append a new gated thought vector and FIFO-evict the oldest slot.
 
-        Called by DualModalDeepSeekV4Mini after text blocks, reusing H_thought
-        already computed before text blocks to avoid running thought-stream
-        blocks twice per forward pass.
+        Called by DualModalDeepSeekV4Mini after text blocks. The thought-block
+        outputs read by the text stream are produced once by _process_only before
+        the text blocks; this write step only needs the post-text H_text summary,
+        so it does not re-run the thought blocks.
 
         Returns updated mem_bank [B, M', mem_dim].
         """
         cfg = self.cfg
 
-        # Cross-modal: thoughts absorb text summary (gated)
-        h_text_summary = H_text.mean(dim=1, keepdim=True)        # [B, 1, d_model]
-        h_proj = self.text_proj(h_text_summary)                   # [B, 1, mem_dim]
-        gate   = torch.sigmoid(self.text_gate(self.norm_tm(H_thought)))
-        # H_thought updated in place (not returned — caller already has it)
-        _ = H_thought + gate * h_proj
-
-        # Consolidation
-        if mem_bank.size(1) >= cfg.max_mem:
-            mem_bank = self.consolidator(mem_bank, H_text)
-
-        # Append new thought
+        # Gated write + FIFO eviction
         m_new    = self._new_thought(H_text)
         mem_bank = torch.cat([mem_bank, m_new], dim=1)
+        if mem_bank.size(1) > cfg.max_mem:
+            mem_bank = mem_bank[:, -cfg.max_mem:, :]
         return mem_bank
 
     # ── Main forward ──────────────────────────────────────────────────────────
@@ -311,19 +252,11 @@ class ThoughtStream(nn.Module):
         # ── 1. Run thought-stream blocks ──────────────────────────────────────
         H_thought, bal = self._process(mem_bank)                # [B, M, mem_dim]
 
-        # ── 2. Cross-modal: thoughts absorb text summary (gated) ─────────────
-        h_text_summary = H_text.mean(dim=1, keepdim=True)       # [B, 1, d_model]
-        h_proj = self.text_proj(h_text_summary)                  # [B, 1, mem_dim]
-        gate   = torch.sigmoid(self.text_gate(self.norm_tm(H_thought)))  # [B, M, mem_dim]
-        H_thought = H_thought + gate * h_proj                    # broadcast over M
-
-        # ── 3. Consolidation: compress oldest k slots if bank is full ─────────
-        if mem_bank.size(1) >= cfg.max_mem:
-            mem_bank = self.consolidator(mem_bank, H_text)       # [B, M-k+1, mem_dim]
-
-        # ── 4. Write new thought vector ───────────────────────────────────────
+        # ── 2. Gated write + FIFO eviction ────────────────────────────────────
         m_new    = self._new_thought(H_text)                     # [B, 1, mem_dim]
-        mem_bank = torch.cat([mem_bank, m_new], dim=1)           # [B, M'+1, mem_dim]
+        mem_bank = torch.cat([mem_bank, m_new], dim=1)           # [B, M+1, mem_dim]
+        if mem_bank.size(1) > cfg.max_mem:                       # drop oldest slot
+            mem_bank = mem_bank[:, -cfg.max_mem:, :]
 
         return H_thought, mem_bank, bal
 
@@ -332,14 +265,19 @@ class ThoughtStream(nn.Module):
         Produce a new thought vector from the current text.
 
         Context: soft attention pool over all positions (vs. last-token only).
-        Gate: per-dim sigmoid in [0,1]^mem_dim so each feature can be written
+        Per-dim gate: sigmoid in [0,1]^mem_dim so each feature can be written
         independently — near-zero gate dims suppress uninformative features.
+        Write-decision α: scalar sigmoid in [0,1] scaling the whole vector — the
+        model's "write or skip" modality choice (α≈0 → an empty slot, evicted by
+        FIFO; α≈1 → commit this thought). Fully differentiable; learned via the LM
+        loss, so forced/redundant writes are no longer imposed every pass.
         """
         # Attention-pooled summary: learned scalar score per position → softmax
         scores  = self.write_ctx_q(H_text).squeeze(-1)         # [B, T]
         weights = torch.softmax(scores, dim=-1)                 # [B, T]
         h_ctx   = (weights.unsqueeze(-1) * H_text).sum(dim=1)  # [B, d_model]
 
-        p = torch.sigmoid(self.write_gate(h_ctx))              # [B, mem_dim]
-        m = self.norm_write(self.thought_head(h_ctx))          # [B, mem_dim]
-        return (p * m).unsqueeze(1)                            # [B, 1, mem_dim]
+        p     = torch.sigmoid(self.write_gate(h_ctx))          # [B, mem_dim] content gate
+        m     = self.norm_write(self.thought_head(h_ctx))      # [B, mem_dim] thought
+        alpha = torch.sigmoid(self.write_decision(h_ctx))      # [B, 1] modality choice
+        return (alpha * p * m).unsqueeze(1)                    # [B, 1, mem_dim]
