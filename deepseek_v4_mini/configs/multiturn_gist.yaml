@@ -1,0 +1,82 @@
+# Synthetic multi-turn GIST task — the clean pass/fail for cross-turn memory.
+#
+# UltraChat never produced a content_gap because its ~4 turns are self-contained:
+# nothing in a later turn REQUIRES an earlier one. This task is built so it does.
+#
+#   turn 0 : [BOS, CTX_c]              establishes a latent context c (loss-masked)
+#   turn t : [Q] -> predict s_t ~ P_c  answer depends ONLY on c
+#
+# Each answer turn is a single [Q] segment: no symbol and no c are in the attention
+# window, so the only path to c is the thought bank written at turn 0. Predicting
+# s_t from [Q] alone costs ~ln(S); with the gist carried it costs ~H(P_c). So
+# content_gap ≈ ln(S) - H(P_c) is LARGE and SUSTAINED iff the bank carries the gist
+# across turns. With C=8, S=64, p=0.9: ln(64)=4.16, H(P_c)≈2.60 -> expect ~1.5 nats.
+#
+#   content_gap -> ~1.5  : memory carries the gist  ✅  (proceed to the <think> token)
+#   content_gap -> ~0    : the bank can't hold one context across turns  ❌ (fix archi)
+#
+# Runs through the SAME per-turn training path + probe as the real multiturn loader.
+#
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_gist.yaml
+
+# ── Model (small; the task is tiny) ─────────────────────────────────────────────
+vocab_size: 80               # >= 3 + n_contexts(8) + n_symbols(64) = 75
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+
+n_hc: 2
+sinkhorn_iters: 20
+
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+
+use_thought_memory: true
+mem_dim: 32
+max_mem: 16
+
+balance_loss_weight: 1.0e-3
+mem_write_diversity: 0.05     # novelty-gated write: keep stored thoughts distinct
+
+# ── Training ────────────────────────────────────────────────────────────────────
+training:
+  device: auto
+  seed: 42
+  lr: 3.0e-4
+  muon_lr: 0.003
+  weight_decay: 0.1
+  steps: 2000
+  warmup_steps: 100
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0          # ignored: multiturn path segments per turn-slot
+  mem_bptt_window: 2          # >=2 so the turn-0 write head gets gradient (invariant)
+  grad_accum: 4               # opt step every grad_accum turn-slots
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 1000
+  save_dir: checkpoints/multiturn_gist
+  run_name: dsv4mini_multiturn_gist
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_gist/metrics.jsonl
+
+# ── Data ────────────────────────────────────────────────────────────────────────
+data:
+  task: multiturn_gist
+  n_contexts: 8               # number of latent contexts (the gist to remember)
+  n_symbols: 64               # symbol vocabulary the answers are drawn from
+  pref_mass: 0.9              # prob mass P_c puts on its symbol block
+  turns_per_conv: 6           # 1 context turn + 5 answer turns
+  batch_size: 64              # turn-aligned lanes (synthetic is cheap)

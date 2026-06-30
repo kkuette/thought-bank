@@ -341,12 +341,179 @@ def _build_persistent_file_loader(cfg_dict: dict, tokenizer, split: str = "train
     return PersistDS()
 
 
+def _encode_conversation(ex, tokenizer, u_mark, a_mark, mfield, max_len):
+    """Encode one chat example to (ids, turn_starts) or None if too short.
+
+    ids is the full token stream with role markers; turn_starts are EXCHANGE
+    boundaries — the index before each user turn except the first. Splitting there
+    makes each segment a full exchange [user_k, assistant_k]: the model sees the
+    current question in-window and the bank carries only OLDER exchanges (the real
+    'remember earlier turns' case), instead of the bank having to carry even the
+    immediate question (which an assistant-boundary split forced)."""
+    msgs = ex.get(mfield) or []
+    ids, turn_starts = [], []
+    for m in msgs:
+        role    = m.get("role", "")
+        content = m.get("content", "") or ""
+        mark    = a_mark if role == "assistant" else u_mark
+        if role == "user" and ids:          # exchange boundary (not before the 1st turn)
+            turn_starts.append(len(ids))
+        ids.extend(mark)
+        ids.extend(tokenizer.encode(content, add_special_tokens=False))
+        if len(ids) >= max_len + 1:
+            break
+    ids = ids[:max_len + 1]
+    turn_starts = [t for t in turn_starts if 0 < t < len(ids) - 1]
+    return (ids, turn_starts) if (len(ids) >= 8 and turn_starts) else None
+
+
+def _build_multiturn_loader(cfg_dict: dict, tokenizer, split: str = "train_sft"):
+    """Turn-aligned BATCHED multi-turn loader for turn-cadenced memory writes.
+
+    Writes fire once per TURN (a semantic boundary) instead of every N tokens.
+    To keep the GPU busy despite per-turn forwards, B lanes are processed in
+    lock-step by TURN INDEX: each yield is turn-slot t of all B lanes, padded to a
+    common length. Each lane independently streams conversations (refilling when a
+    conversation runs out, like the persistent file loader), so every lane is
+    always active — no all-pad rows. The bank [B, M, d] persists across turn-slots
+    within a conversation and is reset per-lane at a conversation boundary.
+
+    Yields (x [B,L], y [B,L], loss_mask [B,L] bool, reset [B] bool) where reset[b]
+    marks the first turn-segment of a new conversation in lane b. Right-padding +
+    causal attention means real tokens never attend to pads; loss_mask zeroes pad
+    targets and the write pool ignores pad positions.
+    """
+    from datasets import load_dataset
+
+    hf      = cfg_dict["data"]
+    name    = hf["name"]
+    max_len = hf["seq_len"]
+    B       = max(1, int(hf.get("batch_size", 1)))
+    mfield  = hf.get("messages_field", "messages")
+    pad_id  = tokenizer.pad_token_id or 0
+    u_mark  = tokenizer.encode("\n<|user|>\n", add_special_tokens=False)
+    a_mark  = tokenizer.encode("\n<|assistant|>\n", add_special_tokens=False)
+
+    def conv_to_turns(ids, turn_starts):
+        """Split a conversation into (x_seg, y_seg) per turn at turn_starts."""
+        x, y = ids[:-1], ids[1:]
+        bounds = [0] + turn_starts + [len(x)]
+        return [(x[a:b], y[a:b]) for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+
+    class MultiTurnBatchedDS:
+        def __iter__(self):
+            it = iter(load_dataset(name, split=split, streaming=True))
+            queues  = [[] for _ in range(B)]   # remaining turn-segments per lane
+            pending = [False] * B              # next pop starts a new conversation
+
+            def refill(b):
+                while not queues[b]:
+                    enc = _encode_conversation(next(it), tokenizer, u_mark, a_mark, mfield, max_len)
+                    if enc is None:
+                        continue
+                    queues[b] = conv_to_turns(*enc)
+                    pending[b] = True
+
+            while True:
+                segs, resets = [], []
+                for b in range(B):
+                    if not queues[b]:
+                        refill(b)
+                    segs.append(queues[b].pop(0))
+                    resets.append(pending[b])
+                    pending[b] = False
+                L = max(len(xs) for xs, _ in segs)
+                x = torch.full((B, L), pad_id, dtype=torch.long)
+                y = torch.full((B, L), pad_id, dtype=torch.long)
+                mask = torch.zeros((B, L), dtype=torch.bool)
+                for b, (xs, ys) in enumerate(segs):
+                    n = len(xs)
+                    x[b, :n] = torch.tensor(xs, dtype=torch.long)
+                    y[b, :n] = torch.tensor(ys, dtype=torch.long)
+                    mask[b, :n] = True
+                yield x, y, mask, torch.tensor(resets, dtype=torch.bool)
+
+    return MultiTurnBatchedDS()
+
+
+_GIST_DISTS_CACHE: dict = {}
+
+
+def _gist_dists(C: int, S: int, p_pref: float) -> torch.Tensor:
+    """Fixed context→symbol distribution map shared by the synthetic gist loader
+    and its probe (so both agree on P_c). Each context puts p_pref on a disjoint
+    block of k = S//C symbols and spreads the rest uniformly."""
+    key = (C, S, round(p_pref, 6))
+    if key not in _GIST_DISTS_CACHE:
+        k = max(1, S // C)
+        d = torch.full((C, S), (1.0 - p_pref) / max(1, S - k))
+        for c in range(C):
+            d[c, c * k: c * k + k] = p_pref / k
+        _GIST_DISTS_CACHE[key] = d / d.sum(dim=1, keepdim=True)
+    return _GIST_DISTS_CACHE[key]
+
+
+def _build_synthetic_multiturn(cfg_dict: dict):
+    """Synthetic multi-turn GIST task: a latent context set in turn 0 that later,
+    NON-overlapping short turns can only get from memory.
+
+    Each conversation (FIXED turn count, so the B lanes stay turn-aligned and reset
+    together):
+        turn 0 : [BOS, CTX_c]              -> establishes context c (loss-masked)
+        turn t : [Q] -> predict s_t ~ P_c  -> answer depends ONLY on c
+    Turn t's attention window is a single [Q] segment: no symbol and no c are in
+    view, so the ONLY path to c is the thought bank written at turn 0. Predicting
+    s_t from [Q] alone costs ~ln(S); with the gist carried it costs ~H(P_c). So
+    content_gap ≈ ln(S) - H(P_c) is LARGE and SUSTAINED iff the bank carries the
+    gist across turns — the clean pass/fail UltraChat (self-contained turns) never
+    produced.
+
+    Yields the SAME contract as the real multiturn loader, one turn-slot at a time:
+        (x [B,L], y [B,L], loss_mask [B,L] bool, reset [B] bool)
+
+    Vocab: 0=PAD 1=BOS 2=Q, contexts=[3, 3+C), symbols=[3+C, 3+C+S).
+    Set vocab_size >= 3 + n_contexts + n_symbols.
+    """
+    d      = cfg_dict["data"]
+    bs     = int(d["batch_size"])
+    C      = int(d.get("n_contexts", 8))
+    S      = int(d.get("n_symbols", 64))
+    p_pref = float(d.get("pref_mass", 0.9))
+    turns  = int(d.get("turns_per_conv", 6))     # 1 context turn + (turns-1) answers
+    BOS, Q, CTX_OFF = 1, 2, 3
+    SYM_OFF = CTX_OFF + C
+    dists   = _gist_dists(C, S, p_pref)
+
+    class GistDS:
+        def __iter__(self):
+            while True:
+                cs = torch.randint(0, C, (bs,))                  # fresh context per lane
+                # turn 0: [BOS, CTX_c] — loss-masked, only writes c into the bank
+                x = torch.stack([torch.tensor([BOS, CTX_OFF + int(c)]) for c in cs])
+                yield (x, x.clone(),
+                       torch.zeros((bs, 2), dtype=torch.bool),
+                       torch.ones(bs, dtype=torch.bool))
+                # answer turns: predict one symbol ~ P_c from [Q] (needs the bank)
+                for _ in range(turns - 1):
+                    s = torch.stack([torch.multinomial(dists[int(c)], 1) for c in cs]).view(bs)
+                    yield (torch.full((bs, 1), Q, dtype=torch.long),
+                           (SYM_OFF + s).view(bs, 1),
+                           torch.ones((bs, 1), dtype=torch.bool),
+                           torch.zeros(bs, dtype=torch.bool))
+
+    return GistDS()
+
+
 def _build_dataloader(cfg_dict: dict, tokenizer, split: str = "train"):
     """Thin wrapper around HF streaming dataset → fixed-length batches."""
     if cfg_dict["data"].get("task") == "associative_recall":
         return _build_synthetic_recall(cfg_dict)
     if cfg_dict["data"].get("task") == "latent_context":
         return _build_latent_context(cfg_dict)
+    if cfg_dict["data"].get("task") == "multiturn_gist":
+        return _build_synthetic_multiturn(cfg_dict)
+    if cfg_dict["data"].get("task") == "multiturn":
+        return _build_multiturn_loader(cfg_dict, tokenizer, cfg_dict["data"].get("split", "train_sft"))
     if cfg_dict["data"].get("persist"):
         return _build_persistent_file_loader(cfg_dict, tokenizer, split)
 
@@ -420,7 +587,9 @@ def fused_cross_entropy(
         else:
             loss_c = _ce_chunk(h_c, weight, t_c)
         total = total + loss_c
-    return total / max(1, N)
+    # _ce_chunk sums and skips ignore_index (-100), so divide by REAL tokens only.
+    valid = int((tgt != -100).sum())
+    return total / max(1, valid)
 
 
 def compute_loss(
@@ -428,9 +597,17 @@ def compute_loss(
     targets: torch.LongTensor,
     balance_weight: float,
     ce_chunk_tokens: int = 1024,
+    write_cost: float = 0.0,
+    write_diversity: float = 0.0,
+    loss_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
     balance_loss = out["balance_loss"]
     p_gates      = out.get("p_gates")    # [B, T] or None (legacy model only)
+
+    # Padded multi-turn batches: ignore pad positions in the loss (set to -100,
+    # which F.cross_entropy skips; the fused path divides by real-token count).
+    if loss_mask is not None:
+        targets = targets.masked_fill(~loss_mask.bool(), -100)
 
     if out.get("logits") is not None:
         logits = out["logits"]            # [B, T, V]
@@ -439,6 +616,7 @@ def compute_loss(
         ce = F.cross_entropy(
             logits.transpose(1, 2),       # [B, V, T]
             targets,                      # [B, T]
+            ignore_index=-100,
         )
     else:
         # Memory-efficient path: model returned hidden states + tied head weight.
@@ -462,6 +640,26 @@ def compute_loss(
     if write_alpha is not None:
         logs["write_alpha"] = float(write_alpha)  # mean write prob α (write/skip)
 
+    # Sparsity budget on the write decision: cost · E[-log(1-α)]. Gives writing an
+    # opportunity cost so α stops saturating at 1 and becomes selective. Probes call
+    # compute_loss with the default write_cost=0.0, so probe CE stays uncontaminated.
+    write_penalty = out.get("write_penalty")
+    if write_penalty is not None and write_cost > 0.0:
+        pen  = write_cost * write_penalty
+        loss = loss + pen
+        logs["write_pen"] = float(pen.detach())
+
+    # Novelty-gated write: penalise similarity of the new write to existing slots.
+    # Pushes the head to store diverse thoughts (raises bank effective rank). The
+    # raw redundancy (max cosine) is logged regardless of weight, as a diagnostic.
+    write_redundancy = out.get("write_redundancy")
+    if write_redundancy is not None:
+        logs["write_redund"] = float(write_redundancy.detach())
+        if write_diversity > 0.0:
+            div  = write_diversity * write_redundancy
+            loss = loss + div
+            logs["write_div"] = float(div.detach())
+
     return loss, logs
 
 
@@ -481,6 +679,9 @@ def forward_backward(
     use_amp: bool,
     bptt_window: int = 2,
     init_mem: Optional[torch.Tensor] = None,
+    write_cost: float = 0.0,
+    write_diversity: float = 0.0,
+    seg_bounds: Optional[torch.Tensor] = None,
 ) -> tuple[dict, Optional[torch.Tensor]]:
     """Forward + backward for one micro-batch, returning (averaged logs, final bank).
 
@@ -505,7 +706,13 @@ def forward_backward(
     (still bounded). W=2 is the minimal value that trains the write head.
     """
     T = x.size(1)
-    if seg_len and 0 < seg_len < T:
+    if seg_bounds is not None and seg_bounds.numel() > 0:
+        # Explicit semantic segmentation (multi-turn: split at assistant-turn starts).
+        # One write fires per turn-segment; cadence is the turn, not a fixed length.
+        bounds = [int(b) for b in seg_bounds.tolist() if 0 < int(b) < T]
+        xs = torch.tensor_split(x, bounds, dim=1)
+        ys = torch.tensor_split(y, bounds, dim=1)
+    elif seg_len and 0 < seg_len < T:
         xs = x.split(seg_len, dim=1)
         ys = y.split(seg_len, dim=1)
     else:
@@ -520,7 +727,7 @@ def forward_backward(
     for i, (x_s, y_s) in enumerate(zip(xs, ys)):
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             out = model(x_s, init_mem=mem, compute_logits=not fused_ce)
-            loss, logs = compute_loss(out, y_s, balance_w, ce_chunk)
+            loss, logs = compute_loss(out, y_s, balance_w, ce_chunk, write_cost, write_diversity)
         # Scale so accumulated grads match a single large batch averaged over
         # both gradient-accumulation micro-batches and segments.
         seg_loss = scaler.scale(loss / (grad_accum * n_seg))
@@ -596,13 +803,32 @@ def memory_probe(
     )
     bank_norm = float(mem.float().norm(dim=-1).mean()) if mem is not None else 0.0
     write_rate = sum(alphas) / len(alphas) if alphas else 0.0
+    eff_rank = _effective_rank(mem)
     return {
         "mem_ablation_gap": gap,        # CE_without - CE_with  (>0 => memory helps)
         "mem_diversity":    diversity,  # std across slots (~0 => collapsed/useless)
+        "mem_eff_rank":     eff_rank,   # entropy eff. rank of slots (~1 => duplicates)
         "mem_bank_norm":    bank_norm,
         "mem_slots_final":  float(mem.size(1)) if mem is not None else 0.0,
         "mem_write_rate":   write_rate, # mean α: how strongly the model commits writes
     }
+
+
+def _effective_rank(mem: Optional[torch.Tensor]) -> float:
+    """Entropy effective rank of the bank slots: exp(H(p)) with p = normalised
+    squared singular values of the centred bank. ~1 => all slots ≈ one direction
+    (near-duplicate writes); ~max_mem => fully diverse. The honest redundancy
+    metric — unlike per-dim std (mem_diversity), it catches directional collapse."""
+    if mem is None or mem.size(1) < 2:
+        return 0.0
+    bank = mem[0].float()
+    bank = bank - bank.mean(dim=0, keepdim=True)
+    sv = torch.linalg.svdvals(bank)
+    s2 = sv ** 2
+    if float(s2.sum()) <= 0:
+        return 0.0
+    p = s2 / s2.sum()
+    return float(torch.exp(-(p * (p + 1e-12).log()).sum()))
 
 
 @torch.no_grad()
@@ -667,22 +893,218 @@ def persistence_probe(
             ces.append(logs["ce"])
         return (sum(ces) / max(1, len(ces))), mem
 
-    mem_carried = None
-    ce_carried, ce_reset = [], []
-    for k, c in enumerate(chunks):
-        ce_c, mem_carried = run_chunk(c, mem_carried)   # carried across chunks
-        ce_r, _           = run_chunk(c, None)          # bank reset this chunk
-        if k > 0:                                        # persistence only matters past chunk 0
-            ce_carried.append(ce_c)
-            ce_reset.append(ce_r)
+    # Disentangle CONTENT from STRUCTURE. persist_gap (carried vs reset) conflates
+    # two things: the written content AND the bank structure (slot count + slot
+    # positional embeddings) — a carried bank has ~max_mem slots, a reset one
+    # rebuilds from empty. A zero-content carried arm (writes zeroed, slots still
+    # appended → identical slot count) isolates them:
+    #   content_gap   = CE_zero  - CE_real   (pure content, slot count held equal)
+    #   structure_gap = CE_reset - CE_zero   (slot-count / positional structure)
+    #   persist_gap   = CE_reset - CE_real   = content_gap + structure_gap
+    ts = getattr(model, "thought_stream", None)
+    orig_new = ts._new_thought if ts is not None else None
+
+    def carried_run(zero_content: bool):
+        if ts is not None:
+            ts._new_thought = (lambda H, b=None, p=None: torch.zeros_like(orig_new(H, b, p))) if zero_content else orig_new
+        mem = None
+        ces = []
+        for c in chunks:
+            ce_c, mem = run_chunk(c, mem)
+            ces.append(ce_c)
+        if ts is not None:
+            ts._new_thought = orig_new
+        return ces
+
+    ce_real = carried_run(zero_content=False)
+    ce_zero = carried_run(zero_content=True)
+    ce_reset = [run_chunk(c, None)[0] for c in chunks]
 
     if was_training:
         model.train()
 
-    gap = (sum(ce_reset) - sum(ce_carried)) / len(ce_carried) if ce_carried else 0.0
+    def avg_tail(xs):                                     # chunks k>0 only
+        return sum(xs[1:]) / max(1, len(xs[1:]))
+    R, Z, S = avg_tail(ce_real), avg_tail(ce_zero), avg_tail(ce_reset)
     return {
-        "persist_gap":     gap,                          # CE_reset - CE_carried (>0 => persistence helps)
-        "persist_chunks":  float(len(ce_carried) + 1),
+        "persist_gap":   S - R,                          # content + structure (legacy headline)
+        "content_gap":   Z - R,                          # PURE content benefit (the metric to trust)
+        "structure_gap": S - Z,                          # slot-count / positional component
+        "persist_chunks": float(len(ce_real)),
+    }
+
+
+@torch.no_grad()
+def multiturn_probe(
+    model: nn.Module,
+    tokenizer,
+    cfg_dict: dict,
+    *,
+    fused_ce: bool,
+    ce_chunk: int,
+    balance_w: float,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+) -> dict:
+    """Turn-cadenced memory probe on one freshly-streamed conversation (batch=1).
+
+    Fetches its own conversation (independent of the training batch, which is now a
+    padded turn-slot), segments it by assistant-turn starts and runs three arms over
+    turns k>0, measuring mean CE:
+      real   : bank carried across turns, real writes
+      zero   : bank carried, writes zeroed (slots kept) -> isolates content
+      ablate : no bank at all (init_mem=None each turn)
+    Returns ablation_gap (ablate-real), content_gap (zero-real, the metric to trust)
+    and the final bank's effective rank (redundancy of stored thoughts).
+    """
+    from datasets import load_dataset
+    hf      = cfg_dict["data"]
+    max_len = hf["seq_len"]
+    mfield  = hf.get("messages_field", "messages")
+    min_t   = int(hf.get("min_turns", 2))
+    u_mark  = tokenizer.encode("\n<|user|>\n", add_special_tokens=False)
+    a_mark  = tokenizer.encode("\n<|assistant|>\n", add_special_tokens=False)
+    enc = None
+    for ex in load_dataset(hf["name"], split=hf.get("split", "train_sft"), streaming=True):
+        e = _encode_conversation(ex, tokenizer, u_mark, a_mark, mfield, max_len)
+        if e is not None and len(e[1]) >= min_t:
+            enc = e
+            break
+    if enc is None:
+        return {}
+    ids, turn_starts = enc
+    x = torch.tensor(ids[:-1], dtype=torch.long).unsqueeze(0).to(device)
+    y = torch.tensor(ids[1:],  dtype=torch.long).unsqueeze(0).to(device)
+    bounds = [int(b) for b in turn_starts if 0 < int(b) < x.size(1)]
+    if not bounds:
+        return {}
+    xs = torch.tensor_split(x, bounds, dim=1)
+    ys = torch.tensor_split(y, bounds, dim=1)
+    was_training = model.training
+    model.eval()
+
+    ts = getattr(model, "thought_stream", None)
+    orig_new = ts._new_thought if ts is not None else None
+
+    def run(zero_content: bool, ablate: bool):
+        if ts is not None:
+            ts._new_thought = (
+                (lambda H, b=None, p=None: torch.zeros_like(orig_new(H, b, p))) if zero_content else orig_new
+            )
+        mem = None
+        ces = []
+        for i, (x_s, y_s) in enumerate(zip(xs, ys)):
+            if x_s.size(1) < 2:
+                continue
+            init = None if ablate else mem
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                out = model(x_s, init_mem=init, compute_logits=not fused_ce)
+                _, lg = compute_loss(out, y_s, balance_w, ce_chunk)
+            if not ablate:
+                mem = out["mem_bank"].detach()
+            if i > 0:
+                ces.append(lg["ce"])
+        if ts is not None:
+            ts._new_thought = orig_new
+        return (sum(ces) / max(1, len(ces)) if ces else 0.0), mem
+
+    ce_real, mem = run(zero_content=False, ablate=False)
+    ce_zero, _   = run(zero_content=True,  ablate=False)
+    ce_abl,  _   = run(zero_content=False, ablate=True)
+
+    if was_training:
+        model.train()
+    return {
+        "mem_ablation_gap": ce_abl - ce_real,            # whole-pathway benefit
+        "content_gap":      ce_zero - ce_real,           # pure content (trust this)
+        "mem_eff_rank":     _effective_rank(mem),        # redundancy of stored thoughts
+        "mem_slots_final":  float(mem.size(1)) if mem is not None else 0.0,
+        "mem_turns":        float(len(xs)),
+    }
+
+
+def synthetic_multiturn_probe(
+    model: nn.Module,
+    cfg_dict: dict,
+    *,
+    fused_ce: bool,
+    ce_chunk: int,
+    balance_w: float,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+    n_conv: int = 16,
+) -> dict:
+    """Gist probe for the synthetic multi-turn task: averages CE over the answer
+    turns (t>0) of n_conv fresh conversations under three arms.
+      real   : bank carried from turn 0, real writes
+      zero   : bank carried, writes zeroed (slots kept) -> isolates content
+      ablate : no bank at all (init_mem=None each turn)
+    content_gap = ce_zero - ce_real is the verdict: ≈ ln(S) - H(P_c) if the gist is
+    carried, ~0 if the bank can't hold one context across turns.
+    """
+    d      = cfg_dict["data"]
+    C      = int(d.get("n_contexts", 8))
+    S      = int(d.get("n_symbols", 64))
+    p_pref = float(d.get("pref_mass", 0.9))
+    turns  = int(d.get("turns_per_conv", 6))
+    BOS, Q, CTX_OFF = 1, 2, 3
+    SYM_OFF = CTX_OFF + C
+    dists   = _gist_dists(C, S, p_pref)
+
+    was_training = model.training
+    model.eval()
+    ts = getattr(model, "thought_stream", None)
+    orig_new = ts._new_thought if ts is not None else None
+
+    # Same conversations across the three arms for a low-variance gap.
+    convs = []
+    for _ in range(n_conv):
+        c = int(torch.randint(0, C, (1,)))
+        syms = [int(torch.multinomial(dists[c], 1)) for _ in range(turns - 1)]
+        convs.append((c, syms))
+
+    def run(zero_content: bool, ablate: bool):
+        if ts is not None:
+            ts._new_thought = (
+                (lambda H, b=None, p=None: torch.zeros_like(orig_new(H, b, p))) if zero_content else orig_new
+            )
+        ces, last_mem = [], None
+        for c, syms in convs:
+            mem = None
+            x0 = torch.tensor([[BOS, CTX_OFF + c]], device=device)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                out = model(x0, init_mem=None, compute_logits=not fused_ce)
+            if not ablate:
+                mem = out["mem_bank"].detach()
+            for s in syms:
+                xq = torch.tensor([[Q]], device=device)
+                yq = torch.tensor([[SYM_OFF + s]], device=device)
+                init = None if ablate else mem
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    out = model(xq, init_mem=init, compute_logits=not fused_ce)
+                    _, lg = compute_loss(out, yq, balance_w, ce_chunk)
+                if not ablate:
+                    mem = out["mem_bank"].detach()
+                ces.append(lg["ce"])
+            last_mem = mem
+        if ts is not None:
+            ts._new_thought = orig_new
+        return (sum(ces) / max(1, len(ces)) if ces else 0.0), last_mem
+
+    ce_real, mem = run(zero_content=False, ablate=False)
+    ce_zero, _   = run(zero_content=True,  ablate=False)
+    ce_abl,  _   = run(zero_content=False, ablate=True)
+
+    if was_training:
+        model.train()
+    return {
+        "mem_ablation_gap": ce_abl - ce_real,
+        "content_gap":      ce_zero - ce_real,
+        "mem_eff_rank":     _effective_rank(mem) if mem is not None else 0.0,
+        "mem_slots_final":  float(mem.size(1)) if mem is not None else 0.0,
+        "mem_turns":        float(turns),
     }
 
 
@@ -716,7 +1138,7 @@ def main() -> None:
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
     # Synthetic tasks have no text: keep vocab_size from the yaml, no tokenizer.
-    if data_cfg.get("task") in ("associative_recall", "latent_context"):
+    if data_cfg.get("task") in ("associative_recall", "latent_context", "multiturn_gist"):
         tokenizer = None
         tqdm.write(f"Synthetic task: {data_cfg['task']}  (vocab_size={model_cfg.vocab_size})")
     else:
@@ -801,11 +1223,15 @@ def main() -> None:
     mem_bptt_window = max(1, int(train_cfg.get("mem_bptt_window", 2)))
     mem_probe_every = int(train_cfg.get("mem_probe_every", 0))  # 0 = off
     mem_persist     = bool(data_cfg.get("persist", False))      # carry bank across steps
+    mem_multiturn   = data_cfg.get("task") in ("multiturn", "multiturn_gist")  # per-turn forward, bank/conversation
+    mem_synth_mt    = data_cfg.get("task") == "multiturn_gist"   # synthetic gist probe (no tokenizer)
     persist_chunks  = int(train_cfg.get("persist_probe_chunks", 6))
     log_every   = int(train_cfg.get("log_every", 50))
     save_every  = int(train_cfg.get("save_every", 1000))
     save_dir    = Path(train_cfg.get("save_dir", f"checkpoints/{run_name}"))
     balance_w   = float(model_cfg.balance_loss_weight)
+    write_cost  = float(getattr(model_cfg, "mem_write_cost", 0.0))       # write-sparsity budget
+    write_div   = float(getattr(model_cfg, "mem_write_diversity", 0.0))  # novelty-gated write
 
     model.train()
     step  = 0          # optimiser steps (one per grad_accum micro-batches)
@@ -814,34 +1240,64 @@ def main() -> None:
     toks  = 0          # tokens accumulated across the current optimiser step
     pbar  = tqdm(total=total_steps, desc="Training")
     persist_mem: Optional[torch.Tensor] = None   # bank carried across steps
+    window_loss = None                            # multi-turn TBPTT window accumulator
 
     for batch in dl:
-        if mem_persist:
-            x, y, reset = batch
-            reset = reset.to(device)
+        if mem_multiturn:
+            # One TURN-SLOT of B lanes (padded). The bank persists across slots
+            # within a conversation, resets per-lane at a conversation boundary, and
+            # backward runs over a TBPTT window of mem_bptt_window slots.
+            x, y, lmask, reset = batch
+            x, y, lmask, reset = x.to(device), y.to(device), lmask.to(device), reset.to(device)
+            toks += int(lmask.sum())
+
+            init_mem = persist_mem
+            if init_mem is not None and reset.any():
+                init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                out = model(x, init_mem=init_mem, compute_logits=not fused_ce, pad_mask=lmask)
+                loss, logs = compute_loss(
+                    out, y, balance_w, ce_chunk, write_cost, write_div, loss_mask=lmask
+                )
+            persist_mem = out["mem_bank"]                  # keep graph within the window
+            seg_loss = scaler.scale(loss / grad_accum)
+            window_loss = seg_loss if window_loss is None else window_loss + seg_loss
+            micro += 1
+            at_step = (micro % grad_accum == 0)
+            if micro % mem_bptt_window == 0 or at_step:     # flush window (TBPTT truncation)
+                window_loss.backward()
+                window_loss   = None
+                persist_mem   = persist_mem.detach()
+            if not at_step:
+                continue
         else:
-            x, y = batch
-            reset = None
-        x, y = x.to(device), y.to(device)
-        toks += x.numel()
+            if mem_persist:
+                x, y, reset = batch
+                reset = reset.to(device)
+            else:
+                x, y = batch
+                reset = None
+            x, y = x.to(device), y.to(device)
+            toks += x.numel()
 
-        init_mem = persist_mem
-        if mem_persist and init_mem is not None and reset is not None and reset.any():
-            # zero the slots of lanes that just started a new file (fresh context)
-            init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
+            init_mem = persist_mem
+            if mem_persist and init_mem is not None and reset is not None and reset.any():
+                # zero the slots of lanes that just started a new file (fresh context)
+                init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
 
-        logs, mem_out = forward_backward(
-            model, x, y,
-            fused_ce=fused_ce, ce_chunk=ce_chunk, balance_w=balance_w,
-            scaler=scaler, seg_len=mem_seg_len, grad_accum=grad_accum,
-            device=device, amp_dtype=amp_dtype, use_amp=use_amp,
-            bptt_window=mem_bptt_window, init_mem=init_mem,
-        )
-        if mem_persist:
-            persist_mem = mem_out      # detached; carried into next step
-        micro += 1
-        if micro % grad_accum != 0:
-            continue
+            logs, mem_out = forward_backward(
+                model, x, y,
+                fused_ce=fused_ce, ce_chunk=ce_chunk, balance_w=balance_w,
+                scaler=scaler, seg_len=mem_seg_len, grad_accum=grad_accum,
+                device=device, amp_dtype=amp_dtype, use_amp=use_amp,
+                bptt_window=mem_bptt_window, init_mem=init_mem,
+                write_cost=write_cost, write_diversity=write_div,
+            )
+            if mem_persist:
+                persist_mem = mem_out      # detached; carried into next step
+            micro += 1
+            if micro % grad_accum != 0:
+                continue
 
         if hasattr(scaler, "unscale_"):
             scaler.unscale_(opt)
@@ -860,8 +1316,29 @@ def main() -> None:
         pbar.set_postfix(loss=f"{logs['ce']:.3f}", ppl=f"{logs['ppl']:.1f}", tok_s=f"{tok_s:.0f}")
         pbar.update(1)
 
+        # Multi-turn probe: turn-cadenced content_gap + effective rank
+        if mem_probe_every and mem_multiturn and step % mem_probe_every == 0:
+            if mem_synth_mt:
+                mp = synthetic_multiturn_probe(
+                    model, raw, fused_ce=fused_ce, ce_chunk=ce_chunk,
+                    balance_w=balance_w, device=device, amp_dtype=amp_dtype, use_amp=use_amp,
+                )
+            else:
+                mp = multiturn_probe(
+                    model, tokenizer, raw, fused_ce=fused_ce, ce_chunk=ce_chunk,
+                    balance_w=balance_w, device=device, amp_dtype=amp_dtype, use_amp=use_amp,
+                )
+            logs.update(mp)
+            if mp:
+                tqdm.write(
+                    f"  [mt-probe] ablation_gap={mp['mem_ablation_gap']:+.4f}"
+                    f"  content_gap={mp['content_gap']:+.4f}"
+                    f"  eff_rank={mp['mem_eff_rank']:.2f}/{mp['mem_slots_final']:.0f}"
+                    f"  turns={mp['mem_turns']:.0f}"
+                )
+
         # Memory usefulness probe (ablation: CE with vs without the bank)
-        if mem_probe_every and mem_seg_len and step % mem_probe_every == 0:
+        if mem_probe_every and mem_seg_len and not mem_multiturn and step % mem_probe_every == 0:
             probe = memory_probe(
                 model, x, y, fused_ce=fused_ce, ce_chunk=ce_chunk,
                 balance_w=balance_w, seg_len=mem_seg_len, device=device,
@@ -886,8 +1363,10 @@ def main() -> None:
                 logs.update(pp)
                 if pp:
                     tqdm.write(
-                        f"  [persist-probe] persist_gap(CE↓)={pp['persist_gap']:+.4f}"
-                        f"  over {pp['persist_chunks']:.0f} chunks of one file"
+                        f"  [persist-probe] persist_gap={pp['persist_gap']:+.4f}"
+                        f"  = content_gap={pp['content_gap']:+.4f}"
+                        f"  + structure_gap={pp['structure_gap']:+.4f}"
+                        f"  ({pp['persist_chunks']:.0f} chunks)"
                     )
 
         if step % log_every == 0 or step == 1:
@@ -897,6 +1376,9 @@ def main() -> None:
                 + (f"  r_hat={logs.get('r_hat', 0):.3f}" if "r_hat" in logs else "")
                 + (f"  mem={logs['mem_slots']:.0f}" if "mem_slots" in logs else "")
                 + (f"  α={logs['write_alpha']:.3f}" if "write_alpha" in logs else "")
+                + (f"  wpen={logs['write_pen']:.3f}" if "write_pen" in logs else "")
+                + (f"  redund={logs['write_redund']:.3f}" if "write_redund" in logs else "")
+                + (f"  erank={logs['mem_eff_rank']:.2f}" if "mem_eff_rank" in logs else "")
                 + (f"  gap={logs['mem_ablation_gap']:+.3f}" if "mem_ablation_gap" in logs else "")
                 + f"  lr={opt.param_groups[0]['lr']:.2e}  tok/s={tok_s:.0f}"
             )

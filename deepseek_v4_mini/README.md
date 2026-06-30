@@ -180,6 +180,7 @@ out2 = model(ids, init_mem=out["mem_bank"])
 python -m deepseek_v4_mini.train deepseek_v4_mini/configs/tiny.yaml          # TinyStories
 python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code.yaml          # code, bank reset/seq
 python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist.yaml  # code, bank persists
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist_sparse.yaml  # + write-sparsity budget
 python -m deepseek_v4_mini.train deepseek_v4_mini/configs/synth_recall.yaml  # addressable-recall test
 python -m deepseek_v4_mini.train deepseek_v4_mini/configs/gist.yaml          # latent-context test
 ```
@@ -190,9 +191,19 @@ It logs to `runs/<run_name>/metrics.jsonl` and saves checkpoints.
 
 **Memory probes** run during training (every `mem_probe_every` steps):
 `mem_ablation_gap` (CE without vs with the bank), `mem_diversity` (slot spread),
-`mem_write_rate` (mean α), and — for persistent runs — `persist_gap` (CE with the
-bank carried across chunks of one file vs reset each chunk). Offline PPL with/without
-the bank: `python -m deepseek_v4_mini.eval_memory`.
+`mem_write_rate` (mean α), and — for persistent runs — `persist_gap` and its
+decomposition `content_gap` + `structure_gap`.
+
+> **`content_gap` is the memory metric to trust.** `persist_gap` (bank carried
+> across chunks vs reset each chunk) conflates the *content* written into slots
+> with the bank *structure* (slot count + slot positional embeddings): a carried
+> bank has ~`max_mem` slots, a reset one rebuilds from empty. Re-running the
+> carried arm with writes **zeroed** (slots still appended, slot count identical)
+> isolates them — `content_gap = CE_zero − CE_real` is the pure content benefit,
+> `structure_gap = CE_reset − CE_zero` the rest. On the code dataset ~2/3 of
+> `persist_gap` turned out to be structural; trust `content_gap`.
+
+Offline PPL with/without the bank: `python -m deepseek_v4_mini.eval_memory`.
 
 ---
 
@@ -239,6 +250,7 @@ Memory training knobs live in the YAML `training:` / `data:` sections:
 | `mem_segment_len` | Attention window per segment; smaller ⇒ more reliance on the bank |
 | `mem_bptt_window` | TBPTT span; **≥2 required** to train the write head |
 | `mem_probe_every` | How often to run the ablation / persistence probes |
+| `mem_write_cost` | Sparsity budget on α: adds `cost · E[-log(1-α)]` so writing has a cost (0 ⇒ α saturates at 1). Needs a warmup if used. |
 | `data.persist` | `true` ⇒ per-file ordered lanes + carry the bank across steps |
 
 ---
@@ -258,10 +270,11 @@ deepseek_v4_mini/
   configs/
     tiny.yaml          — TinyStories, fast iteration
     small.yaml         — TinyStories, single RTX 3090
-    code.yaml          — code (Python), bank reset per sequence
-    code_persist.yaml  — code (Python), bank persists across sequences
-    synth_recall.yaml  — synthetic addressable-recall diagnostic
-    gist.yaml          — synthetic latent-context (gist) diagnostic
+    code.yaml              — code (Python), bank reset per sequence
+    code_persist.yaml      — code (Python), bank persists across sequences
+    code_persist_sparse.yaml — persistent + write-sparsity budget (mem_write_cost)
+    synth_recall.yaml      — synthetic addressable-recall diagnostic
+    gist.yaml              — synthetic latent-context (gist) diagnostic
 ```
 
 ---

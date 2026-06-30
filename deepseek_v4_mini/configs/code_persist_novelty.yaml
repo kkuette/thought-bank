@@ -1,0 +1,74 @@
+# Persistent bank (= code_persist.yaml) PLUS a novelty-gated write. Without it the
+# bank collapses to near-duplicate writes — adjacent-slot cosine ~0.94, effective
+# rank ~1.5/16, so 16 slots store ~1 vector and content_gap is only ~+0.08.
+# mem_write_diversity penalises the cosine of each new write to its closest existing
+# slot, training the head to store DIVERSE thoughts.
+#
+# A/B baseline = code_persist.yaml (mem_write_diversity=0). Success = mem_eff_rank
+# rises well above ~1.5 AND content_gap grows (more distinct, useful thoughts). Watch
+# redund (max cosine, should fall) and erank in the step log.
+#
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist_novelty.yaml
+
+# ── Model (identical to code.yaml) ─────────────────────────────────────────────
+vocab_size: 50257
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.1
+max_seq_len: 512
+
+n_hc: 2
+sinkhorn_iters: 20
+
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+
+use_thought_memory: true
+mem_dim: 32
+max_mem: 16
+
+balance_loss_weight: 1.0e-3
+mem_write_diversity: 0.1      # novelty-gated write: penalise cos(new write, closest slot)
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  device: auto
+  seed: 42
+  tokenizer: deepseek-ai/DeepSeek-V3
+  lr: 3.0e-4
+  muon_lr: 0.003
+  weight_decay: 0.1
+  steps: 5000
+  warmup_steps: 100
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 64
+  mem_bptt_window: 2
+  mem_probe_every: 200
+  persist_probe_chunks: 6     # persistence probe runs on one >=6-chunk file
+  log_every: 50
+  save_every: 1000
+  save_dir: checkpoints/code_persist_novelty
+  run_name: dsv4mini_code_persist_novelty
+  tensorboard: false
+  metrics_file: runs/dsv4mini_code_persist_novelty/metrics.jsonl
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  name: codeparrot/codeparrot-clean-valid
+  text_field: content
+  split: train
+  seq_len: 512
+  batch_size: 8
+  persist: true               # ordered per-file lanes + cross-step bank carry
