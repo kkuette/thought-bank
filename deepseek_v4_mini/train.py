@@ -188,8 +188,118 @@ def _set_seed(seed: int) -> None:
 
 # ── Data helpers (HF streaming) ───────────────────────────────────────────────
 
+def _build_synthetic_recall(cfg_dict: dict):
+    """Procedural associative-recall task that *requires* cross-segment memory.
+
+    Layout per sequence (small synthetic vocab):
+        [BOS] k1 v1 k2 v2 ... kM vM [SEP] kq vq kq vq ...
+    The M key→value pairs (keys distinct) sit in the first segments; the query
+    section repeats already-seen keys whose value must be reproduced. Because the
+    text stream only attends within one `mem_segment_len` window, a query landing
+    in a later segment than its pair can ONLY be answered through the thought bank.
+    So `ablation_gap` (CE without − CE with memory) is a near-binary verdict on
+    whether the memory works.
+
+    Vocab layout: 0=PAD 1=BOS 2=SEP, keys=[3, 3+n_keys), values=[3+n_keys, ...).
+    Set the model's `vocab_size` to at least 3 + n_keys + n_values.
+    """
+    from torch.utils.data import IterableDataset, DataLoader
+
+    d        = cfg_dict["data"]
+    seq_len  = d["seq_len"]
+    bs       = d["batch_size"]
+    n_keys   = int(d.get("n_keys", 40))
+    n_values = int(d.get("n_values", 16))
+    n_pairs  = min(int(d.get("n_pairs", n_keys)), n_keys)   # distinct keys
+    PAD, BOS, SEP, KEY_OFF = 0, 1, 2, 3
+    VAL_OFF = KEY_OFF + n_keys
+
+    class SynthDS(IterableDataset):
+        def __iter__(self):
+            while True:
+                keys = torch.randperm(n_keys)[:n_pairs]
+                vals = torch.randint(0, n_values, (n_pairs,))
+                kv   = {int(k): int(v) for k, v in zip(keys.tolist(), vals.tolist())}
+                klist = list(kv.keys())
+
+                seq = [BOS]
+                for k, v in zip(keys.tolist(), vals.tolist()):
+                    seq.append(KEY_OFF + k)
+                    seq.append(VAL_OFF + v)
+                seq.append(SEP)
+                while len(seq) < seq_len + 1:                  # query section
+                    qk = klist[int(torch.randint(0, len(klist), (1,)))]
+                    seq.append(KEY_OFF + qk)
+                    if len(seq) < seq_len + 1:
+                        seq.append(VAL_OFF + kv[qk])
+
+                chunk = torch.tensor(seq[:seq_len + 1], dtype=torch.long)
+                yield chunk[:-1], chunk[1:]
+
+    return DataLoader(SynthDS(), batch_size=bs, num_workers=0)
+
+
+def _build_latent_context(cfg_dict: dict):
+    """Procedural 'gist memory' task: a persistent latent context beyond the
+    attention window.
+
+    Layout per sequence:
+        [BOS] [CTX_c] s s s s ...        (symbols s ~ P_c, a FIXED per-context dist)
+    The context token c appears once at the start (segment 0). Every later symbol
+    is drawn from a distribution P_c that depends on c, so predicting symbols in
+    segments >0 is far easier IF the model still 'knows' c — but attention only
+    spans one `mem_segment_len` window, so after segment 0 the ONLY way to keep c
+    is the thought bank. This is the gist/summary use-case (remember *broadly*
+    what's going on), not exact recall.
+
+    CE floor per symbol: ~H(P_c) with the gist carried vs ~ln(n_symbols) without,
+    so ablation_gap ≈ ln(S) − H(P_c), large and *sustained* if the memory works.
+
+    Vocab: 0=PAD 1=BOS, contexts=[2, 2+C), symbols=[2+C, 2+C+S).
+    Set vocab_size >= 2 + n_contexts + n_symbols.
+    """
+    from torch.utils.data import IterableDataset, DataLoader
+
+    d        = cfg_dict["data"]
+    seq_len  = d["seq_len"]
+    bs       = d["batch_size"]
+    C        = int(d.get("n_contexts", 8))
+    S        = int(d.get("n_symbols", 64))
+    p_pref   = float(d.get("pref_mass", 0.9))      # prob mass on a context's block
+    PAD, BOS, CTX_OFF = 0, 1, 2
+    SYM_OFF  = CTX_OFF + C
+
+    # Fixed context→distribution map (shared across all sequences, so it is
+    # learnable): each context concentrates p_pref on a disjoint block of symbols.
+    k = max(1, S // C)
+    dists = torch.empty(C, S)
+    for c in range(C):
+        dists[c].fill_((1.0 - p_pref) / max(1, S - k))
+        dists[c, c * k: c * k + k] = p_pref / k
+    dists = dists / dists.sum(dim=1, keepdim=True)
+
+    class CtxDS(IterableDataset):
+        def __iter__(self):
+            n_sym = seq_len + 1 - 2                 # minus BOS and the context token
+            while True:
+                c    = int(torch.randint(0, C, (1,)))
+                syms = torch.multinomial(dists[c], n_sym, replacement=True)
+                seq  = torch.cat([
+                    torch.tensor([BOS, CTX_OFF + c], dtype=torch.long),
+                    SYM_OFF + syms,
+                ])
+                yield seq[:-1], seq[1:]
+
+    return DataLoader(CtxDS(), batch_size=bs, num_workers=0)
+
+
 def _build_dataloader(cfg_dict: dict, tokenizer, split: str = "train"):
     """Thin wrapper around HF streaming dataset → fixed-length batches."""
+    if cfg_dict["data"].get("task") == "associative_recall":
+        return _build_synthetic_recall(cfg_dict)
+    if cfg_dict["data"].get("task") == "latent_context":
+        return _build_latent_context(cfg_dict)
+
     from datasets import load_dataset
     from torch.utils.data import IterableDataset, DataLoader
 
@@ -242,9 +352,11 @@ def fused_cross_entropy(
     checkpointing each chunk so peak memory is O(chunk_tokens * V) rather than
     O(B * T * V).
     """
+    # targets are ALREADY next-token shifted by the dataloader (y=chunk[1:]),
+    # aligned position-for-position with `hidden`. Do NOT shift again.
     d   = hidden.size(-1)
-    h   = hidden[:, :-1, :].reshape(-1, d)               # [N, d]
-    tgt = targets[:, 1:].reshape(-1)                     # [N]
+    h   = hidden.reshape(-1, d)                          # [N, d]
+    tgt = targets.reshape(-1)                            # [N]
     N   = h.size(0)
     if chunk_tokens <= 0:
         chunk_tokens = N
@@ -272,9 +384,11 @@ def compute_loss(
 
     if out.get("logits") is not None:
         logits = out["logits"]            # [B, T, V]
+        # targets are ALREADY next-token shifted by the dataloader (y=chunk[1:]),
+        # aligned position-for-position with the model input x. Do NOT shift again.
         ce = F.cross_entropy(
-            logits[:, :-1, :].transpose(1, 2),
-            targets[:, 1:],
+            logits.transpose(1, 2),       # [B, V, T]
+            targets,                      # [B, T]
         )
     else:
         # Memory-efficient path: model returned hidden states + tied head weight.
@@ -293,6 +407,10 @@ def compute_loss(
 
     if p_gates is not None:
         logs["r_hat"] = float(p_gates.mean().detach())
+
+    write_alpha = out.get("write_alpha")
+    if write_alpha is not None:
+        logs["write_alpha"] = float(write_alpha)  # mean write prob α (write/skip)
 
     return loss, logs
 
@@ -399,11 +517,13 @@ def memory_probe(
     ys = y.split(seg_len, dim=1) if (seg_len and 0 < seg_len < y.size(1)) else (y,)
 
     mem: Optional[torch.Tensor] = None
-    ce_with, ce_without = [], []
+    ce_with, ce_without, alphas = [], [], []
     for x_s, y_s in zip(xs, ys):
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             out_w = model(x_s, init_mem=mem, compute_logits=not fused_ce)
             _, logs_w = compute_loss(out_w, y_s, balance_w, ce_chunk)
+            if out_w.get("write_alpha") is not None:
+                alphas.append(float(out_w["write_alpha"]))
             if mem is not None and mem.size(1) > 0:
                 out_o = model(x_s, init_mem=None, compute_logits=not fused_ce)
                 _, logs_o = compute_loss(out_o, y_s, balance_w, ce_chunk)
@@ -419,11 +539,13 @@ def memory_probe(
         float(mem.float().std(dim=1).mean()) if mem is not None and mem.size(1) > 1 else 0.0
     )
     bank_norm = float(mem.float().norm(dim=-1).mean()) if mem is not None else 0.0
+    write_rate = sum(alphas) / len(alphas) if alphas else 0.0
     return {
         "mem_ablation_gap": gap,        # CE_without - CE_with  (>0 => memory helps)
         "mem_diversity":    diversity,  # std across slots (~0 => collapsed/useless)
         "mem_bank_norm":    bank_norm,
         "mem_slots_final":  float(mem.size(1)) if mem is not None else 0.0,
+        "mem_write_rate":   write_rate, # mean α: how strongly the model commits writes
     }
 
 
@@ -456,12 +578,17 @@ def main() -> None:
     _set_seed(train_cfg.get("seed", 42))
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
-    tok_name = train_cfg.get("tokenizer", "gpt2")
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tok_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model_cfg.vocab_size = len(tokenizer)
+    # Synthetic tasks have no text: keep vocab_size from the yaml, no tokenizer.
+    if data_cfg.get("task") in ("associative_recall", "latent_context"):
+        tokenizer = None
+        tqdm.write(f"Synthetic task: {data_cfg['task']}  (vocab_size={model_cfg.vocab_size})")
+    else:
+        tok_name = train_cfg.get("tokenizer", "gpt2")
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tok_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model_cfg.vocab_size = len(tokenizer)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     if model_cfg.use_dual_stream:
@@ -592,6 +719,7 @@ def main() -> None:
                 f"  [mem-probe] ablation_gap(CE↓)={probe['mem_ablation_gap']:+.4f}"
                 f"  diversity={probe['mem_diversity']:.4f}"
                 f"  bank_norm={probe['mem_bank_norm']:.3f}"
+                f"  write_rate(α)={probe['mem_write_rate']:.3f}"
                 f"  slots={probe['mem_slots_final']:.0f}"
             )
 
@@ -601,6 +729,7 @@ def main() -> None:
                 f"  balance={logs['balance']:.4f}"
                 + (f"  r_hat={logs.get('r_hat', 0):.3f}" if "r_hat" in logs else "")
                 + (f"  mem={logs['mem_slots']:.0f}" if "mem_slots" in logs else "")
+                + (f"  α={logs['write_alpha']:.3f}" if "write_alpha" in logs else "")
                 + (f"  gap={logs['mem_ablation_gap']:+.3f}" if "mem_ablation_gap" in logs else "")
                 + f"  lr={opt.param_groups[0]['lr']:.2e}  tok/s={tok_s:.0f}"
             )

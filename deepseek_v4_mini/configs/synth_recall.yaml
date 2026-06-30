@@ -1,0 +1,75 @@
+# Associative-recall diagnostic — does the thought memory actually carry
+# information across segments? Unlike TinyStories (short-range, fits in the
+# attention window), here a query's answer lives in an EARLIER segment than the
+# query, so the attention-capped text stream cannot solve it; only the thought
+# bank can. Watch mem_probe's ablation_gap: it should climb well above the
+# TinyStories ~0.03 if the memory works, and stay ~0 if it doesn't.
+#
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/synth_recall.yaml
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+# Small synthetic vocab: 0=PAD 1=BOS 2=SEP, 40 keys, 16 values → 59 ids used.
+vocab_size: 64
+d_model: 128
+n_layers: 4              # 2 CSA + 2 HCA
+n_heads: 2
+d_head: 32
+dropout: 0.0            # synthetic + infinite data: no need to regularise
+max_seq_len: 256
+
+# mHC
+n_hc: 2
+sinkhorn_iters: 20
+
+# Attention
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+
+# MoE
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+
+# Thought memory
+use_thought_memory: true
+mem_dim: 32
+max_mem: 16
+
+balance_loss_weight: 1.0e-3
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  device: auto
+  seed: 42
+  lr: 3.0e-4
+  muon_lr: 0.003
+  weight_decay: 0.1
+  steps: 2000
+  warmup_steps: 60
+  grad_clip: 1.0
+  precision: bf16
+  # 256 / 32 = 8 segments. Pairs fill the first ~3 segments; queries land in
+  # segments 3–7, beyond the attention window → only the bank can answer them.
+  mem_segment_len: 32
+  mem_bptt_window: 2
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 1000
+  save_dir: checkpoints/synth_recall
+  run_name: dsv4mini_synth_recall
+  tensorboard: false
+  metrics_file: runs/dsv4mini_synth_recall/metrics.jsonl
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  task: associative_recall   # triggers the procedural generator (no tokenizer)
+  n_keys: 40                 # distinct keys → key ids [3, 43)
+  n_values: 16               # value ids [43, 59)
+  n_pairs: 40                # key→value pairs presented before the queries
+  seq_len: 256
+  batch_size: 32

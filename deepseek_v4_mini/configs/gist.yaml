@@ -1,0 +1,79 @@
+# Gist-memory diagnostic — does the thought bank carry a persistent global state
+# (the "what's going on broadly" / project-context use case) beyond the attention
+# window? A latent context c is shown once at the start, then every later symbol is
+# drawn from a fixed per-context distribution P_c. Attention only spans one
+# segment, so after segment 0 the bank is the ONLY way to keep c.
+#
+# Expected: with 8 contexts / 64 symbols / 0.9 preferred mass,
+#   H(P_c) ≈ 2.60 nats,  ln(64) ≈ 4.16 nats  →  ablation_gap ≈ 1.56 / symbol
+# if the gist memory works (vs ~0.03 on TinyStories). A LARGE, SUSTAINED gap is
+# the verdict that the memory carries the gist.
+#
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/gist.yaml
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+# Vocab: 0=PAD 1=BOS, 8 contexts [2,10), 64 symbols [10,74) → 74 ids used.
+vocab_size: 80
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 256
+
+# mHC
+n_hc: 2
+sinkhorn_iters: 20
+
+# Attention
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+
+# MoE
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+
+# Thought memory
+use_thought_memory: true
+mem_dim: 32
+max_mem: 16
+
+balance_loss_weight: 1.0e-3
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  device: auto
+  seed: 42
+  lr: 3.0e-4
+  muon_lr: 0.003
+  weight_decay: 0.1
+  steps: 2000
+  warmup_steps: 60
+  grad_clip: 1.0
+  precision: bf16
+  # 256 / 32 = 8 segments. Context token sits in segment 0; symbols in segments
+  # 1–7 can only be predicted well if the bank still carries c.
+  mem_segment_len: 32
+  mem_bptt_window: 2
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 1000
+  save_dir: checkpoints/gist
+  run_name: dsv4mini_gist
+  tensorboard: false
+  metrics_file: runs/dsv4mini_gist/metrics.jsonl
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  task: latent_context
+  n_contexts: 8       # context ids [2, 10)
+  n_symbols: 64       # symbol ids [10, 74)
+  pref_mass: 0.9      # mass each context puts on its preferred symbol block
+  seq_len: 256
+  batch_size: 32

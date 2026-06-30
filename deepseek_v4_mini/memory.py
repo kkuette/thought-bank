@@ -158,6 +158,10 @@ class ThoughtStream(nn.Module):
         # bias=0 → α≈0.5 at init (neutral); the LM loss then learns when to write.
         self.write_decision = nn.Linear(cfg.d_model, 1, bias=True)
 
+        # Telemetry: batch-mean of the last write probability α (set in
+        # _new_thought). Lets train.py track the write/skip modality over training.
+        self.last_write_alpha: Optional[torch.Tensor] = None
+
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _process(self, mem_bank: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -280,4 +284,7 @@ class ThoughtStream(nn.Module):
         p     = torch.sigmoid(self.write_gate(h_ctx))          # [B, mem_dim] content gate
         m     = self.norm_write(self.thought_head(h_ctx))      # [B, mem_dim] thought
         alpha = torch.sigmoid(self.write_decision(h_ctx))      # [B, 1] modality choice
+        # Stash the batch-mean write probability for telemetry (detached, no graph).
+        # >0.5 ≈ "the model chose to commit this thought"; ≈0 ≈ "skip / empty slot".
+        self.last_write_alpha = alpha.detach().mean()
         return (alpha * p * m).unsqueeze(1)                    # [B, 1, mem_dim]
