@@ -1,292 +1,175 @@
 # Diffusion Thought Tensor
 
-A novel approach to language modeling that integrates **diffusion models** with **thought tensor architecture**, replacing traditional autoregressive generation with iterative refinement and persistent cognitive states.
-
-## 🧠 Core Innovation
-
-This project explores the fusion of diffusion processes with 3D thought tensors, enabling:
-
-- **Bidirectional Context**: Thoughts can attend to future and past simultaneously
-- **Iterative Refinement**: Multiple denoising steps allow thought maturation  
-- **Parallel Processing**: All positions evolve together for holistic reasoning
-- **Controllable Generation**: Gradient-based steering of thought evolution
-- **Persistent Memory**: Thoughts evolve across conversation turns
-
-## 🚀 Quick Start
-
-### Prerequisites
-- **GPU**: RTX 3090 (24GB) or equivalent
-- **RAM**: 32GB+ recommended
-- **Python**: 3.8+
-
-### Installation
-```bash
-# Clone the repository
-git clone <repository-url>
-cd experiment
-
-# Install dependencies
-pip install torch>=1.13.0 transformers>=4.20.0 diffusers>=0.10.0
-pip install einops tqdm pyyaml numpy wandb
-pip install tensorboard matplotlib seaborn
-
-# Verify installation
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
-```
-
-### Basic Usage
-```bash
-# Train the model (starts with TinyStories dataset)
-python diffusion_thought_tensor/train_dream_hf.py \
-    --config diffusion_thought_tensor/configs/dream_config.yaml \
-    --dataset roneneldan/TinyStories \
-    --epochs 5
-
-# Compare with baseline
-python train_comparison_experiment.py \
-    --baseline_config complex_baseline_config.yaml \
-    --enhanced_config diffusion_thought_tensor/configs/dream_config.yaml
-```
-
-## 🏗️ Architecture
-
-### Diffusion-Based Thought Evolution
-
-```
-Input: [Text Tokens] + [Thought Tensor Stack]
-    ↓
-Embedding Layer (Discrete → Continuous) 
-    ↓
-Diffusion Process (T timesteps)
-    ↓
-Denoising Network + Thought Evolution
-    ↓
-Output: [Refined Text] + [New Thought]
-    ↓
-New Thought → Push to Stack (Stack Evolution)
-    ↓
-Updated: [Next Input] + [Evolved Thought Stack]
-```
-
-### 3D Thought Representation
-
-- **Spatial Dimensions**: Each thought is 2D (H×W) representing structured knowledge (It could be any dimension while it is nD-1 the dimension input)
-- **Temporal Stack**: Depth dimension stores thought history over time
-- **Cross-Attention**: Thoughts influence text generation through attention mechanisms
-- **Compression**: 3D→2D evolution reduces dimensionality while preserving information
-
-## ✨ Key Features
-
-### Enhanced Thought System
-- **Temporal Attention**: Multi-scale processing of thought history
-- **Self-Supervised Learning**: Thoughts learn through prediction and reconstruction
-- **Importance-Based Retention**: Smart memory management for thought stacks
-- **Temporal Dynamics**: Velocity and acceleration tracking of thought evolution
-
-### Advanced Masking & Generation
-- **Bidirectional Attention**: Leverages [DREAM](https://github.com/DreamLM/Dream) techniques for non-causal attention
-- **Progressive Unmasking**: Confidence-based token revelation during generation
-- **Block-wise Processing**: Efficient masking strategies from [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM)
-
-## 🔧 Models
-
-### StackedDiffusionModel3D
-The main model with full 3D thought tensor integration:
-- ~1B parameters optimized for single GPU training
-- 3D thought stack with temporal evolution
-- Cross-attention between thoughts and text
-- DREAM-style bidirectional attention
-
-### BaselineDreamModel  
-Control model without thought system:
-- Identical architecture minus thought components
-- Pure DREAM-style masked language modeling
-- Used for controlled comparison experiments
-
-## 🚀 Training
-
-### Quick Start
-```bash
-# Train the main 3D thought model
-python diffusion_thought_tensor/train_dream_hf.py \
-    --config diffusion_thought_tensor/configs/dream_config.yaml \
-    --dataset roneneldan/TinyStories \
-    --epochs 5 \
-    --mask_ratio 0.7
-
-# Train baseline for comparison  
-python train_comparison_experiment.py \
-    --baseline_config complex_baseline_config.yaml \
-    --enhanced_config diffusion_thought_tensor/configs/dream_config.yaml
-```
-
-### Training Features
-- **Memory Optimized**: Gradient checkpointing and mixed precision for 24GB GPUs
-- **Progressive Masking**: Dynamic mask ratio scheduling during training  
-- **Thought Persistence**: Maintains thought stacks across batches
-- **Multi-GPU Support**: Distributed training capabilities
-
-## 💬 Interactive Usage
-
-### Chat Interface
-```bash
-python diffusion_thought_tensor/interactive_chat.py \
-    --model_path outputs/dream_checkpoints/best_dream_model.pt \
-    --config diffusion_thought_tensor/configs/dream_config.yaml
-```
-
-## ⚙️ Configuration
-
-Key configuration options in `diffusion_thought_tensor/configs/dream_config.yaml`:
-
-```yaml
-model:
-  embed_dim: 720          # Model size  
-  num_layers: 16          # Transformer layers
-  max_seq_length: 2048    # Context length
-
-thought_tensor:
-  input_dims: [16, 16, 64]  # 3D thought dimensions
-  stack_size: 8             # Thought stack depth
-  self_supervised_learning: true
-  temporal_dynamics: true
-
-masking:
-  mask_ratio: 0.7           # Initial masking ratio
-  confidence_threshold: 0.75 # Unmasking threshold
-  progressive_unmasking: true
-
-diffusion:
-  num_steps: 500            # Denoising steps
-  noise_schedule: "cosine"  # Noise scheduling
-```
-
-## 📊 Expected Performance
-
-⚠️ **Note**: These are research targets, not validated benchmarks. Current implementation focuses on proof-of-concept.
-
-### Performance Targets
-- **Perplexity**: Competitive with GPT-2 small (117M params) 
-- **Generation Speed**: 100-200 tokens/second on RTX 3090
-- **Memory Usage**: <24GB VRAM for training
-- **Thought Coherence**: >0.8 correlation between timesteps
-
-### Theoretical Capabilities  
-- **Thought Interpolation**: Smooth blending between different reasoning states
-- **Controlled Evolution**: Gradient-guided thought steering
-- **Error Recovery**: Self-correction during generation
-- **Bidirectional Reasoning**: Fill-in-the-blank style completion
-
-
-## 🎯 Research Goals
-
-1. **Validate Thought Contribution**: Compare thought-enhanced vs baseline models
-2. **Understand Thought Evolution**: Analyze how thoughts change during diffusion
-3. **Explore Novel Capabilities**: Test bidirectional reasoning and thought control
-4. **Scale Efficiently**: Optimize for single-GPU research setups
-
-## 📈 Current Status
-
-- ✅ Core 3D thought tensor architecture implemented
-- ✅ DREAM-style bidirectional attention integrated  
-- ✅ Enhanced thought system with temporal dynamics
-- ✅ Training pipeline with memory optimization
-- ✅ Interactive chat interface
-- ✅ Comprehensive analysis tools
-- 🔄 Large-scale training experiments (halted)
-- 🔄 Thought evolution analysis and visualization
-
-## 📊 Current Results
-
-⚠️ **Experimental Status**: This is active research code. Current results are preliminary.
-
-- **Training**: Successfully trains on TinyStories dataset without memory issues
-- **Baseline Comparison**: Framework implemented for controlled experiments
-- **Memory Efficiency**: Runs on 24GB GPU with gradient checkpointing
-- **Thought Evolution**: Basic thought tensor mechanics functional
-
-## ⚠️ Known Limitations
-
-- **Scale**: Currently optimized for small-scale experiments (~1B parameters)
-- **Validation**: Performance claims require empirical validation
-- **Dependencies**: Specific version requirements for stable training
-- **Hardware**: High memory requirements limit accessibility
-- **Documentation**: Some advanced features lack detailed documentation
-
-## 🔧 Troubleshooting
-
-### Common Issues
-
-**CUDA Out of Memory**
-```bash
-# Reduce batch size in config
-batch_size: 4  # or lower
-gradient_accumulation_steps: 4  # increase to maintain effective batch size
-```
-
-**Import Errors**
-```bash
-# Ensure all dependencies are installed
-pip install -r requirements.txt  # if available
-# Or install manually as shown in Quick Start
-```
-
-**Training Divergence**
-```bash
-# Lower learning rate
-learning_rate: 1e-5  # default: 3e-4
-```
-
-**Dataset Loading Issues**
-```bash
-# Verify internet connection for HuggingFace datasets
-# Or specify local dataset path in config
-```
-
-### Getting Help
-- Check existing issues in the repository
-- Verify hardware requirements are met
-- Review configuration files for typos
-
-## 📚 Research Documentation
-
-This project builds on extensive research and architectural design. The following documents provide deep technical insights:
-
-### Core Architecture Documents
-- **[Complete Project Roadmap](docs/old/complete_project_roadmap.md)** - Comprehensive implementation plan with technical stack, datasets, algorithms, and detailed phases
-- **[Unified Thought Tensor Architecture](docs/old/unified_thought_tensor_arch.md)** - Meta-dimensional growth mechanism with dynamic complexity scaling and emergent cognitive behaviors
-- **[Original Thought Tensor Concept](docs/old/thought_tensor_project.md)** - Foundational concept documentation with budget-conscious implementation strategies
-
-### Technical Implementation Guides  
-- **[Diffusion Research Document](docs/old/diffusion_thought_tensor_research.md)** - ~500M parameter diffusion model architecture optimized for RTX 3090, with detailed training strategies
-- **[Enhanced Model Improvements](docs/old/enhanced_model_improvements.md)** - Performance optimizations, memory management, advanced training techniques, and comprehensive monitoring
-
-### Additional Research Materials
-- **[Compass Artifact](docs/old/compass_artifact_wf-9c6a1bc8-95e1-4258-a3ab-2bcbed9495a8_text_markdown.md)** - Extended research analysis and architectural considerations
-
-These documents contain the theoretical foundations, detailed algorithms, evaluation metrics, and research methodologies underlying this implementation. They provide essential context for understanding the novel approach to persistent AI cognition through diffusion-based thought tensor evolution.
-
-## 📚 Technical Details
-
-### Full Requirements
-
-**Hardware**
-- **GPU**: RTX 3090 (24GB) or equivalent
-- **RAM**: 32GB+ recommended
-- **Storage**: ~50GB for models and data
-
-**Dependencies**
-```bash
-pip install torch>=1.13.0 transformers>=4.20.0 diffusers>=0.10.0
-pip install einops tqdm pyyaml numpy wandb
-pip install tensorboard matplotlib seaborn
-```
-
-### External Methods
-This implementation builds upon:
-- **DREAM**: Bidirectional attention and masking strategies - [Repository](https://github.com/DreamLM/Dream)
-- **Fast-dLLM**: Efficient generation techniques - [Repository](https://github.com/NVlabs/Fast-dLLM)
+Research repo exploring **persistent thought memory** for language models. The
+active line of work is **`deepseek_v4_mini`**: a small reproduction of the
+DeepSeek-V4 architecture fused with a **dual-stream thought-memory bank** — a text
+stream plus a second stream that maintains a compressed "gist" of what has already
+happened and carries it forward.
+
+The driving question: *is an external memory bank actually useful, and when?*
+This session answered it (see [Findings](#-findings)).
+
+> **Legacy:** the earlier diffusion / 3D-thought-tensor prototype lives under
+> [`diffusion_thought_tensor/`](diffusion_thought_tensor/) and [`docs/old/`](docs/old/).
+> It is no longer the focus and is kept only for reference.
 
 ---
 
-This research combines diffusion models' parallel processing capabilities with persistent thought states, potentially enabling new forms of AI reasoning that go beyond traditional autoregressive generation.
+## 🧠 Core idea
+
+```
+        thought stream  [B, M, mem_dim]         (the running "gist" / memory bank)
+                 │  cross-modal at every layer
+                 ▼
+        text stream     [B, T, d_model]         (predicts the next token)
+                 │
+                 ▼
+        gated write  α·p·m   →   append to bank   →   FIFO-evict oldest
+                 │
+        bank carried to the next segment / sequence
+```
+
+- **Text stream** does next-token prediction (CSA/HCA attention + MoE, mHC residuals).
+- **Thought stream** is a second small transformer over the memory bank
+  `[B, M, mem_dim]`, slot index = temporal position (slot 0 oldest, slot M-1 newest).
+- **Gated write**: each segment produces a candidate thought `α·p·m` where the
+  scalar `α = sigmoid(write_decision)` is the model's *write/skip* choice and `p`
+  is a per-dimension content gate. The bank is FIFO-capped at `max_mem`.
+- The bank is the **only cross-segment channel**: the text stream's attention is
+  capped to one `mem_segment_len` window, so anything older must travel through
+  the bank.
+
+Full architecture notes (mHC, CSA, HCA, MoE, thought stream) are in the package
+README: [`deepseek_v4_mini/README.md`](deepseek_v4_mini/README.md).
+
+---
+
+## 🚀 Quick start
+
+### Environment
+```bash
+# conda env used in development
+conda activate diffusion-thought          # see setup_environment.sh
+pip install -r requirements.txt           # torch, transformers, datasets, ...
+python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+```
+Target hardware: a single 24 GB GPU (RTX 3090).
+
+### Train
+```bash
+# language modelling
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/tiny.yaml      # ~19M, TinyStories
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code.yaml      # code, per-sequence reset
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist.yaml  # code, PERSISTENT bank
+
+# memory diagnostics (synthetic, no tokenizer)
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/synth_recall.yaml  # addressable recall
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/gist.yaml          # latent-context gist
+```
+> Scripts importing the package need `PYTHONPATH=<repo-root>`.
+
+### Use the model
+```python
+from deepseek_v4_mini import DualModalDeepSeekV4Mini, DeepSeekV4MiniConfig
+import torch
+
+cfg   = DeepSeekV4MiniConfig.tiny()
+model = DualModalDeepSeekV4Mini(cfg)
+ids   = torch.randint(0, cfg.vocab_size, (2, 64))
+
+out  = model(ids)                            # first pass: empty bank
+out2 = model(ids, init_mem=out["mem_bank"])  # carry the bank forward
+```
+
+---
+
+## 🔬 Measuring whether the memory helps
+
+Two probes run during training and write to `runs/<run_name>/metrics.jsonl`:
+
+| Metric | Meaning |
+|---|---|
+| `mem_ablation_gap` | CE without the bank − CE with it, on the same tokens (>0 ⇒ helps) |
+| `mem_diversity` | std across bank slots (~0 ⇒ slots collapsed = useless) |
+| `mem_write_rate` (α) | mean write probability — does the model choose to write? |
+| `persist_gap` | (persistent runs) CE with the bank **carried across chunks** of one file vs reset each chunk, on later chunks — the clean cross-sequence verdict |
+
+Offline analysis: [`deepseek_v4_mini/eval_memory.py`](deepseek_v4_mini/eval_memory.py)
+(PPL with vs without the bank).
+
+---
+
+## 📊 Findings
+
+**The memory bank only earns its keep when it is allowed to *persist* across
+sequences.** Resetting it every sequence (the default) makes it look useless.
+
+A/B on the **same architecture and code dataset**, at matched steps:
+
+| Setup | `ablation_gap` | `persist_gap` | slot `diversity` |
+|---|---|---|---|
+| per-sequence reset (`code.yaml`) | ~+0.02 → +0.10 | — | ~0.15 |
+| **persistent** (`code_persist.yaml`) | **+1.0 → +1.8** | **≈ +0.30 (stable)** | **~0.41** |
+
+- **`persist_gap ≈ +0.30`, stable** across probes — carrying the bank across
+  chunks of the same file consistently lowers later-chunk loss. This is the real
+  "remember earlier context" use case, and it works.
+- On short / locally-redeterminable data (TinyStories, dense contexts) the gap
+  stays small: when the relevant "gist" fits in the attention window, the bank is
+  redundant. Memory pays off for **non-local** context beyond the window.
+- The bank is a **gist/summary** memory, not an addressable key→value store: the
+  synthetic `associative_recall` task does *not* get solved by it (slots collapse
+  to a single direction). Use it to remember *what is going on broadly*, not to
+  recall exact values.
+
+### Things that were required to get here
+- **Next-token alignment**: the loaders pre-shift targets, so the loss must *not*
+  shift again — a fixed double-shift had been training a +2-token objective.
+- **Write-head gradient**: `mem_bptt_window ≥ 2`, otherwise the write head never
+  receives gradient and the bank is filled by an untrained projection.
+- **NaN stability**: `muon_lr ≈ 0.003` and `sinkhorn_iters = 20` (the bigger
+  levers); RMSNorm variance in fp32; Sinkhorn with per-matrix max-subtract.
+
+---
+
+## ⚙️ Configs
+
+| File | Dataset / task | Purpose |
+|---|---|---|
+| `configs/tiny.yaml` | TinyStories (~19M) | fast LM iteration |
+| `configs/small.yaml` | TinyStories (~32M) | single RTX 3090 |
+| `configs/code.yaml` | codeparrot (Python) | baseline, bank reset per sequence |
+| `configs/code_persist.yaml` | codeparrot (Python) | bank **persists** across steps |
+| `configs/synth_recall.yaml` | synthetic | addressable key→value recall test |
+| `configs/gist.yaml` | synthetic | latent-context (gist) test |
+
+Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/README.md)):
+
+| Parameter | Description |
+|---|---|
+| `mem_dim`, `max_mem` | thought-vector size and FIFO bank capacity |
+| `mem_segment_len` | attention window; smaller ⇒ more reliance on the bank |
+| `mem_bptt_window` | TBPTT span; **≥2 required** to train the write head |
+| `mem_probe_every` | how often to run the ablation / persistence probes |
+| `data.persist: true` | per-file ordered lanes + carry the bank across steps |
+
+---
+
+## 📁 Repository layout
+
+```
+deepseek_v4_mini/        ← active project (dual-stream thought memory)
+  model.py  memory.py  attention.py  moe.py  mhc.py  config.py  train.py
+  eval_memory.py         ← offline PPL with/without the bank
+  configs/               ← tiny, small, code, code_persist, synth_recall, gist
+thought_lm_minimal/      ← minimal thought-LM baseline
+diffusion_thought_tensor/, docs/old/   ← legacy diffusion prototype (reference only)
+checkpoints/, runs/      ← training outputs
+```
+
+---
+
+## 📚 References
+- DeepSeek-V4 (architecture base), DeepSeekMoE (Dai et al., 2024)
+- Hyper-Connections (Zhu et al., 2025), Muon optimizer (Jordan et al., 2024)
+- Thought-memory baseline: [`thought_lm_minimal/`](thought_lm_minimal/)
