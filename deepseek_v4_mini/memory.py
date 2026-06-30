@@ -222,6 +222,7 @@ class ThoughtStream(nn.Module):
         self,
         H_text: torch.Tensor,           # [B, T, d_model]
         mem_bank: torch.Tensor,         # [B, M, mem_dim]
+        pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Append a new gated thought vector and FIFO-evict the oldest slot.
@@ -236,7 +237,7 @@ class ThoughtStream(nn.Module):
         cfg = self.cfg
 
         # Gated write + FIFO eviction (novelty measured vs the pre-append bank)
-        m_new    = self._new_thought(H_text, mem_bank)
+        m_new    = self._new_thought(H_text, mem_bank, pad_mask)
         mem_bank = torch.cat([mem_bank, m_new], dim=1)
         if mem_bank.size(1) > cfg.max_mem:
             mem_bank = mem_bank[:, -cfg.max_mem:, :]
@@ -248,6 +249,7 @@ class ThoughtStream(nn.Module):
         self,
         H_text: torch.Tensor,           # [B, T, d_model]  current text hidden states
         mem_bank: Optional[torch.Tensor],# [B, M, mem_dim] or None
+        pad_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -259,7 +261,7 @@ class ThoughtStream(nn.Module):
 
         # ── No memories yet: skip processing, just write the first vector ─────
         if mem_bank is None or mem_bank.size(1) == 0:
-            m_new    = self._new_thought(H_text)                # [B, 1, mem_dim]
+            m_new    = self._new_thought(H_text, None, pad_mask)  # [B, 1, mem_dim]
             mem_bank = m_new
             return None, mem_bank, torch.zeros((), device=H_text.device)
 
@@ -267,7 +269,7 @@ class ThoughtStream(nn.Module):
         H_thought, bal = self._process(mem_bank)                # [B, M, mem_dim]
 
         # ── 2. Gated write + FIFO eviction ────────────────────────────────────
-        m_new    = self._new_thought(H_text, mem_bank)           # [B, 1, mem_dim]
+        m_new    = self._new_thought(H_text, mem_bank, pad_mask)  # [B, 1, mem_dim]
         mem_bank = torch.cat([mem_bank, m_new], dim=1)           # [B, M+1, mem_dim]
         if mem_bank.size(1) > cfg.max_mem:                       # drop oldest slot
             mem_bank = mem_bank[:, -cfg.max_mem:, :]
@@ -275,7 +277,10 @@ class ThoughtStream(nn.Module):
         return H_thought, mem_bank, bal
 
     def _new_thought(
-        self, H_text: torch.Tensor, bank: Optional[torch.Tensor] = None
+        self,
+        H_text: torch.Tensor,
+        bank: Optional[torch.Tensor] = None,
+        pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Produce a new thought vector from the current text.
@@ -288,8 +293,14 @@ class ThoughtStream(nn.Module):
         FIFO; α≈1 → commit this thought). Fully differentiable; learned via the LM
         loss, so forced/redundant writes are no longer imposed every pass.
         """
-        # Attention-pooled summary: learned scalar score per position → softmax
+        # Attention-pooled summary: learned scalar score per position → softmax.
+        # With padded multi-turn turns, mask pad positions so the pool summarises
+        # only real tokens. (`safe` keeps all-pad rows finite — they are discarded.)
         scores  = self.write_ctx_q(H_text).squeeze(-1)         # [B, T]
+        if pad_mask is not None:
+            m    = pad_mask.bool()
+            safe = m | (~m.any(dim=1, keepdim=True))
+            scores = scores.masked_fill(~safe, float("-inf"))
         weights = torch.softmax(scores, dim=-1)                 # [B, T]
         h_ctx   = (weights.unsqueeze(-1) * H_text).sum(dim=1)  # [B, d_model]
 

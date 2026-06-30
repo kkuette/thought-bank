@@ -9,6 +9,10 @@
 # thoughts. v1 keeps K=1 write/turn and no novelty penalty, to isolate the effect
 # of CADENCE alone (compare mt-probe eff_rank / content_gap vs code_persist).
 #
+# Throughput: B lanes are processed turn-aligned (lock-step by turn index), each
+# lane streaming its own conversation, so the GPU sees real batches despite the
+# per-turn write cadence.
+#
 # python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn.yaml
 
 # ── Model (same size as code_persist) ──────────────────────────────────────────
@@ -55,9 +59,9 @@ training:
   grad_clip: 1.0
   precision: bf16
   mem_segment_len: 0          # 0 => segment by TURN boundaries, not fixed length
-  mem_bptt_window: 2
-  grad_accum: 8               # batch_size is forced to 1 for multi-turn
-  mem_probe_every: 200
+  mem_bptt_window: 2          # TBPTT window over turn-slots
+  grad_accum: 2               # opt step every grad_accum turn-slots (eff. batch = B*grad_accum)
+  mem_probe_every: 100
   log_every: 50
   save_every: 1000
   save_dir: checkpoints/multiturn
@@ -73,4 +77,4 @@ data:
   messages_field: messages
   min_turns: 2
   seq_len: 1024               # max conversation length (tokens)
-  batch_size: 1
+  batch_size: 8               # turn-aligned lanes processed in lock-step (GPU-efficient)

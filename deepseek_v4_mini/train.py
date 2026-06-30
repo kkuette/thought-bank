@@ -341,55 +341,95 @@ def _build_persistent_file_loader(cfg_dict: dict, tokenizer, split: str = "train
     return PersistDS()
 
 
+def _encode_conversation(ex, tokenizer, u_mark, a_mark, mfield, max_len):
+    """Encode one chat example to (ids, turn_starts) or None if too short.
+
+    ids is the full token stream with role markers; turn_starts are indices into
+    x=ids[:-1] where each assistant turn begins (the write-fire points)."""
+    msgs = ex.get(mfield) or []
+    ids, turn_starts = [], []
+    for m in msgs:
+        role    = m.get("role", "")
+        content = m.get("content", "") or ""
+        mark    = a_mark if role == "assistant" else u_mark
+        if role == "assistant":
+            turn_starts.append(len(ids))
+        ids.extend(mark)
+        ids.extend(tokenizer.encode(content, add_special_tokens=False))
+        if len(ids) >= max_len + 1:
+            break
+    ids = ids[:max_len + 1]
+    turn_starts = [t for t in turn_starts if 0 < t < len(ids) - 1]
+    return (ids, turn_starts) if (len(ids) >= 8 and turn_starts) else None
+
+
 def _build_multiturn_loader(cfg_dict: dict, tokenizer, split: str = "train_sft"):
-    """Multi-turn conversation loader for TURN-CADENCED memory writes.
+    """Turn-aligned BATCHED multi-turn loader for turn-cadenced memory writes.
 
-    One conversation = one item. The conversation is encoded as a single token
-    stream with explicit role markers; `turn_starts` gives the token index where
-    each *assistant* turn begins. The trainer segments the stream at those points
-    (segment = turn) and writes to the bank once per turn, carrying the bank across
-    turns of the conversation (reset between conversations). This replaces the
-    arbitrary every-N-tokens write cadence with a SEMANTIC one — the unit that
-    actually matters for "remember earlier turns of this project".
+    Writes fire once per TURN (a semantic boundary) instead of every N tokens.
+    To keep the GPU busy despite per-turn forwards, B lanes are processed in
+    lock-step by TURN INDEX: each yield is turn-slot t of all B lanes, padded to a
+    common length. Each lane independently streams conversations (refilling when a
+    conversation runs out, like the persistent file loader), so every lane is
+    always active — no all-pad rows. The bank [B, M, d] persists across turn-slots
+    within a conversation and is reset per-lane at a conversation boundary.
 
-    Yields (x [1,T], y [1,T], turn_starts [n_turns]). batch_size is forced to 1:
-    conversations have different turn boundaries, so batching lanes would misalign
-    the per-turn writes; effective batch comes from grad accumulation.
+    Yields (x [B,L], y [B,L], loss_mask [B,L] bool, reset [B] bool) where reset[b]
+    marks the first turn-segment of a new conversation in lane b. Right-padding +
+    causal attention means real tokens never attend to pads; loss_mask zeroes pad
+    targets and the write pool ignores pad positions.
     """
     from datasets import load_dataset
 
-    hf       = cfg_dict["data"]
-    name     = hf["name"]
-    max_len  = hf["seq_len"]                       # cap on conversation length
-    mfield   = hf.get("messages_field", "messages")
-    min_turns = int(hf.get("min_turns", 2))        # need >=2 assistant turns for persistence
-    u_mark = tokenizer.encode("\n<|user|>\n", add_special_tokens=False)
-    a_mark = tokenizer.encode("\n<|assistant|>\n", add_special_tokens=False)
+    hf      = cfg_dict["data"]
+    name    = hf["name"]
+    max_len = hf["seq_len"]
+    B       = max(1, int(hf.get("batch_size", 1)))
+    mfield  = hf.get("messages_field", "messages")
+    pad_id  = tokenizer.pad_token_id or 0
+    u_mark  = tokenizer.encode("\n<|user|>\n", add_special_tokens=False)
+    a_mark  = tokenizer.encode("\n<|assistant|>\n", add_special_tokens=False)
 
-    class MultiTurnDS:
+    def conv_to_turns(ids, turn_starts):
+        """Split a conversation into (x_seg, y_seg) per turn at turn_starts."""
+        x, y = ids[:-1], ids[1:]
+        bounds = [0] + turn_starts + [len(x)]
+        return [(x[a:b], y[a:b]) for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+
+    class MultiTurnBatchedDS:
         def __iter__(self):
-            for ex in load_dataset(name, split=split, streaming=True):
-                msgs = ex.get(mfield) or []
-                ids, turn_starts = [], []
-                for m in msgs:
-                    role    = m.get("role", "")
-                    content = m.get("content", "") or ""
-                    mark    = a_mark if role == "assistant" else u_mark
-                    if role == "assistant":
-                        turn_starts.append(len(ids))   # write fires before this turn
-                    ids.extend(mark)
-                    ids.extend(tokenizer.encode(content, add_special_tokens=False))
-                    if len(ids) >= max_len + 1:
-                        break
-                ids = ids[:max_len + 1]
-                turn_starts = [t for t in turn_starts if 0 < t < len(ids) - 1]
-                if len(ids) < 8 or len(turn_starts) < min_turns:
-                    continue
-                x = torch.tensor(ids[:-1], dtype=torch.long).unsqueeze(0)
-                y = torch.tensor(ids[1:],  dtype=torch.long).unsqueeze(0)
-                yield x, y, torch.tensor(turn_starts, dtype=torch.long)
+            it = iter(load_dataset(name, split=split, streaming=True))
+            queues  = [[] for _ in range(B)]   # remaining turn-segments per lane
+            pending = [False] * B              # next pop starts a new conversation
 
-    return MultiTurnDS()
+            def refill(b):
+                while not queues[b]:
+                    enc = _encode_conversation(next(it), tokenizer, u_mark, a_mark, mfield, max_len)
+                    if enc is None:
+                        continue
+                    queues[b] = conv_to_turns(*enc)
+                    pending[b] = True
+
+            while True:
+                segs, resets = [], []
+                for b in range(B):
+                    if not queues[b]:
+                        refill(b)
+                    segs.append(queues[b].pop(0))
+                    resets.append(pending[b])
+                    pending[b] = False
+                L = max(len(xs) for xs, _ in segs)
+                x = torch.full((B, L), pad_id, dtype=torch.long)
+                y = torch.full((B, L), pad_id, dtype=torch.long)
+                mask = torch.zeros((B, L), dtype=torch.bool)
+                for b, (xs, ys) in enumerate(segs):
+                    n = len(xs)
+                    x[b, :n] = torch.tensor(xs, dtype=torch.long)
+                    y[b, :n] = torch.tensor(ys, dtype=torch.long)
+                    mask[b, :n] = True
+                yield x, y, mask, torch.tensor(resets, dtype=torch.bool)
+
+    return MultiTurnBatchedDS()
 
 
 def _build_dataloader(cfg_dict: dict, tokenizer, split: str = "train"):
@@ -473,7 +513,9 @@ def fused_cross_entropy(
         else:
             loss_c = _ce_chunk(h_c, weight, t_c)
         total = total + loss_c
-    return total / max(1, N)
+    # _ce_chunk sums and skips ignore_index (-100), so divide by REAL tokens only.
+    valid = int((tgt != -100).sum())
+    return total / max(1, valid)
 
 
 def compute_loss(
@@ -483,9 +525,15 @@ def compute_loss(
     ce_chunk_tokens: int = 1024,
     write_cost: float = 0.0,
     write_diversity: float = 0.0,
+    loss_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
     balance_loss = out["balance_loss"]
     p_gates      = out.get("p_gates")    # [B, T] or None (legacy model only)
+
+    # Padded multi-turn batches: ignore pad positions in the loss (set to -100,
+    # which F.cross_entropy skips; the fused path divides by real-token count).
+    if loss_mask is not None:
+        targets = targets.masked_fill(~loss_mask.bool(), -100)
 
     if out.get("logits") is not None:
         logits = out["logits"]            # [B, T, V]
@@ -494,6 +542,7 @@ def compute_loss(
         ce = F.cross_entropy(
             logits.transpose(1, 2),       # [B, V, T]
             targets,                      # [B, T]
+            ignore_index=-100,
         )
     else:
         # Memory-efficient path: model returned hidden states + tied head weight.
@@ -783,7 +832,7 @@ def persistence_probe(
 
     def carried_run(zero_content: bool):
         if ts is not None:
-            ts._new_thought = (lambda H, b=None: torch.zeros_like(orig_new(H, b))) if zero_content else orig_new
+            ts._new_thought = (lambda H, b=None, p=None: torch.zeros_like(orig_new(H, b, p))) if zero_content else orig_new
         mem = None
         ces = []
         for c in chunks:
@@ -814,9 +863,8 @@ def persistence_probe(
 @torch.no_grad()
 def multiturn_probe(
     model: nn.Module,
-    x: torch.LongTensor,
-    y: torch.LongTensor,
-    seg_bounds: torch.Tensor,
+    tokenizer,
+    cfg_dict: dict,
     *,
     fused_ce: bool,
     ce_chunk: int,
@@ -825,9 +873,10 @@ def multiturn_probe(
     amp_dtype: torch.dtype,
     use_amp: bool,
 ) -> dict:
-    """Turn-cadenced memory probe on ONE conversation (the current batch).
+    """Turn-cadenced memory probe on one freshly-streamed conversation (batch=1).
 
-    Segments the conversation by assistant-turn starts and runs three arms over the
+    Fetches its own conversation (independent of the training batch, which is now a
+    padded turn-slot), segments it by assistant-turn starts and runs three arms over
     turns k>0, measuring mean CE:
       real   : bank carried across turns, real writes
       zero   : bank carried, writes zeroed (slots kept) -> isolates content
@@ -835,8 +884,25 @@ def multiturn_probe(
     Returns ablation_gap (ablate-real), content_gap (zero-real, the metric to trust)
     and the final bank's effective rank (redundancy of stored thoughts).
     """
-    T = x.size(1)
-    bounds = [int(b) for b in seg_bounds.tolist() if 0 < int(b) < T]
+    from datasets import load_dataset
+    hf      = cfg_dict["data"]
+    max_len = hf["seq_len"]
+    mfield  = hf.get("messages_field", "messages")
+    min_t   = int(hf.get("min_turns", 2))
+    u_mark  = tokenizer.encode("\n<|user|>\n", add_special_tokens=False)
+    a_mark  = tokenizer.encode("\n<|assistant|>\n", add_special_tokens=False)
+    enc = None
+    for ex in load_dataset(hf["name"], split=hf.get("split", "train_sft"), streaming=True):
+        e = _encode_conversation(ex, tokenizer, u_mark, a_mark, mfield, max_len)
+        if e is not None and len(e[1]) >= min_t:
+            enc = e
+            break
+    if enc is None:
+        return {}
+    ids, turn_starts = enc
+    x = torch.tensor(ids[:-1], dtype=torch.long).unsqueeze(0).to(device)
+    y = torch.tensor(ids[1:],  dtype=torch.long).unsqueeze(0).to(device)
+    bounds = [int(b) for b in turn_starts if 0 < int(b) < x.size(1)]
     if not bounds:
         return {}
     xs = torch.tensor_split(x, bounds, dim=1)
@@ -850,7 +916,7 @@ def multiturn_probe(
     def run(zero_content: bool, ablate: bool):
         if ts is not None:
             ts._new_thought = (
-                (lambda H, b=None: torch.zeros_like(orig_new(H, b))) if zero_content else orig_new
+                (lambda H, b=None, p=None: torch.zeros_like(orig_new(H, b, p))) if zero_content else orig_new
             )
         mem = None
         ces = []
@@ -1015,43 +1081,64 @@ def main() -> None:
     toks  = 0          # tokens accumulated across the current optimiser step
     pbar  = tqdm(total=total_steps, desc="Training")
     persist_mem: Optional[torch.Tensor] = None   # bank carried across steps
+    window_loss = None                            # multi-turn TBPTT window accumulator
 
     for batch in dl:
-        seg_bounds = None
         if mem_multiturn:
-            x, y, seg_bounds = batch                 # one conversation; segment by turn
-            seg_bounds = seg_bounds.to(device)
-            reset = None
-        elif mem_persist:
-            x, y, reset = batch
-            reset = reset.to(device)
+            # One TURN-SLOT of B lanes (padded). The bank persists across slots
+            # within a conversation, resets per-lane at a conversation boundary, and
+            # backward runs over a TBPTT window of mem_bptt_window slots.
+            x, y, lmask, reset = batch
+            x, y, lmask, reset = x.to(device), y.to(device), lmask.to(device), reset.to(device)
+            toks += int(lmask.sum())
+
+            init_mem = persist_mem
+            if init_mem is not None and reset.any():
+                init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                out = model(x, init_mem=init_mem, compute_logits=not fused_ce, pad_mask=lmask)
+                loss, logs = compute_loss(
+                    out, y, balance_w, ce_chunk, write_cost, write_div, loss_mask=lmask
+                )
+            persist_mem = out["mem_bank"]                  # keep graph within the window
+            seg_loss = scaler.scale(loss / grad_accum)
+            window_loss = seg_loss if window_loss is None else window_loss + seg_loss
+            micro += 1
+            at_step = (micro % grad_accum == 0)
+            if micro % mem_bptt_window == 0 or at_step:     # flush window (TBPTT truncation)
+                window_loss.backward()
+                window_loss   = None
+                persist_mem   = persist_mem.detach()
+            if not at_step:
+                continue
         else:
-            x, y = batch
-            reset = None
-        x, y = x.to(device), y.to(device)
-        toks += x.numel()
+            if mem_persist:
+                x, y, reset = batch
+                reset = reset.to(device)
+            else:
+                x, y = batch
+                reset = None
+            x, y = x.to(device), y.to(device)
+            toks += x.numel()
 
-        # Multi-turn: bank persists ACROSS TURNS within the conversation (handled
-        # inside forward_backward via seg_bounds) but resets between conversations.
-        init_mem = None if mem_multiturn else persist_mem
-        if mem_persist and init_mem is not None and reset is not None and reset.any():
-            # zero the slots of lanes that just started a new file (fresh context)
-            init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
+            init_mem = persist_mem
+            if mem_persist and init_mem is not None and reset is not None and reset.any():
+                # zero the slots of lanes that just started a new file (fresh context)
+                init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
 
-        logs, mem_out = forward_backward(
-            model, x, y,
-            fused_ce=fused_ce, ce_chunk=ce_chunk, balance_w=balance_w,
-            scaler=scaler, seg_len=mem_seg_len, grad_accum=grad_accum,
-            device=device, amp_dtype=amp_dtype, use_amp=use_amp,
-            bptt_window=mem_bptt_window, init_mem=init_mem,
-            write_cost=write_cost, write_diversity=write_div,
-            seg_bounds=seg_bounds,
-        )
-        if mem_persist:
-            persist_mem = mem_out      # detached; carried into next step
-        micro += 1
-        if micro % grad_accum != 0:
-            continue
+            logs, mem_out = forward_backward(
+                model, x, y,
+                fused_ce=fused_ce, ce_chunk=ce_chunk, balance_w=balance_w,
+                scaler=scaler, seg_len=mem_seg_len, grad_accum=grad_accum,
+                device=device, amp_dtype=amp_dtype, use_amp=use_amp,
+                bptt_window=mem_bptt_window, init_mem=init_mem,
+                write_cost=write_cost, write_diversity=write_div,
+            )
+            if mem_persist:
+                persist_mem = mem_out      # detached; carried into next step
+            micro += 1
+            if micro % grad_accum != 0:
+                continue
 
         if hasattr(scaler, "unscale_"):
             scaler.unscale_(opt)
@@ -1073,7 +1160,7 @@ def main() -> None:
         # Multi-turn probe: turn-cadenced content_gap + effective rank
         if mem_probe_every and mem_multiturn and step % mem_probe_every == 0:
             mp = multiturn_probe(
-                model, x, y, seg_bounds, fused_ce=fused_ce, ce_chunk=ce_chunk,
+                model, tokenizer, raw, fused_ce=fused_ce, ce_chunk=ce_chunk,
                 balance_w=balance_w, device=device, amp_dtype=amp_dtype, use_amp=use_amp,
             )
             logs.update(mp)

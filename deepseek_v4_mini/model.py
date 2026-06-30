@@ -438,6 +438,7 @@ class DualModalDeepSeekV4Mini(nn.Module):
         input_ids: torch.LongTensor,
         init_mem: Optional[torch.Tensor] = None,
         compute_logits: bool = True,
+        pad_mask: Optional[torch.Tensor] = None,
     ) -> dict:
         B, T  = input_ids.shape
         cfg   = self.cfg
@@ -470,10 +471,10 @@ class DualModalDeepSeekV4Mini(nn.Module):
         # ── Step 4: gated thought write + FIFO eviction (no re-run of blocks) ──
         if init_mem is None or init_mem.size(1) == 0:
             # First forward: write the very first thought vector
-            _, mem_bank, _ = self.thought_stream(H_text, init_mem)
+            _, mem_bank, _ = self.thought_stream(H_text, init_mem, pad_mask)
         else:
             # Blocks already ran in _process_only; only append the new thought.
-            mem_bank = self.thought_stream._write(H_text, init_mem)
+            mem_bank = self.thought_stream._write(H_text, init_mem, pad_mask)
 
         # ── Step 5: LM head ───────────────────────────────────────────────────
         out = {
