@@ -428,6 +428,7 @@ def compute_loss(
     targets: torch.LongTensor,
     balance_weight: float,
     ce_chunk_tokens: int = 1024,
+    write_cost: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     balance_loss = out["balance_loss"]
     p_gates      = out.get("p_gates")    # [B, T] or None (legacy model only)
@@ -462,6 +463,15 @@ def compute_loss(
     if write_alpha is not None:
         logs["write_alpha"] = float(write_alpha)  # mean write prob α (write/skip)
 
+    # Sparsity budget on the write decision: cost · E[-log(1-α)]. Gives writing an
+    # opportunity cost so α stops saturating at 1 and becomes selective. Probes call
+    # compute_loss with the default write_cost=0.0, so probe CE stays uncontaminated.
+    write_penalty = out.get("write_penalty")
+    if write_penalty is not None and write_cost > 0.0:
+        pen  = write_cost * write_penalty
+        loss = loss + pen
+        logs["write_pen"] = float(pen.detach())
+
     return loss, logs
 
 
@@ -481,6 +491,7 @@ def forward_backward(
     use_amp: bool,
     bptt_window: int = 2,
     init_mem: Optional[torch.Tensor] = None,
+    write_cost: float = 0.0,
 ) -> tuple[dict, Optional[torch.Tensor]]:
     """Forward + backward for one micro-batch, returning (averaged logs, final bank).
 
@@ -520,7 +531,7 @@ def forward_backward(
     for i, (x_s, y_s) in enumerate(zip(xs, ys)):
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             out = model(x_s, init_mem=mem, compute_logits=not fused_ce)
-            loss, logs = compute_loss(out, y_s, balance_w, ce_chunk)
+            loss, logs = compute_loss(out, y_s, balance_w, ce_chunk, write_cost)
         # Scale so accumulated grads match a single large batch averaged over
         # both gradient-accumulation micro-batches and segments.
         seg_loss = scaler.scale(loss / (grad_accum * n_seg))
@@ -667,22 +678,44 @@ def persistence_probe(
             ces.append(logs["ce"])
         return (sum(ces) / max(1, len(ces))), mem
 
-    mem_carried = None
-    ce_carried, ce_reset = [], []
-    for k, c in enumerate(chunks):
-        ce_c, mem_carried = run_chunk(c, mem_carried)   # carried across chunks
-        ce_r, _           = run_chunk(c, None)          # bank reset this chunk
-        if k > 0:                                        # persistence only matters past chunk 0
-            ce_carried.append(ce_c)
-            ce_reset.append(ce_r)
+    # Disentangle CONTENT from STRUCTURE. persist_gap (carried vs reset) conflates
+    # two things: the written content AND the bank structure (slot count + slot
+    # positional embeddings) — a carried bank has ~max_mem slots, a reset one
+    # rebuilds from empty. A zero-content carried arm (writes zeroed, slots still
+    # appended → identical slot count) isolates them:
+    #   content_gap   = CE_zero  - CE_real   (pure content, slot count held equal)
+    #   structure_gap = CE_reset - CE_zero   (slot-count / positional structure)
+    #   persist_gap   = CE_reset - CE_real   = content_gap + structure_gap
+    ts = getattr(model, "thought_stream", None)
+    orig_new = ts._new_thought if ts is not None else None
+
+    def carried_run(zero_content: bool):
+        if ts is not None:
+            ts._new_thought = (lambda H: torch.zeros_like(orig_new(H))) if zero_content else orig_new
+        mem = None
+        ces = []
+        for c in chunks:
+            ce_c, mem = run_chunk(c, mem)
+            ces.append(ce_c)
+        if ts is not None:
+            ts._new_thought = orig_new
+        return ces
+
+    ce_real = carried_run(zero_content=False)
+    ce_zero = carried_run(zero_content=True)
+    ce_reset = [run_chunk(c, None)[0] for c in chunks]
 
     if was_training:
         model.train()
 
-    gap = (sum(ce_reset) - sum(ce_carried)) / len(ce_carried) if ce_carried else 0.0
+    def avg_tail(xs):                                     # chunks k>0 only
+        return sum(xs[1:]) / max(1, len(xs[1:]))
+    R, Z, S = avg_tail(ce_real), avg_tail(ce_zero), avg_tail(ce_reset)
     return {
-        "persist_gap":     gap,                          # CE_reset - CE_carried (>0 => persistence helps)
-        "persist_chunks":  float(len(ce_carried) + 1),
+        "persist_gap":   S - R,                          # content + structure (legacy headline)
+        "content_gap":   Z - R,                          # PURE content benefit (the metric to trust)
+        "structure_gap": S - Z,                          # slot-count / positional component
+        "persist_chunks": float(len(ce_real)),
     }
 
 
@@ -806,6 +839,7 @@ def main() -> None:
     save_every  = int(train_cfg.get("save_every", 1000))
     save_dir    = Path(train_cfg.get("save_dir", f"checkpoints/{run_name}"))
     balance_w   = float(model_cfg.balance_loss_weight)
+    write_cost  = float(getattr(model_cfg, "mem_write_cost", 0.0))  # write-sparsity budget
 
     model.train()
     step  = 0          # optimiser steps (one per grad_accum micro-batches)
@@ -836,6 +870,7 @@ def main() -> None:
             scaler=scaler, seg_len=mem_seg_len, grad_accum=grad_accum,
             device=device, amp_dtype=amp_dtype, use_amp=use_amp,
             bptt_window=mem_bptt_window, init_mem=init_mem,
+            write_cost=write_cost,
         )
         if mem_persist:
             persist_mem = mem_out      # detached; carried into next step
@@ -886,8 +921,10 @@ def main() -> None:
                 logs.update(pp)
                 if pp:
                     tqdm.write(
-                        f"  [persist-probe] persist_gap(CE↓)={pp['persist_gap']:+.4f}"
-                        f"  over {pp['persist_chunks']:.0f} chunks of one file"
+                        f"  [persist-probe] persist_gap={pp['persist_gap']:+.4f}"
+                        f"  = content_gap={pp['content_gap']:+.4f}"
+                        f"  + structure_gap={pp['structure_gap']:+.4f}"
+                        f"  ({pp['persist_chunks']:.0f} chunks)"
                     )
 
         if step % log_every == 0 or step == 1:
@@ -897,6 +934,7 @@ def main() -> None:
                 + (f"  r_hat={logs.get('r_hat', 0):.3f}" if "r_hat" in logs else "")
                 + (f"  mem={logs['mem_slots']:.0f}" if "mem_slots" in logs else "")
                 + (f"  α={logs['write_alpha']:.3f}" if "write_alpha" in logs else "")
+                + (f"  wpen={logs['write_pen']:.3f}" if "write_pen" in logs else "")
                 + (f"  gap={logs['mem_ablation_gap']:+.3f}" if "mem_ablation_gap" in logs else "")
                 + f"  lr={opt.param_groups[0]['lr']:.2e}  tok/s={tok_s:.0f}"
             )

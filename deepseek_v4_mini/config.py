@@ -63,6 +63,10 @@ class DeepSeekV4MiniConfig:
 
     # ── Training ──────────────────────────────────────────────────────────────
     balance_loss_weight: float = 1e-4   # MoE balance loss weight (paper §4.2.2: 0.0001)
+    # Sparsity budget on the write-decision α: adds cost · E[-log(1-α)] to the loss
+    # so writing has an opportunity cost. 0.0 = no penalty (α free to saturate at 1).
+    # The budget form keeps a live gradient even when α≈1 (unlike an L1 on α).
+    mem_write_cost: float = 0.0
 
     # ── Factory helpers ───────────────────────────────────────────────────────
     @classmethod

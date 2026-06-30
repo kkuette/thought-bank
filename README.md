@@ -89,10 +89,12 @@ Two probes run during training and write to `runs/<run_name>/metrics.jsonl`:
 
 | Metric | Meaning |
 |---|---|
-| `mem_ablation_gap` | CE without the bank − CE with it, on the same tokens (>0 ⇒ helps) |
+| `mem_ablation_gap` | CE without the bank − CE with it, on the same tokens (>0 ⇒ helps) — but ablating removes the **whole** cross-modal pathway, not just content |
 | `mem_diversity` | std across bank slots (~0 ⇒ slots collapsed = useless) |
 | `mem_write_rate` (α) | mean write probability — does the model choose to write? |
-| `persist_gap` | (persistent runs) CE with the bank **carried across chunks** of one file vs reset each chunk, on later chunks — the clean cross-sequence verdict |
+| `persist_gap` | (persistent runs) CE with the bank **carried across chunks** of one file vs reset each chunk. **Conflates content and structure** — see below; kept as the legacy headline |
+| **`content_gap`** | **the metric to trust**: CE with writes **zeroed** vs real, slot count held identical — the *pure* benefit of what is written into the bank |
+| `structure_gap` | `persist_gap − content_gap`: the part explained by slot count + slot positional embeddings, independent of content |
 
 Offline analysis: [`deepseek_v4_mini/eval_memory.py`](deepseek_v4_mini/eval_memory.py)
 (PPL with vs without the bank).
@@ -109,11 +111,34 @@ A/B on the **same architecture and code dataset**, at matched steps:
 | Setup | `ablation_gap` | `persist_gap` | slot `diversity` |
 |---|---|---|---|
 | per-sequence reset (`code.yaml`) | ~+0.02 → +0.10 | — | ~0.15 |
-| **persistent** (`code_persist.yaml`) | **+1.0 → +1.8** | **≈ +0.30 (stable)** | **~0.41** |
+| **persistent** (`code_persist.yaml`) | **+1.0 → +1.8** | **≈ +0.24–0.30 (stable)** | **~0.41** |
 
-- **`persist_gap ≈ +0.30`, stable** across probes — carrying the bank across
-  chunks of the same file consistently lowers later-chunk loss. This is the real
-  "remember earlier context" use case, and it works.
+### ⚠️ But most of `persist_gap` is structure, not content
+
+A control on the persistent checkpoint (step 2000, averaged over 6 files)
+**decomposes** `persist_gap` by zeroing the written content while keeping the
+slot count identical:
+
+| Component | Value | Share |
+|---|---|---|
+| `persist_gap` (carried vs reset) | **+0.236** | 100% |
+| **`content_gap`** (pure content) | **+0.077** | **33%** |
+| `structure_gap` (slot count / positions) | +0.159 | 67% |
+
+- **The written content genuinely helps — but modestly.** `content_gap = +0.077`
+  was positive on all 6 files (0.046–0.095, σ=0.018), so the bank content is not
+  noise. But it is small.
+- **~2/3 of the headline `persist_gap` is a structural artifact**: a carried bank
+  has ~`max_mem` positionally-encoded slots, a reset one rebuilds from empty, and
+  that difference alone moves later-chunk CE — even with a **zero-content** bank
+  (the sparse run with α≈0 still showed `persist_gap ≈ +0.32`). So `persist_gap`
+  overstates the memory's content value by ~3×. **Trust `content_gap`.**
+- Likewise `ablation_gap` is inflated: ablating the bank removes the *entire*
+  cross-modal pathway, not just the content, so its large value (+1.0–1.8) mostly
+  reflects "the pathway exists", not "the stored thoughts are useful".
+
+### Other findings
+
 - On short / locally-redeterminable data (TinyStories, dense contexts) the gap
   stays small: when the relevant "gist" fits in the attention window, the bank is
   redundant. Memory pays off for **non-local** context beyond the window.
@@ -121,6 +146,11 @@ A/B on the **same architecture and code dataset**, at matched steps:
   synthetic `associative_recall` task does *not* get solved by it (slots collapse
   to a single direction). Use it to remember *what is going on broadly*, not to
   recall exact values.
+- The write-decision α **saturates to 1.0** (always write) without a cost — the
+  write/skip "choice" decides nothing. A sparsity budget (`mem_write_cost`,
+  `cost · E[-log(1-α)]`) gives writing an opportunity cost; applied from step 0 it
+  over-corrects (α→0), so it needs a warmup. Judge selectivity by `content_gap`
+  holding with fewer writes, not by `persist_gap`.
 
 ### Things that were required to get here
 - **Next-token alignment**: the loaders pre-shift targets, so the loss must *not*
@@ -151,6 +181,7 @@ Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/R
 | `mem_segment_len` | attention window; smaller ⇒ more reliance on the bank |
 | `mem_bptt_window` | TBPTT span; **≥2 required** to train the write head |
 | `mem_probe_every` | how often to run the ablation / persistence probes |
+| `mem_write_cost` | sparsity budget on α (`cost · E[-log(1-α)]`); 0 = α free to saturate at 1 |
 | `data.persist: true` | per-file ordered lanes + carry the bank across steps |
 
 ---

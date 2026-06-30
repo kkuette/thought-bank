@@ -161,6 +161,11 @@ class ThoughtStream(nn.Module):
         # Telemetry: batch-mean of the last write probability α (set in
         # _new_thought). Lets train.py track the write/skip modality over training.
         self.last_write_alpha: Optional[torch.Tensor] = None
+        # Differentiable sparsity budget for the last write: E[-log(1-α)] =
+        # E[softplus(z)] (z = write_decision logit). Weighted by mem_write_cost in
+        # train.py. Budget form (not L1 on α) keeps a live gradient when α≈1, so a
+        # saturated "always write" can be pulled back toward selective writing.
+        self.last_write_penalty: Optional[torch.Tensor] = None
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -283,8 +288,12 @@ class ThoughtStream(nn.Module):
 
         p     = torch.sigmoid(self.write_gate(h_ctx))          # [B, mem_dim] content gate
         m     = self.norm_write(self.thought_head(h_ctx))      # [B, mem_dim] thought
-        alpha = torch.sigmoid(self.write_decision(h_ctx))      # [B, 1] modality choice
+        z     = self.write_decision(h_ctx)                     # [B, 1] decision logit
+        alpha = torch.sigmoid(z)                               # [B, 1] modality choice
         # Stash the batch-mean write probability for telemetry (detached, no graph).
         # >0.5 ≈ "the model chose to commit this thought"; ≈0 ≈ "skip / empty slot".
         self.last_write_alpha = alpha.detach().mean()
+        # Differentiable write budget E[-log(1-α)] = E[softplus(z)] (stable form).
+        # train.py adds mem_write_cost * this to the loss as the per-write cost.
+        self.last_write_penalty = F.softplus(z).mean()
         return (alpha * p * m).unsqueeze(1)                    # [B, 1, mem_dim]
