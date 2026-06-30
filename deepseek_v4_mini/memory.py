@@ -166,6 +166,11 @@ class ThoughtStream(nn.Module):
         # train.py. Budget form (not L1 on α) keeps a live gradient when α≈1, so a
         # saturated "always write" can be pulled back toward selective writing.
         self.last_write_penalty: Optional[torch.Tensor] = None
+        # Differentiable novelty/redundancy of the last write: E[max_j cos(m_new,
+        # slot_j)] vs the existing (stop-grad) bank. Weighted by mem_write_diversity
+        # in train.py; minimising it pushes each write away from its closest stored
+        # neighbour, raising the bank's effective rank (≈1.5/16 without pressure).
+        self.last_write_redundancy: Optional[torch.Tensor] = None
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -230,8 +235,8 @@ class ThoughtStream(nn.Module):
         """
         cfg = self.cfg
 
-        # Gated write + FIFO eviction
-        m_new    = self._new_thought(H_text)
+        # Gated write + FIFO eviction (novelty measured vs the pre-append bank)
+        m_new    = self._new_thought(H_text, mem_bank)
         mem_bank = torch.cat([mem_bank, m_new], dim=1)
         if mem_bank.size(1) > cfg.max_mem:
             mem_bank = mem_bank[:, -cfg.max_mem:, :]
@@ -262,14 +267,16 @@ class ThoughtStream(nn.Module):
         H_thought, bal = self._process(mem_bank)                # [B, M, mem_dim]
 
         # ── 2. Gated write + FIFO eviction ────────────────────────────────────
-        m_new    = self._new_thought(H_text)                     # [B, 1, mem_dim]
+        m_new    = self._new_thought(H_text, mem_bank)           # [B, 1, mem_dim]
         mem_bank = torch.cat([mem_bank, m_new], dim=1)           # [B, M+1, mem_dim]
         if mem_bank.size(1) > cfg.max_mem:                       # drop oldest slot
             mem_bank = mem_bank[:, -cfg.max_mem:, :]
 
         return H_thought, mem_bank, bal
 
-    def _new_thought(self, H_text: torch.Tensor) -> torch.Tensor:
+    def _new_thought(
+        self, H_text: torch.Tensor, bank: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Produce a new thought vector from the current text.
 
@@ -296,4 +303,14 @@ class ThoughtStream(nn.Module):
         # Differentiable write budget E[-log(1-α)] = E[softplus(z)] (stable form).
         # train.py adds mem_write_cost * this to the loss as the per-write cost.
         self.last_write_penalty = F.softplus(z).mean()
+        # Novelty: cosine of the new write to the closest existing (stop-grad) slot.
+        # train.py adds mem_write_diversity * this so the head learns to write vectors
+        # unlike what is already stored (gradient flows through m, not the bank).
+        if bank is not None and bank.size(1) > 0:
+            mn  = F.normalize(m, dim=-1)                       # [B, mem_dim]
+            bn  = F.normalize(bank.detach().float(), dim=-1).to(m.dtype)  # [B, M, mem_dim]
+            cos = torch.einsum("bd,bmd->bm", mn, bn)          # [B, M] sim to each slot
+            self.last_write_redundancy = cos.amax(dim=1).mean()  # closest neighbour
+        else:
+            self.last_write_redundancy = torch.zeros((), device=H_text.device)
         return (alpha * p * m).unsqueeze(1)                    # [B, 1, mem_dim]

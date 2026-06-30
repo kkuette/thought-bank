@@ -477,10 +477,11 @@ class DualModalDeepSeekV4Mini(nn.Module):
 
         # ── Step 5: LM head ───────────────────────────────────────────────────
         out = {
-            "balance_loss":  total_bal,
-            "mem_bank":      mem_bank,
-            "write_alpha":   self.thought_stream.last_write_alpha,    # mean α (telemetry)
-            "write_penalty": self.thought_stream.last_write_penalty,  # diff budget E[-log(1-α)]
+            "balance_loss":    total_bal,
+            "mem_bank":        mem_bank,
+            "write_alpha":     self.thought_stream.last_write_alpha,      # mean α (telemetry)
+            "write_penalty":   self.thought_stream.last_write_penalty,    # diff budget E[-log(1-α)]
+            "write_redundancy": self.thought_stream.last_write_redundancy, # diff E[max cos to bank]
         }
         if compute_logits:
             out["logits"] = self.lm_head(H_text)                           # [B,T,V]

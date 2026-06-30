@@ -341,12 +341,65 @@ def _build_persistent_file_loader(cfg_dict: dict, tokenizer, split: str = "train
     return PersistDS()
 
 
+def _build_multiturn_loader(cfg_dict: dict, tokenizer, split: str = "train_sft"):
+    """Multi-turn conversation loader for TURN-CADENCED memory writes.
+
+    One conversation = one item. The conversation is encoded as a single token
+    stream with explicit role markers; `turn_starts` gives the token index where
+    each *assistant* turn begins. The trainer segments the stream at those points
+    (segment = turn) and writes to the bank once per turn, carrying the bank across
+    turns of the conversation (reset between conversations). This replaces the
+    arbitrary every-N-tokens write cadence with a SEMANTIC one — the unit that
+    actually matters for "remember earlier turns of this project".
+
+    Yields (x [1,T], y [1,T], turn_starts [n_turns]). batch_size is forced to 1:
+    conversations have different turn boundaries, so batching lanes would misalign
+    the per-turn writes; effective batch comes from grad accumulation.
+    """
+    from datasets import load_dataset
+
+    hf       = cfg_dict["data"]
+    name     = hf["name"]
+    max_len  = hf["seq_len"]                       # cap on conversation length
+    mfield   = hf.get("messages_field", "messages")
+    min_turns = int(hf.get("min_turns", 2))        # need >=2 assistant turns for persistence
+    u_mark = tokenizer.encode("\n<|user|>\n", add_special_tokens=False)
+    a_mark = tokenizer.encode("\n<|assistant|>\n", add_special_tokens=False)
+
+    class MultiTurnDS:
+        def __iter__(self):
+            for ex in load_dataset(name, split=split, streaming=True):
+                msgs = ex.get(mfield) or []
+                ids, turn_starts = [], []
+                for m in msgs:
+                    role    = m.get("role", "")
+                    content = m.get("content", "") or ""
+                    mark    = a_mark if role == "assistant" else u_mark
+                    if role == "assistant":
+                        turn_starts.append(len(ids))   # write fires before this turn
+                    ids.extend(mark)
+                    ids.extend(tokenizer.encode(content, add_special_tokens=False))
+                    if len(ids) >= max_len + 1:
+                        break
+                ids = ids[:max_len + 1]
+                turn_starts = [t for t in turn_starts if 0 < t < len(ids) - 1]
+                if len(ids) < 8 or len(turn_starts) < min_turns:
+                    continue
+                x = torch.tensor(ids[:-1], dtype=torch.long).unsqueeze(0)
+                y = torch.tensor(ids[1:],  dtype=torch.long).unsqueeze(0)
+                yield x, y, torch.tensor(turn_starts, dtype=torch.long)
+
+    return MultiTurnDS()
+
+
 def _build_dataloader(cfg_dict: dict, tokenizer, split: str = "train"):
     """Thin wrapper around HF streaming dataset → fixed-length batches."""
     if cfg_dict["data"].get("task") == "associative_recall":
         return _build_synthetic_recall(cfg_dict)
     if cfg_dict["data"].get("task") == "latent_context":
         return _build_latent_context(cfg_dict)
+    if cfg_dict["data"].get("task") == "multiturn":
+        return _build_multiturn_loader(cfg_dict, tokenizer, cfg_dict["data"].get("split", "train_sft"))
     if cfg_dict["data"].get("persist"):
         return _build_persistent_file_loader(cfg_dict, tokenizer, split)
 
@@ -429,6 +482,7 @@ def compute_loss(
     balance_weight: float,
     ce_chunk_tokens: int = 1024,
     write_cost: float = 0.0,
+    write_diversity: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     balance_loss = out["balance_loss"]
     p_gates      = out.get("p_gates")    # [B, T] or None (legacy model only)
@@ -472,6 +526,17 @@ def compute_loss(
         loss = loss + pen
         logs["write_pen"] = float(pen.detach())
 
+    # Novelty-gated write: penalise similarity of the new write to existing slots.
+    # Pushes the head to store diverse thoughts (raises bank effective rank). The
+    # raw redundancy (max cosine) is logged regardless of weight, as a diagnostic.
+    write_redundancy = out.get("write_redundancy")
+    if write_redundancy is not None:
+        logs["write_redund"] = float(write_redundancy.detach())
+        if write_diversity > 0.0:
+            div  = write_diversity * write_redundancy
+            loss = loss + div
+            logs["write_div"] = float(div.detach())
+
     return loss, logs
 
 
@@ -492,6 +557,8 @@ def forward_backward(
     bptt_window: int = 2,
     init_mem: Optional[torch.Tensor] = None,
     write_cost: float = 0.0,
+    write_diversity: float = 0.0,
+    seg_bounds: Optional[torch.Tensor] = None,
 ) -> tuple[dict, Optional[torch.Tensor]]:
     """Forward + backward for one micro-batch, returning (averaged logs, final bank).
 
@@ -516,7 +583,13 @@ def forward_backward(
     (still bounded). W=2 is the minimal value that trains the write head.
     """
     T = x.size(1)
-    if seg_len and 0 < seg_len < T:
+    if seg_bounds is not None and seg_bounds.numel() > 0:
+        # Explicit semantic segmentation (multi-turn: split at assistant-turn starts).
+        # One write fires per turn-segment; cadence is the turn, not a fixed length.
+        bounds = [int(b) for b in seg_bounds.tolist() if 0 < int(b) < T]
+        xs = torch.tensor_split(x, bounds, dim=1)
+        ys = torch.tensor_split(y, bounds, dim=1)
+    elif seg_len and 0 < seg_len < T:
         xs = x.split(seg_len, dim=1)
         ys = y.split(seg_len, dim=1)
     else:
@@ -531,7 +604,7 @@ def forward_backward(
     for i, (x_s, y_s) in enumerate(zip(xs, ys)):
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             out = model(x_s, init_mem=mem, compute_logits=not fused_ce)
-            loss, logs = compute_loss(out, y_s, balance_w, ce_chunk, write_cost)
+            loss, logs = compute_loss(out, y_s, balance_w, ce_chunk, write_cost, write_diversity)
         # Scale so accumulated grads match a single large batch averaged over
         # both gradient-accumulation micro-batches and segments.
         seg_loss = scaler.scale(loss / (grad_accum * n_seg))
@@ -607,13 +680,32 @@ def memory_probe(
     )
     bank_norm = float(mem.float().norm(dim=-1).mean()) if mem is not None else 0.0
     write_rate = sum(alphas) / len(alphas) if alphas else 0.0
+    eff_rank = _effective_rank(mem)
     return {
         "mem_ablation_gap": gap,        # CE_without - CE_with  (>0 => memory helps)
         "mem_diversity":    diversity,  # std across slots (~0 => collapsed/useless)
+        "mem_eff_rank":     eff_rank,   # entropy eff. rank of slots (~1 => duplicates)
         "mem_bank_norm":    bank_norm,
         "mem_slots_final":  float(mem.size(1)) if mem is not None else 0.0,
         "mem_write_rate":   write_rate, # mean α: how strongly the model commits writes
     }
+
+
+def _effective_rank(mem: Optional[torch.Tensor]) -> float:
+    """Entropy effective rank of the bank slots: exp(H(p)) with p = normalised
+    squared singular values of the centred bank. ~1 => all slots ≈ one direction
+    (near-duplicate writes); ~max_mem => fully diverse. The honest redundancy
+    metric — unlike per-dim std (mem_diversity), it catches directional collapse."""
+    if mem is None or mem.size(1) < 2:
+        return 0.0
+    bank = mem[0].float()
+    bank = bank - bank.mean(dim=0, keepdim=True)
+    sv = torch.linalg.svdvals(bank)
+    s2 = sv ** 2
+    if float(s2.sum()) <= 0:
+        return 0.0
+    p = s2 / s2.sum()
+    return float(torch.exp(-(p * (p + 1e-12).log()).sum()))
 
 
 @torch.no_grad()
@@ -691,7 +783,7 @@ def persistence_probe(
 
     def carried_run(zero_content: bool):
         if ts is not None:
-            ts._new_thought = (lambda H: torch.zeros_like(orig_new(H))) if zero_content else orig_new
+            ts._new_thought = (lambda H, b=None: torch.zeros_like(orig_new(H, b))) if zero_content else orig_new
         mem = None
         ces = []
         for c in chunks:
@@ -716,6 +808,79 @@ def persistence_probe(
         "content_gap":   Z - R,                          # PURE content benefit (the metric to trust)
         "structure_gap": S - Z,                          # slot-count / positional component
         "persist_chunks": float(len(ce_real)),
+    }
+
+
+@torch.no_grad()
+def multiturn_probe(
+    model: nn.Module,
+    x: torch.LongTensor,
+    y: torch.LongTensor,
+    seg_bounds: torch.Tensor,
+    *,
+    fused_ce: bool,
+    ce_chunk: int,
+    balance_w: float,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+) -> dict:
+    """Turn-cadenced memory probe on ONE conversation (the current batch).
+
+    Segments the conversation by assistant-turn starts and runs three arms over the
+    turns k>0, measuring mean CE:
+      real   : bank carried across turns, real writes
+      zero   : bank carried, writes zeroed (slots kept) -> isolates content
+      ablate : no bank at all (init_mem=None each turn)
+    Returns ablation_gap (ablate-real), content_gap (zero-real, the metric to trust)
+    and the final bank's effective rank (redundancy of stored thoughts).
+    """
+    T = x.size(1)
+    bounds = [int(b) for b in seg_bounds.tolist() if 0 < int(b) < T]
+    if not bounds:
+        return {}
+    xs = torch.tensor_split(x, bounds, dim=1)
+    ys = torch.tensor_split(y, bounds, dim=1)
+    was_training = model.training
+    model.eval()
+
+    ts = getattr(model, "thought_stream", None)
+    orig_new = ts._new_thought if ts is not None else None
+
+    def run(zero_content: bool, ablate: bool):
+        if ts is not None:
+            ts._new_thought = (
+                (lambda H, b=None: torch.zeros_like(orig_new(H, b))) if zero_content else orig_new
+            )
+        mem = None
+        ces = []
+        for i, (x_s, y_s) in enumerate(zip(xs, ys)):
+            if x_s.size(1) < 2:
+                continue
+            init = None if ablate else mem
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                out = model(x_s, init_mem=init, compute_logits=not fused_ce)
+                _, lg = compute_loss(out, y_s, balance_w, ce_chunk)
+            if not ablate:
+                mem = out["mem_bank"].detach()
+            if i > 0:
+                ces.append(lg["ce"])
+        if ts is not None:
+            ts._new_thought = orig_new
+        return (sum(ces) / max(1, len(ces)) if ces else 0.0), mem
+
+    ce_real, mem = run(zero_content=False, ablate=False)
+    ce_zero, _   = run(zero_content=True,  ablate=False)
+    ce_abl,  _   = run(zero_content=False, ablate=True)
+
+    if was_training:
+        model.train()
+    return {
+        "mem_ablation_gap": ce_abl - ce_real,            # whole-pathway benefit
+        "content_gap":      ce_zero - ce_real,           # pure content (trust this)
+        "mem_eff_rank":     _effective_rank(mem),        # redundancy of stored thoughts
+        "mem_slots_final":  float(mem.size(1)) if mem is not None else 0.0,
+        "mem_turns":        float(len(xs)),
     }
 
 
@@ -834,12 +999,14 @@ def main() -> None:
     mem_bptt_window = max(1, int(train_cfg.get("mem_bptt_window", 2)))
     mem_probe_every = int(train_cfg.get("mem_probe_every", 0))  # 0 = off
     mem_persist     = bool(data_cfg.get("persist", False))      # carry bank across steps
+    mem_multiturn   = data_cfg.get("task") == "multiturn"        # segment by turn, bank/conversation
     persist_chunks  = int(train_cfg.get("persist_probe_chunks", 6))
     log_every   = int(train_cfg.get("log_every", 50))
     save_every  = int(train_cfg.get("save_every", 1000))
     save_dir    = Path(train_cfg.get("save_dir", f"checkpoints/{run_name}"))
     balance_w   = float(model_cfg.balance_loss_weight)
-    write_cost  = float(getattr(model_cfg, "mem_write_cost", 0.0))  # write-sparsity budget
+    write_cost  = float(getattr(model_cfg, "mem_write_cost", 0.0))       # write-sparsity budget
+    write_div   = float(getattr(model_cfg, "mem_write_diversity", 0.0))  # novelty-gated write
 
     model.train()
     step  = 0          # optimiser steps (one per grad_accum micro-batches)
@@ -850,7 +1017,12 @@ def main() -> None:
     persist_mem: Optional[torch.Tensor] = None   # bank carried across steps
 
     for batch in dl:
-        if mem_persist:
+        seg_bounds = None
+        if mem_multiturn:
+            x, y, seg_bounds = batch                 # one conversation; segment by turn
+            seg_bounds = seg_bounds.to(device)
+            reset = None
+        elif mem_persist:
             x, y, reset = batch
             reset = reset.to(device)
         else:
@@ -859,7 +1031,9 @@ def main() -> None:
         x, y = x.to(device), y.to(device)
         toks += x.numel()
 
-        init_mem = persist_mem
+        # Multi-turn: bank persists ACROSS TURNS within the conversation (handled
+        # inside forward_backward via seg_bounds) but resets between conversations.
+        init_mem = None if mem_multiturn else persist_mem
         if mem_persist and init_mem is not None and reset is not None and reset.any():
             # zero the slots of lanes that just started a new file (fresh context)
             init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
@@ -870,7 +1044,8 @@ def main() -> None:
             scaler=scaler, seg_len=mem_seg_len, grad_accum=grad_accum,
             device=device, amp_dtype=amp_dtype, use_amp=use_amp,
             bptt_window=mem_bptt_window, init_mem=init_mem,
-            write_cost=write_cost,
+            write_cost=write_cost, write_diversity=write_div,
+            seg_bounds=seg_bounds,
         )
         if mem_persist:
             persist_mem = mem_out      # detached; carried into next step
@@ -895,8 +1070,23 @@ def main() -> None:
         pbar.set_postfix(loss=f"{logs['ce']:.3f}", ppl=f"{logs['ppl']:.1f}", tok_s=f"{tok_s:.0f}")
         pbar.update(1)
 
+        # Multi-turn probe: turn-cadenced content_gap + effective rank
+        if mem_probe_every and mem_multiturn and step % mem_probe_every == 0:
+            mp = multiturn_probe(
+                model, x, y, seg_bounds, fused_ce=fused_ce, ce_chunk=ce_chunk,
+                balance_w=balance_w, device=device, amp_dtype=amp_dtype, use_amp=use_amp,
+            )
+            logs.update(mp)
+            if mp:
+                tqdm.write(
+                    f"  [mt-probe] ablation_gap={mp['mem_ablation_gap']:+.4f}"
+                    f"  content_gap={mp['content_gap']:+.4f}"
+                    f"  eff_rank={mp['mem_eff_rank']:.2f}/{mp['mem_slots_final']:.0f}"
+                    f"  turns={mp['mem_turns']:.0f}"
+                )
+
         # Memory usefulness probe (ablation: CE with vs without the bank)
-        if mem_probe_every and mem_seg_len and step % mem_probe_every == 0:
+        if mem_probe_every and mem_seg_len and not mem_multiturn and step % mem_probe_every == 0:
             probe = memory_probe(
                 model, x, y, fused_ce=fused_ce, ce_chunk=ce_chunk,
                 balance_w=balance_w, seg_len=mem_seg_len, device=device,
@@ -935,6 +1125,8 @@ def main() -> None:
                 + (f"  mem={logs['mem_slots']:.0f}" if "mem_slots" in logs else "")
                 + (f"  α={logs['write_alpha']:.3f}" if "write_alpha" in logs else "")
                 + (f"  wpen={logs['write_pen']:.3f}" if "write_pen" in logs else "")
+                + (f"  redund={logs['write_redund']:.3f}" if "write_redund" in logs else "")
+                + (f"  erank={logs['mem_eff_rank']:.2f}" if "mem_eff_rank" in logs else "")
                 + (f"  gap={logs['mem_ablation_gap']:+.3f}" if "mem_ablation_gap" in logs else "")
                 + f"  lr={opt.param_groups[0]['lr']:.2e}  tok/s={tok_s:.0f}"
             )

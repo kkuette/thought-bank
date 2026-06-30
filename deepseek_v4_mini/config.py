@@ -67,6 +67,12 @@ class DeepSeekV4MiniConfig:
     # so writing has an opportunity cost. 0.0 = no penalty (α free to saturate at 1).
     # The budget form keeps a live gradient even when α≈1 (unlike an L1 on α).
     mem_write_cost: float = 0.0
+    # Novelty-gated write: penalise the cosine of each new write to the closest
+    # existing bank slot (adds weight · E[max_j cos(m_new, slot_j)] to the loss).
+    # Trains the write head to store DIVERSE thoughts instead of near-duplicates —
+    # without it the bank collapses to ~1 effective vector (eff. rank ~1.5/16).
+    # 0.0 = off.
+    mem_write_diversity: float = 0.0
 
     # ── Factory helpers ───────────────────────────────────────────────────────
     @classmethod
