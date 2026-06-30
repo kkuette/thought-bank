@@ -6,8 +6,12 @@
 # boundary — rather than an arbitrary write every mem_segment_len tokens. The
 # every-64-tokens cadence is what filled the bank with near-duplicate vectors
 # (eff. rank ~1.5/16); writing at turn boundaries should store more distinct
-# thoughts. v1 keeps K=1 write/turn and no novelty penalty, to isolate the effect
-# of CADENCE alone (compare mt-probe eff_rank / content_gap vs code_persist).
+# thoughts. Step 1 of the multi-turn plan: EXCHANGE-split (segment = user_k +
+# assistant_k, so the bank carries only older exchanges) + novelty-gated write
+# (mem_write_diversity) so the head stores distinct thoughts. Baseline for A/B is
+# the no-novelty assistant-split run (runs/dsv4mini_multiturn). Success = content_gap
+# turns positive while redund stays low and eff_rank rises. (K=1 write/turn; the
+# <think>-token-triggered write is the next step.)
 #
 # Throughput: B lanes are processed turn-aligned (lock-step by turn index), each
 # lane streaming its own conversation, so the GPU sees real batches despite the
@@ -44,7 +48,7 @@ mem_dim: 32
 max_mem: 16
 
 balance_loss_weight: 1.0e-3
-mem_write_diversity: 0.0     # v1: isolate cadence; raise later for intra-bank diversity
+mem_write_diversity: 0.05    # novelty-gated write: store distinct thoughts (vs redund→1)
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
@@ -64,10 +68,10 @@ training:
   mem_probe_every: 100
   log_every: 50
   save_every: 1000
-  save_dir: checkpoints/multiturn
-  run_name: dsv4mini_multiturn
+  save_dir: checkpoints/multiturn_ex
+  run_name: dsv4mini_multiturn_ex
   tensorboard: false
-  metrics_file: runs/dsv4mini_multiturn/metrics.jsonl
+  metrics_file: runs/dsv4mini_multiturn_ex/metrics.jsonl
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:

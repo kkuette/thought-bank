@@ -344,15 +344,19 @@ def _build_persistent_file_loader(cfg_dict: dict, tokenizer, split: str = "train
 def _encode_conversation(ex, tokenizer, u_mark, a_mark, mfield, max_len):
     """Encode one chat example to (ids, turn_starts) or None if too short.
 
-    ids is the full token stream with role markers; turn_starts are indices into
-    x=ids[:-1] where each assistant turn begins (the write-fire points)."""
+    ids is the full token stream with role markers; turn_starts are EXCHANGE
+    boundaries — the index before each user turn except the first. Splitting there
+    makes each segment a full exchange [user_k, assistant_k]: the model sees the
+    current question in-window and the bank carries only OLDER exchanges (the real
+    'remember earlier turns' case), instead of the bank having to carry even the
+    immediate question (which an assistant-boundary split forced)."""
     msgs = ex.get(mfield) or []
     ids, turn_starts = [], []
     for m in msgs:
         role    = m.get("role", "")
         content = m.get("content", "") or ""
         mark    = a_mark if role == "assistant" else u_mark
-        if role == "assistant":
+        if role == "user" and ids:          # exchange boundary (not before the 1st turn)
             turn_starts.append(len(ids))
         ids.extend(mark)
         ids.extend(tokenizer.encode(content, add_special_tokens=False))
