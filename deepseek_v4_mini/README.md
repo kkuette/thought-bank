@@ -1,135 +1,167 @@
 # deepseek_v4_mini
 
-Small Python reproduction of the [DeepSeek-V4](https://arxiv.org/abs/2606.19348) architecture, fused with a dual-stream thought memory system.
+Small Python reproduction of the [DeepSeek-V4](https://arxiv.org/abs/2606.19348) architecture, fused with a **fast-weight thought bank**: a rolling memory the model reads as *weights* (not attended data) and writes to itself, targeting continual learning at inference **without a backward pass**.
 
 Designed for single-GPU experimentation (~6M–32M params).
+
+---
+
+## The idea: memory as fast weights
+
+The thought bank `[B, M, mem_dim]` is not a KV cache the text attends to. Each slot is
+expanded by a learned hypernet into a small low-rank MLP layer, and the token stream is
+passed **through** that stack of layers. The model writes its own vectors into the bank and
+then reuses them as the weights of its own forward pass. A rule inferred at turn 0 (e.g.
+"shift every symbol by `s`") can thus be *applied* at later turns even though the answer
+window contains no examples — the rule crosses the turn boundary through the bank, as a
+fast weight. See [Schmidhuber 1992; Ba et al. 2016; Schlag et al. 2021].
 
 ---
 
 ## Architecture overview
 
 ```
-Pass k
-──────
+Pass k  (one turn / segment)
+────────────────────────────
 
-  ┌─────────────────────────────────────────────────────────┐
-  │  Thought stream  [B, M, mem_dim]                        │
-  │                                                         │
-  │  pos_embed(slot_idx) → CSA/HCA blocks (mHC) → H_thought│
-  │                                                         │
-  │  Slot 0 = oldest surviving thought                      │
-  │  Slot M-1 = most recent thought                         │
-  └────────────────────┬────────────────────────────────────┘
-                       │  cross-modal at every layer
-                       ▼
-  ┌─────────────────────────────────────────────────────────┐
-  │  Text stream  [B, T, d_model]                           │
-  │                                                         │
-  │  for each layer:                                        │
-  │    mHC( CSA or HCA )          ← self-attention          │
-  │    cross_attn( text ← thought )                        │
-  │    mHC( MoE )                 ← feed-forward            │
-  └────────────────────┬────────────────────────────────────┘
-                       │  H_text [B, T, d_model]
-                       ▼
-               ThoughtStream.write()
-                       │
-          ┌────────────┴────────────┐
-          │  gated write            │  m_new = α · p · m
-          │   α = σ(write_decision) │   α : scalar write/skip choice
-          │   p = σ(write_gate)     │   p : per-dim content gate
-          │   m = thought_head(ctx) │   m : the thought vector
-          │  append, then FIFO-evict│
-          │  oldest if > max_mem    │
-          └────────────────────────┘
-                       │
-              Bank [B, M', mem_dim]  →  pass k+1
-              (carried across passes; persists across sequences if enabled)
+  input_ids [B,T] ──► embed ──► X [B,T,n_hc,d]
+                                   │
+   thought bank [B,M,mem_dim] ─────┤  read as FAST WEIGHTS at every block
+   (seeded random[0,1] on a fresh  │
+    conversation, else carried in) │
+                                   ▼
+  ┌──────────────────── DualModalBlock × n_layers ───────────────────┐
+  │  1. mHC( CSA even / HCA odd )          ← text self-attention      │
+  │  2. fast-weight read( text ← bank )    ← slot-parametrised MLP    │
+  │  3. mHC( MoE )                         ← feed-forward             │
+  └──────────────────────────────┬───────────────────────────────────┘
+                                 │  H_text [B,T,d]
+                                 ▼
+                   ThoughtStream.write()   (once, after the blocks)
+                                 │   m = norm(thought_head(pool(H_text)))
+                                 │   gate (optional): m_new = α·p·m
+                                 │   append, FIFO-evict oldest past max_mem
+                                 ▼
+                   mem_bank [B,M',mem_dim]  ──►  pass k+1
+                   (carry as init_mem for multi-turn continual learning)
 ```
 
-**Even-indexed layers** use **CSA** (Compressed Sparse Attention).  
-**Odd-indexed layers** use **HCA** (Heavily Compressed Attention).  
-Both streams follow the same pattern at different scales.
+The bank is **shared and static across the blocks of one forward** (all `n_layers` blocks
+read the same bank); the write happens **once, after** the blocks. There is no separate
+thought-stream transformer — the text model writes the vectors and reuses them directly.
+
+**Even-indexed layers** use **CSA** (Compressed Sparse Attention); **odd-indexed layers**
+use **HCA** (Heavily Compressed Attention).
 
 ---
 
-## Key components
+## Fast-weight read (`model.py` · `DualModalBlock._cross_modal`)
+
+Each slot `mᵢ ∈ R^mem_dim` is expanded by a learned hypernet into a low-rank layer
+`Aᵢ ∈ R^{r×d}`, `Bᵢ ∈ R^{d×r}` (`r = mem_read_rank`), applied **sequentially** over the
+`M` slots:
+
+```
+y ← norm(h)                                  # y0
+for i in range(M):                           # one fast-weight layer per slot
+    y ← y + dropout( Bᵢ · GELU(Aᵢ · y) )     # residual, non-linear
+read = h + fw_o(y − y0)                       # net delta; trivial bank ≈ identity
+```
+
+The **GELU between slots** is load-bearing: without it, stacking/summing slots collapses to
+a single low-rank *linear* map (the failure mode of the earlier outer-product read, which
+could not express an input-conditioned permutation). Placed between attention and MoE so the
+applied "weights" also influence expert routing.
+
+---
+
+## Write head + FIFO eviction (`memory.py` · `ThoughtStream`)
+
+`memory.py` owns only the **write** side (the read lives in the block). A fresh bank is
+seeded by `seed_bank()` with `mem_seed_slots` random-uniform[0,1] vectors, so the
+fast-weight layers are non-zero from the first forward; later writes append on top.
+
+```
+ctx   = attention-pool over H_text (pad-masked)   # [B, d_model]
+m     = norm(thought_head(ctx))                    # the thought      [B, mem_dim]
+# optional gate (mem_write_gate: true):
+p     = sigmoid(write_gate(ctx))                    # per-dim content gate
+α     = sigmoid(write_decision(ctx))               # scalar write/skip choice
+m_new = m           if gate off   else   α · p · m
+```
+
+The vector is appended; past `max_mem` the **oldest slot is FIFO-evicted**.
+
+> **Write gate (`mem_write_gate`).** With the gate on, `α` is the model's write/skip
+> *modality choice* and `p` a per-dim content gate — useful for streaming selectivity. But
+> the gate **attenuates** the written vector (`α·p·m` can only shrink `m`), which slows the
+> bootstrap of the fast-weight transport and dilutes the code a downstream read must recover.
+> Set `mem_write_gate: false` to write the pure normalised thought while bootstrapping;
+> re-enable it once transport works and selectivity matters.
+
+**Training the write head requires `mem_bptt_window ≥ 2`.** The write is a pure *output* of
+a segment — the segment's own loss never depends on it (the write happens after the LM head);
+its only consumer is the *next* segment's read. With a per-segment detach (`window = 1`) the
+write head gets zero gradient. `window ≥ 2` keeps the graph across a boundary so segment
+`i+1`'s loss trains segment `i`'s write.
+
+---
+
+## Teacher-forced bank bootstrap (`train.py`, `multiturn_rule` only)
+
+Read and write each work in isolation — the read applies any fixed code (clean, learned, or
+frozen-random) to ~100%, and the write can encode the latent rule so it is decodable — yet
+naïve **joint** training sticks at an "ignore-bank" fixed point (`rule_acc` at chance): at
+init the read ≈ identity and the early written code is useless, so no gradient tells the read
+to consume the bank, and the write never gets a read-useful gradient.
+
+The fix is a bootstrap that breaks the fixed point. During training on `multiturn_rule`
+(each conversation draws a fresh rule id `s`, a legitimate meta-training signal since `s` is
+latent at inference):
+
+```
+turn 0 :  produce written slot w0 ;  distill = MSE(w0, teacher[s].detach())
+read code = β · teacher[s] + (1-β) · w0        # what the read consumes downstream
+β anneals 1 → 0  over [mem_teacher_anneal_start, mem_teacher_anneal_end]
+```
+
+Early on the read consumes a **clean teacher code** correlated with `s` (the read_isolation
+regime → strong "use me" gradient) while distillation pulls the written slot toward it; then
+the teacher is annealed away and the read applies the pure written code. On the benchmark
+this takes cross-turn rule transport from **0.03 (chance) → ~0.97**, holding after the teacher
+is removed — far above the in-context (ICL) ceiling. Evaluation always reads the pure written
+code, so `rule_acc` measures the true objective throughout. Off by default; enable with
+`mem_teacher_forcing: true`.
+
+---
+
+## Other components
 
 ### mHC — Manifold-Constrained Hyper-Connections (`mhc.py`)
 
-Replaces standard residual connections. The residual stream is widened by a factor `n_hc`, and the residual mapping matrix **B** is constrained to the Birkhoff polytope (doubly stochastic matrices) via Sinkhorn-Knopp iteration. This bounds `||B||₂ ≤ 1`, making deep stacks numerically stable.
+Replaces standard residuals. The residual stream is widened by `n_hc`, and the residual
+mapping matrix **B** is constrained to the Birkhoff polytope (doubly-stochastic) via
+Sinkhorn-Knopp, bounding `||B||₂ ≤ 1` for stable deep stacks.
 
 ```
-X_{l+1} = B_l X_l + C_l F_l(A_l X_l)
-
-X_l ∈ R^{n_hc × d}   — expanded residual stream
-A_l, B_l, C_l         — dynamically generated from X_l
-B_l ∈ Birkhoff polytope  (Sinkhorn-Knopp projection)
+X_{l+1} = B_l X_l + C_l F_l(A_l X_l)     A_l, B_l, C_l dynamically generated from X_l
 ```
 
 ### CSA — Compressed Sparse Attention (`attention.py`)
 
-Compression factor `m` with **overlapping** windows (two KV series Ca, Cb).  
-A lightweight indexer selects the top-k most relevant compressed blocks for each query token. A sliding window branch (`n_win` tokens) handles local dependencies.
-
-```
-n_blocks = T // m
-
-For token t in block i = t // m:
-  - attend top-k compressed blocks from {0, …, i-1}   (global, sparse)
-  - attend last n_win tokens                            (local, dense)
-```
+Compression factor `m` with **overlapping** windows; a lightweight indexer selects the top-k
+compressed blocks per query, plus a sliding window (`n_win`) for local dependencies.
 
 ### HCA — Heavily Compressed Attention (`attention.py`)
 
-Compression factor `m' >> m` with **non-overlapping** windows.  
-Dense attention over all preceding compressed blocks — no top-k selection.  
-Lower per-token cost than CSA; captures very long-range structure cheaply.
+Compression factor `m' >> m` with **non-overlapping** windows; dense over all preceding
+compressed blocks (no top-k). Cheaper than CSA; captures long-range structure.
 
 ### DeepSeekMoE (`moe.py`)
 
-Fine-grained mixture of experts with:
-- **Shared experts** — always active (`n_shared`, typically 1)
-- **Routed experts** — top-k activated per token based on affinity score `√(softplus(h W_gate))`
-
-An auxiliary sequence-balance loss prevents expert collapse.
-
-### Thought stream (`memory.py`)
-
-A second transformer (CSA/HCA + mHC) that operates on the memory bank `[B, M, mem_dim]`. Uses **slot index as temporal encoding** — `nn.Embedding(max_mem, mem_dim)` indexed by position in the bank, so slot 0 = oldest, slot M-1 = newest.
-
-### Gated write + FIFO eviction (`memory.py`)
-
-After the text blocks, each segment writes one thought vector to the bank:
-
-```
-ctx   = attention-pool over the segment's H_text     # [B, d_model]
-m     = norm(thought_head(ctx))                      # the thought  [B, mem_dim]
-p     = sigmoid(write_gate(ctx))                     # per-dim content gate
-α     = sigmoid(write_decision(ctx))                 # scalar write/skip choice
-m_new = α · p · m                                     # gated thought  [B, 1, mem_dim]
-```
-
-The vector is appended; if the bank exceeds `max_mem` the **oldest slot is
-FIFO-evicted**. The scalar `α` is the model's *modality choice* — write this
-thought or skip it — learned end-to-end through the LM loss. (An earlier
-cross-attention consolidator was removed in favour of this simpler, trainable
-write; the `consolidate_k` field now only sizes the slot positional embedding.)
-
-**Training the write head requires `mem_bptt_window ≥ 2`.** The write is a pure
-*output* of a segment — the segment's own loss never depends on it (the write
-happens after the LM head); its only consumer is the *next* segment's read. With
-a per-segment detach (`window = 1`) the write head gets zero gradient and the
-bank is filled by an untrained projection. `window ≥ 2` keeps the graph across a
-boundary so segment i+1's loss trains segment i's write.
-
-### Persistence across sequences (`train.py`)
-
-By default the bank is reset every sequence, so it only spans the in-sequence
-segments. With `data.persist: true` each batch lane streams one source file in
-order and the bank is **carried across training steps** (reset at file
-boundaries) — the "remember earlier context" use case. This is what makes the
-memory actually useful (see the root README's Findings).
+Fine-grained MoE with always-active **shared experts** (`n_shared`) and top-k **routed
+experts** (affinity `√(softplus(h W_gate))`). An auxiliary sequence-balance loss prevents
+expert collapse.
 
 ---
 
@@ -137,13 +169,12 @@ memory actually useful (see the root README's Findings).
 
 | Class | Description |
 |---|---|
-| `DeepSeekV4Mini` | Single text stream, optional bolt-on thought memory |
-| `DualModalDeepSeekV4Mini` | Full dual-stream: text + thought, both CSA/HCA |
+| `DeepSeekV4Mini` | Single text stream; optional legacy bolt-on cross-attention memory |
+| `DualModalDeepSeekV4Mini` | Text stream + fast-weight thought bank (recommended) |
 
 ### Parameter counts
 
-Dominated by the token embedding (`vocab_size × d_model`), so the total depends
-on the tokenizer. Examples:
+Dominated by the token embedding (`vocab_size × d_model`).
 
 | Config | vocab | Total |
 |---|---|---|
@@ -164,46 +195,38 @@ model = DualModalDeepSeekV4Mini(cfg)
 
 ids = torch.randint(0, cfg.vocab_size, (2, 64))
 
-# First pass — empty bank
+# First pass — a fresh bank is seeded with mem_seed_slots random[0,1] vectors,
+# then the write head appends one thought.
 out = model(ids)
 print(out["logits"].shape)    # [2, 64, vocab_size]
-print(out["mem_bank"].shape)  # [2, 1, mem_dim]
-print(out["write_alpha"])     # mean write probability α (write/skip telemetry)
+print(out["mem_bank"].shape)  # [2, mem_seed_slots + 1, mem_dim]  → [2, 5, 32]
+print(out["write_alpha"])     # mean write probability α (telemetry)
 
-# Subsequent passes — carry the bank across calls
+# Subsequent turns — carry the bank across calls (continual learning).
 out2 = model(ids, init_mem=out["mem_bank"])
 ```
 
 ### Training
 
 ```bash
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/tiny.yaml          # TinyStories
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code.yaml          # code, bank reset/seq
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist.yaml  # code, bank persists
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist_sparse.yaml  # + write-sparsity budget
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/synth_recall.yaml  # addressable-recall test
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/gist.yaml          # latent-context test
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/tiny.yaml           # TinyStories
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist.yaml   # code, bank persists
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule.yaml # continual-rule benchmark (teacher-forced)
 ```
 
-The script streams from HuggingFace datasets (default `roneneldan/TinyStories`),
-or generates synthetic data for `task: associative_recall` / `task: latent_context`.
-It logs to `runs/<run_name>/metrics.jsonl` and saves checkpoints.
+The script streams from HuggingFace datasets or generates synthetic data for the
+`associative_recall` / `latent_context` / `multiturn_gist` / `multiturn_gist_kv` /
+`multiturn_rule` tasks. It logs to `runs/<run_name>/metrics.jsonl` and saves checkpoints.
 
-**Memory probes** run during training (every `mem_probe_every` steps):
-`mem_ablation_gap` (CE without vs with the bank), `mem_diversity` (slot spread),
-`mem_write_rate` (mean α), and — for persistent runs — `persist_gap` and its
-decomposition `content_gap` + `structure_gap`.
+**Probes** run every `mem_probe_every` steps. For `multiturn_rule`, `synthetic_rule_probe`
+reports `rule_acc` (accuracy on **unseen** queries via the carried bank — the verdict; chance
+= `1/n_symbols`) and its no-bank ablation. For streaming runs, `content_gap` is the memory
+metric to trust:
 
-> **`content_gap` is the memory metric to trust.** `persist_gap` (bank carried
-> across chunks vs reset each chunk) conflates the *content* written into slots
-> with the bank *structure* (slot count + slot positional embeddings): a carried
-> bank has ~`max_mem` slots, a reset one rebuilds from empty. Re-running the
-> carried arm with writes **zeroed** (slots still appended, slot count identical)
-> isolates them — `content_gap = CE_zero − CE_real` is the pure content benefit,
-> `structure_gap = CE_reset − CE_zero` the rest. On the code dataset ~2/3 of
-> `persist_gap` turned out to be structural; trust `content_gap`.
-
-Offline PPL with/without the bank: `python -m deepseek_v4_mini.eval_memory`.
+> `persist_gap` (bank carried vs reset each chunk) conflates the *content* written into slots
+> with the bank *structure* (slot count + positional structure). Re-running the carried arm
+> with writes **zeroed** isolates them: `content_gap = CE_zero − CE_real` is the pure content
+> benefit. On the code dataset ~2/3 of `persist_gap` was structural — trust `content_gap`.
 
 ---
 
@@ -212,45 +235,40 @@ Offline PPL with/without the bank: `python -m deepseek_v4_mini.eval_memory`.
 All hyperparameters live in `DeepSeekV4MiniConfig` (`config.py`).
 
 ```python
-# Programmatic config
 cfg = DeepSeekV4MiniConfig(
     d_model=256, n_layers=6, n_heads=4, d_head=64,
     csa_m=4, hca_m=32, top_k_csa=8, n_win=16,
     n_experts=8, top_k_experts=2, d_ff=512,
-    # Thought stream
-    mem_dim=64, max_mem=32, n_mem_layers=2,
+    mem_dim=64, max_mem=32, mem_seed_slots=4, mem_read_rank=16,
 )
-
-# Or from YAML
 cfg = DeepSeekV4MiniConfig.from_yaml("deepseek_v4_mini/configs/small.yaml")
-
-# Built-in presets
-cfg = DeepSeekV4MiniConfig.tiny()   # ~6M params
-cfg = DeepSeekV4MiniConfig.small()  # ~32M params
+cfg = DeepSeekV4MiniConfig.tiny()   # ~6.5M params
 ```
 
-Key parameters:
+Model knobs (`config.py`):
 
 | Parameter | Description |
 |---|---|
-| `n_hc` | mHC residual stream width (2 = paper default) |
-| `sinkhorn_iters` | Iterations for Birkhoff projection (5 = paper, 3 = faster) |
-| `csa_m` | CSA compression factor (overlapping windows) |
-| `hca_m` | HCA compression factor (`>> csa_m`) |
-| `top_k_csa` | Compressed blocks attended per token in CSA |
-| `n_win` | Sliding window size (both CSA and HCA) |
-| `mem_dim` | Thought vector dimension |
-| `max_mem` | Bank capacity; oldest slot is FIFO-evicted past this |
-| `n_mem_layers` | Depth of the thought-stream transformer |
+| `n_hc` / `sinkhorn_iters` | mHC residual width / Birkhoff projection iterations |
+| `csa_m` / `hca_m` / `top_k_csa` / `n_win` | Attention compression + sparsity |
+| `mem_dim` | Thought-vector / fast-weight code size |
+| `max_mem` | Bank capacity; oldest slot FIFO-evicted past this |
+| `mem_seed_slots` | Random-uniform[0,1] slots seeding a fresh bank |
+| `mem_read_rank` | Bottleneck rank `r` of each per-slot fast-weight layer |
+| `mem_read_dropout` | Dropout inside the fast-weight MLP layers |
+| `mem_write_gate` | `false` ⇒ ungated write (pure thought); `true` ⇒ `α·p·m` |
+| `mem_write_cost` / `mem_write_diversity` / `mem_write_target(_weight)` | Write-rate / novelty / target-rate regularisers (gate on) |
+| `mem_teacher_forcing` | Enable the teacher-forced bootstrap (`multiturn_rule`) |
+| `mem_teacher_anneal_start` / `_end` | β=1 until start; β linear→0 by end (teacher gone) |
+| `mem_teacher_distill_weight` | Weight on `MSE(w0, teacher[s])`, scaled by β |
 
-Memory training knobs live in the YAML `training:` / `data:` sections:
+Training/data knobs (YAML `training:` / `data:`):
 
 | Parameter | Description |
 |---|---|
 | `mem_segment_len` | Attention window per segment; smaller ⇒ more reliance on the bank |
 | `mem_bptt_window` | TBPTT span; **≥2 required** to train the write head |
-| `mem_probe_every` | How often to run the ablation / persistence probes |
-| `mem_write_cost` | Sparsity budget on α: adds `cost · E[-log(1-α)]` so writing has a cost (0 ⇒ α saturates at 1). Needs a warmup if used. |
+| `mem_probe_every` | How often to run the probes |
 | `data.persist` | `true` ⇒ per-file ordered lanes + carry the bank across steps |
 
 ---
@@ -263,18 +281,16 @@ deepseek_v4_mini/
   mhc.py         — ManifoldHyperConnections + RMSNorm
   attention.py   — CompressedSparseAttention, HeavilyCompressedAttention, RoPE
   moe.py         — SwiGLU, DeepSeekMoE
-  memory.py      — ThoughtBlock, ThoughtStream (gated write + FIFO)
-  model.py       — DeepSeekV4Mini, DualModalDeepSeekV4Mini
-  train.py       — Training loop, memory/persistence probes, synthetic tasks
-  eval_memory.py — Offline PPL with vs without the bank
+  memory.py      — ThoughtStream: bank seeding + gated write + FIFO (write side only)
+  model.py       — DeepSeekV4Mini, DualModalDeepSeekV4Mini, DualModalBlock (fast-weight read)
+  train.py       — training loop, probes, synthetic tasks, teacher-forced bootstrap
+  eval_memory.py — offline PPL with vs without the bank
   configs/
-    tiny.yaml          — TinyStories, fast iteration
-    small.yaml         — TinyStories, single RTX 3090
-    code.yaml              — code (Python), bank reset per sequence
-    code_persist.yaml      — code (Python), bank persists across sequences
-    code_persist_sparse.yaml — persistent + write-sparsity budget (mem_write_cost)
-    synth_recall.yaml      — synthetic addressable-recall diagnostic
-    gist.yaml              — synthetic latent-context (gist) diagnostic
+    tiny.yaml / small.yaml   — TinyStories
+    code_persist.yaml        — code, bank persists across sequences
+    synth_recall.yaml        — synthetic addressable-recall diagnostic
+    gist.yaml                — synthetic latent-context (gist) diagnostic
+    multiturn_rule.yaml      — continual-rule benchmark (fast-weight transport + teacher-forcing)
 ```
 
 ---
@@ -282,7 +298,7 @@ deepseek_v4_mini/
 ## References
 
 - DeepSeek-V4: [arxiv 2606.19348](https://arxiv.org/abs/2606.19348)
-- Hyper-Connections: Zhu et al., 2025
-- DeepSeekMoE: Dai et al., 2024
-- Muon optimizer: Jordan et al., 2024
+- Fast weights: Schmidhuber 1992; Ba et al. 2016; Schlag et al. 2021; Test-Time Training (Sun et al. 2024)
+- Hyper-Connections: Zhu et al., 2025 · DeepSeekMoE: Dai et al., 2024 · Muon: Jordan et al., 2024
 - Thought memory baseline: [`thought_lm_minimal`](../thought_lm_minimal/)
+```

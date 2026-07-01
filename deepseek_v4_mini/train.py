@@ -591,6 +591,7 @@ def _build_synthetic_rule(cfg_dict: dict):
         def __iter__(self):
             while True:
                 s      = [int(v) for v in torch.randint(1, S, (bs,))]
+                s_t    = torch.tensor(s, dtype=torch.long)   # rule id per lane (teacher-forcing)
                 ex     = []                       # shown example inputs per lane
                 unseen = []                       # query pool (disjoint from ex) per lane
                 for b in range(bs):
@@ -606,7 +607,8 @@ def _build_synthetic_rule(cfg_dict: dict):
                         X[b, 2 * j] = SYM_OFF + xi;  X[b, 2 * j + 1] = SYM_OFF + yi
                         Y[b, 2 * j] = SYM_OFF + yi;  Y[b, 2 * j + 1] = SYM_OFF + xi
                         Msk[b, 2 * j] = (j >= 1)     # j=0 unlearnable (shift unknown yet)
-                yield X, Y, Msk, torch.ones(bs, dtype=torch.bool)
+                # 5th element = rule id per lane (used only by teacher-forcing at turn 0)
+                yield X, Y, Msk, torch.ones(bs, dtype=torch.bool), s_t
                 # answer turns: unseen query -> apply the rule (window holds only x_q)
                 for t in range(turns):
                     xq = torch.zeros((bs, 1), dtype=torch.long)
@@ -615,7 +617,7 @@ def _build_synthetic_rule(cfg_dict: dict):
                         q = unseen[b][t % len(unseen[b])]
                         xq[b, 0] = SYM_OFF + q
                         yq[b, 0] = SYM_OFF + (q + s[b]) % S
-                    yield xq, yq, torch.ones((bs, 1), dtype=torch.bool), torch.zeros(bs, dtype=torch.bool)
+                    yield xq, yq, torch.ones((bs, 1), dtype=torch.bool), torch.zeros(bs, dtype=torch.bool), s_t
 
     return RuleDS()
 
@@ -1551,6 +1553,27 @@ def main() -> None:
             return 0.0
         return write_cost * min(1.0, (s - wc_start) / max(1, wc_ramp))
 
+    # ── Teacher-forced bank bootstrap (multiturn_rule only) ────────────────────
+    # At turn 0 the read consumes β·teacher[s] + (1-β)·w0 and a distill loss pulls
+    # the written slot w0 toward the clean teacher code; β anneals 1→0 so the read
+    # ends up applying the pure written code. Breaks the ignore-bank fixed point.
+    tf_on = (bool(getattr(model_cfg, "mem_teacher_forcing", False))
+             and data_cfg.get("task") == "multiturn_rule" and model_cfg.use_dual_stream)
+    teacher_emb = teacher_opt = None
+    tf_a0 = int(getattr(model_cfg, "mem_teacher_anneal_start", 300))
+    tf_a1 = int(getattr(model_cfg, "mem_teacher_anneal_end", 500))
+    tf_dw = float(getattr(model_cfg, "mem_teacher_distill_weight", 2.0))
+    if tf_on:
+        S_rule      = int(data_cfg.get("n_symbols", 32))
+        teacher_emb = nn.Embedding(S_rule, model_cfg.mem_dim).to(device)
+        teacher_opt = optim.AdamW(teacher_emb.parameters(), lr=adam_lr, weight_decay=wd)
+        tqdm.write(f"Teacher-forcing ON: S={S_rule} anneal[{tf_a0},{tf_a1}] distill_w={tf_dw} "
+                   f"gate={'on' if model_cfg.mem_write_gate else 'off'}")
+    def _beta_at(s: int) -> float:
+        if s <= tf_a0: return 1.0
+        if s >= tf_a1: return 0.0
+        return 1.0 - (s - tf_a0) / max(1, tf_a1 - tf_a0)
+
     model.train()
     step  = 0          # optimiser steps (one per grad_accum micro-batches)
     micro = 0          # micro-batches seen since the last optimiser step
@@ -1565,20 +1588,42 @@ def main() -> None:
             # One TURN-SLOT of B lanes (padded). The bank persists across slots
             # within a conversation, resets per-lane at a conversation boundary, and
             # backward runs over a TBPTT window of mem_bptt_window slots.
-            x, y, lmask, reset = batch
+            if len(batch) == 5:                       # multiturn_rule yields the rule id
+                x, y, lmask, reset, rule_s = batch
+                rule_s = rule_s.to(device)
+            else:
+                x, y, lmask, reset = batch
+                rule_s = None
             x, y, lmask, reset = x.to(device), y.to(device), lmask.to(device), reset.to(device)
             toks += int(lmask.sum())
 
             init_mem = persist_mem
             if init_mem is not None and reset.any():
-                init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
+                if bool(reset.all()):
+                    # Turn-aligned synthetic tasks reset all lanes together at a
+                    # conversation boundary → hand back None so the model reseeds a
+                    # fresh random bank (matches the fast-weight seed_bank design).
+                    init_mem = None
+                else:
+                    init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 out = model(x, init_mem=init_mem, compute_logits=not fused_ce, pad_mask=lmask)
                 loss, logs = compute_loss(
                     out, y, balance_w, ce_chunk, _write_cost_at(step), write_div,
                     write_tgt, write_tgt_w, loss_mask=lmask,
                 )
-            persist_mem = out["mem_bank"]                  # keep graph within the window
+            mem_bank = out["mem_bank"]
+            if tf_on and rule_s is not None and bool(reset.all()):
+                # Turn 0: blend the written slot toward a clean teacher code and
+                # distill the write toward it; both fade as β→0 (teacher removed).
+                beta   = _beta_at(step)
+                w0     = mem_bank[:, -1]
+                t_s    = teacher_emb(rule_s).to(mem_bank.dtype)
+                distill = F.mse_loss(w0.float(), t_s.detach().float())
+                code   = (beta * t_s + (1.0 - beta) * w0).unsqueeze(1)
+                mem_bank = torch.cat([mem_bank[:, :-1], code], dim=1)
+                loss = loss + (beta * tf_dw) * distill
+            persist_mem = mem_bank                         # keep graph within the window
             seg_loss = scaler.scale(loss / grad_accum)
             window_loss = seg_loss if window_loss is None else window_loss + seg_loss
             micro += 1
@@ -1623,8 +1668,12 @@ def main() -> None:
             scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         scaler.step(opt)
+        if teacher_opt is not None:
+            scaler.step(teacher_opt)
         scaler.update()
         opt.zero_grad(set_to_none=True)
+        if teacher_opt is not None:
+            teacher_opt.zero_grad(set_to_none=True)
         sched_step()
 
         step += 1

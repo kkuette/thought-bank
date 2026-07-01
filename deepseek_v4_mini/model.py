@@ -2,15 +2,16 @@
 Two model variants:
 
 DeepSeekV4Mini  (single-stream, legacy)
-  Text stream only. Optional bolt-on thought memory from thought_lm_minimal.
+  Text stream only. Optional bolt-on thought memory (cross-attention read).
 
-DualModalDeepSeekV4Mini  (dual-stream, recommended)
-  Text stream  [B, T, d_model]  processed by CSA/HCA blocks with mHC.
-  Thought stream [B, M, mem_dim] processed by its own CSA/HCA blocks with mHC.
-  The two streams interact at every text block via cross-modal attention
-  (text tokens read from processed thought representations).
-  After all text blocks the ThoughtStream writes a new (gated) vector to the
-  bank, FIFO-evicting the oldest slot once the bank exceeds max_mem.
+DualModalDeepSeekV4Mini  (fast-weight thought bank, recommended)
+  Text stream [B, T, d_model] processed by CSA/HCA blocks with mHC. A rolling
+  thought bank [B, M, mem_dim] is READ as FAST WEIGHTS at every text block: each
+  slot parametrises a low-rank MLP layer and the text stream is passed through the
+  stack of them (slot → linear → activation → dropout → next slot). After the text
+  blocks a gated write head appends one new thought vector to the bank (FIFO). The
+  bank is single-stream: there is no separate thought transformer — the text model
+  writes the vectors and reuses them directly as weights (continual-learning goal).
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ from .moe import DeepSeekMoE
 from .memory import ThoughtStream
 
 
-# ── Thought-memory components (ported from thought_lm_minimal) ───────────────
+# ── Legacy bolt-on thought-memory components (DeepSeekV4Mini only) ────────────
 
 class _MemoryCrossAttention(nn.Module):
     """Read from a thought-vector memory bank via cross-attention."""
@@ -74,28 +75,23 @@ class _ThoughtHead(nn.Module):
         return self.proj(h)                 # [B, mem_dim]
 
 
-# ── Single transformer block ──────────────────────────────────────────────────
+# ── Single transformer block (legacy) ─────────────────────────────────────────
 
 class DeepSeekV4Block(nn.Module):
-    """
-    One transformer block: two mHC-wrapped sub-layers (attention + MoE).
-    Even layer_idx → CSA; odd → HCA.
-    """
+    """One transformer block: two mHC-wrapped sub-layers (attention + MoE).
+    Even layer_idx → CSA; odd → HCA."""
 
     def __init__(self, cfg: DeepSeekV4MiniConfig, layer_idx: int) -> None:
         super().__init__()
-        attn_cls = CompressedSparseAttention if layer_idx % 2 == 0 else HeavilyCompressedAttention
-
-        # Build attention sub-layer
         if layer_idx % 2 == 0:
-            attn = attn_cls(
+            attn: nn.Module = CompressedSparseAttention(
                 d_model=cfg.d_model, n_heads=cfg.n_heads, d_head=cfg.d_head,
                 csa_m=cfg.csa_m, top_k=cfg.top_k_csa, n_win=cfg.n_win,
                 d_latent_q=cfg.d_latent_q, n_groups=cfg.n_groups,
                 dropout=cfg.dropout,
             )
         else:
-            attn = attn_cls(
+            attn = HeavilyCompressedAttention(
                 d_model=cfg.d_model, n_heads=cfg.n_heads, d_head=cfg.d_head,
                 hca_m=cfg.hca_m, n_win=cfg.n_win,
                 d_latent_q=cfg.d_latent_q, n_groups=cfg.n_groups,
@@ -110,23 +106,15 @@ class DeepSeekV4Block(nn.Module):
 
         self.norm_attn = RMSNorm(cfg.d_model)
         self.norm_moe  = RMSNorm(cfg.d_model)
-
-        # Each sub-layer gets its own mHC wrapper
         self.mhc_attn = ManifoldHyperConnections(cfg.d_model, cfg.n_hc, cfg.sinkhorn_iters)
         self.mhc_moe  = ManifoldHyperConnections(cfg.d_model, cfg.n_hc, cfg.sinkhorn_iters)
-
         self._attn = attn
         self._moe  = moe
 
     def forward(self, X: torch.Tensor):
-        """
-        X: [B, T, n_hc, d_model]
-        Returns: (X_new [B, T, n_hc, d_model], balance_loss scalar)
-        """
-        # Attention sub-layer
+        """X: [B, T, n_hc, d_model] → (X_new, balance_loss)"""
         X = self.mhc_attn(X, lambda h: self._attn(self.norm_attn(h)))
 
-        # MoE sub-layer
         bal = torch.zeros((), device=X.device)
 
         def _moe_fn(h: torch.Tensor):
@@ -139,55 +127,34 @@ class DeepSeekV4Block(nn.Module):
         return X, bal
 
 
-# ── Full model ────────────────────────────────────────────────────────────────
+# ── Full model (legacy) ───────────────────────────────────────────────────────
 
 class DeepSeekV4Mini(nn.Module):
-    """
-    Small DeepSeek-V4 reproduction with optional thought memory.
-
-    Forward pass returns a dict:
-      logits          [B, T, vocab_size]
-      balance_loss    scalar  – MoE load balancing auxiliary
-      mem_bank        [B, M, mem_dim] | None  – thought memory carry-out
-      p_gates         [B, T]  – thought write probability (if use_thought_memory)
-    """
+    """Small DeepSeek-V4 reproduction with optional bolt-on thought memory."""
 
     def __init__(self, cfg: DeepSeekV4MiniConfig) -> None:
         super().__init__()
         self.cfg = cfg
 
-        # Token embedding
         self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.drop  = nn.Dropout(cfg.dropout)
 
-        # Transformer blocks
         self.blocks = nn.ModuleList(
             [DeepSeekV4Block(cfg, i) for i in range(cfg.n_layers)]
         )
 
-        # Dynamic output collapse: token-dependent softmax mixture over n_hc streams.
-        # A_out_net maps the per-token mean-stream summary to mixture weights.
         self.A_out_net = nn.Linear(cfg.d_model, cfg.n_hc, bias=False)
         self.norm_out  = RMSNorm(cfg.d_model)
 
-        # LM head (tied to embedding by default for smaller param count)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight   # weight tying
-
-        # Embedding init: nn.Embedding defaults to N(0,1), which (with the tied
-        # head and RMSNorm'd hidden states) makes logits std ~= sqrt(d_model) and
-        # blows up the init CE far above ln(vocab). Scale down to std=0.02 so the
-        # model starts near uniform predictions.
         nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
 
-        # ── Optional thought memory ───────────────────────────────────────────
         if cfg.use_thought_memory:
             self.mem_attn  = _MemoryCrossAttention(cfg.d_model, cfg.mem_dim, cfg.n_heads)
             self.gate      = _WriteGate(cfg.d_model)
             self.thought   = _ThoughtHead(cfg.d_model, cfg.mem_dim)
             self.norm_mem  = RMSNorm(cfg.d_model)
-
-    # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(
         self,
@@ -198,60 +165,47 @@ class DeepSeekV4Mini(nn.Module):
         B, T = input_ids.shape
         cfg  = self.cfg
 
-        # 1. Embed → broadcast across n_hc streams
         h = self.drop(self.embed(input_ids))              # [B, T, d]
-        X = h.unsqueeze(2).expand(-1, -1, cfg.n_hc, -1).contiguous()  # [B, T, n_hc, d]
+        X = h.unsqueeze(2).expand(-1, -1, cfg.n_hc, -1).contiguous()
 
-        # 2. Transformer blocks
         total_balance = torch.zeros((), device=X.device)
         for block in self.blocks:
             X, bal = block(X)
             total_balance = total_balance + bal
         total_balance = total_balance / cfg.n_layers
 
-        # 3. Dynamic collapse n_hc → d
-        X_mean = X.mean(dim=2)                                     # [B, T, d]
-        A = torch.softmax(self.A_out_net(X_mean), dim=-1)          # [B, T, n_hc]
-        H = (A.unsqueeze(-1) * X).sum(dim=2)                       # [B, T, d]
+        X_mean = X.mean(dim=2)
+        A = torch.softmax(self.A_out_net(X_mean), dim=-1)
+        H = (A.unsqueeze(-1) * X).sum(dim=2)
         H = self.norm_out(H)
 
-        # 4. Thought memory augmentation (sequential, causal)
         p_gates  = None
         mem_bank = init_mem
-
         if cfg.use_thought_memory:
-            h_aug_list, p_list, mem_list = [], [], []
+            h_aug_list, p_list = [], []
             for t in range(T):
-                h_t = H[:, t:t+1, :]                     # [B, 1, d]
-                h_aug = self.mem_attn(h_t, mem_bank)      # [B, 1, d]
+                h_t   = H[:, t:t+1, :]
+                h_aug = self.mem_attn(h_t, mem_bank)
                 h_aug_list.append(h_aug)
-                p_t   = self.gate(h_aug.squeeze(1))       # [B, 1]
-                m_t   = self.thought(h_aug.squeeze(1))    # [B, mem_dim]
+                p_t   = self.gate(h_aug.squeeze(1))
+                m_t   = self.thought(h_aug.squeeze(1))
                 p_list.append(p_t)
-                m_write = (p_t * m_t).unsqueeze(1)        # [B, 1, mem_dim]
-                mem_list.append(m_write)
+                m_write = (p_t * m_t).unsqueeze(1)
                 mem_bank = m_write if mem_bank is None else torch.cat([mem_bank, m_write], dim=1)
                 if mem_bank.size(1) > cfg.max_mem:
                     mem_bank = mem_bank[:, -cfg.max_mem:]
-
-            H_final = torch.cat(h_aug_list, dim=1)        # [B, T, d]
-            p_gates = torch.cat(p_list, dim=1).squeeze(-1)  # [B, T]
+            H_final = torch.cat(h_aug_list, dim=1)
+            p_gates = torch.cat(p_list, dim=1).squeeze(-1)
         else:
-            H_final = H                                   # [B, T, d]
+            H_final = H
 
-        out = {
-            "balance_loss": total_balance,
-            "mem_bank":     mem_bank,
-            "p_gates":      p_gates,
-        }
+        out = {"balance_loss": total_balance, "mem_bank": mem_bank, "p_gates": p_gates}
         if compute_logits:
-            out["logits"] = self.lm_head(H_final)         # [B, T, V]
+            out["logits"] = self.lm_head(H_final)
         else:
             out["hidden"]         = H_final
             out["lm_head_weight"] = self.lm_head.weight
         return out
-
-    # ── Convenience ───────────────────────────────────────────────────────────
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -261,22 +215,32 @@ class DeepSeekV4Mini(nn.Module):
         return cls(cfg)
 
 
-# ── Dual-stream text block ────────────────────────────────────────────────────
+# ── Fast-weight text block ────────────────────────────────────────────────────
 
 class DualModalBlock(nn.Module):
     """
-    Text transformer block with cross-modal injection from the thought stream.
+    Text transformer block that reads the thought bank as FAST WEIGHTS.
 
     Forward:
-      1. mHC(CSA or HCA)  – text self-attention
-      2. Cross-modal       – each text token attends to thought representations
-                             (standard cross-attention; M ≤ max_mem so cheap)
-      3. mHC(MoE)          – text FFN
+      1. mHC(CSA or HCA)      – text self-attention
+      2. Fast-weight read     – the token stream is passed through a stack of
+                                low-rank MLP layers, one per bank slot (see
+                                _cross_modal). Placed between attention and MoE so
+                                the applied "weights" can influence FFN routing.
+      3. mHC(MoE)             – text FFN
 
-    The cross-modal is placed BETWEEN the attention and FFN sub-layers so that
-    thought context can influence how the FFN routes tokens.
-    The thought representations H_thought are injected as a gated residual
-    distributed uniformly across the n_hc residual streams.
+    Fast-weight read (memory-as-weights, not memory-as-data)
+    ────────────────────────────────────────────────────────
+    Each bank slot m_i ∈ R^mem_dim is expanded by a (frozen, learned) hypernet into
+    a low-rank layer with weights A_i ∈ R^{r×d}, B_i ∈ R^{d×r}:
+
+        y ← y + dropout( B_i · act( A_i · y ) )          (residual, per slot i)
+
+    applied SEQUENTIALLY over the M slots → an M-layer fast-weight MLP whose weights
+    the model wrote. The activation between slots is what makes the composition
+    non-linear: without it, stacking/summing slots collapses to one low-rank linear
+    map (the failure mode of the earlier outer-product read). The read's net effect
+    is a delta added to the token: h + fw_o(y - y0), so a trivial bank ≈ identity.
     """
 
     def __init__(self, cfg: DeepSeekV4MiniConfig, layer_idx: int) -> None:
@@ -311,82 +275,57 @@ class DualModalBlock(nn.Module):
         self._attn = attn
         self._moe  = moe
 
-        # Cross-modal: text [B,T,d] reads from thought [B,M,mem_dim]
-        self.read_mode  = getattr(cfg, "mem_read", "attn")
-        self.norm_cross = RMSNorm(d)
-        if self.read_mode == "fastweight":
-            # Bank builds a linear map W_fast = Σ vᵢkᵢᵀ [d,r]; the token is passed
-            # THROUGH it (no softmax) — memory as WEIGHTS, not attended data.
-            r = int(getattr(cfg, "mem_read_rank", 16))
-            self.read_rank = r
-            self.fw_k = nn.Linear(cfg.mem_dim, r, bias=False)   # slot keys  -> R^r
-            self.fw_v = nn.Linear(cfg.mem_dim, d, bias=False)   # slot values-> R^d
-            self.fw_q = nn.Linear(d, r, bias=False)             # token query-> R^r
-            self.fw_o = nn.Linear(d, d, bias=False)
-            self.norm_fw = RMSNorm(d)
-        else:
-            # Standard multi-head cross-attention (M is small).
-            assert d % cfg.n_heads == 0
-            self.cross_q  = nn.Linear(d, d, bias=False)
-            self.cross_k  = nn.Linear(cfg.mem_dim, d, bias=False)
-            self.cross_v  = nn.Linear(cfg.mem_dim, d, bias=False)
-            self.cross_o  = nn.Linear(d, d, bias=False)
-            self.n_heads  = cfg.n_heads
-            self.head_dim = d // cfg.n_heads
+        # ── Fast-weight read: slot → low-rank MLP layer (A_i [r,d], B_i [d,r]) ──
+        r = int(cfg.mem_read_rank)
+        self.read_rank = r
+        self.fw_A    = nn.Linear(cfg.mem_dim, r * d, bias=False)  # slot → A_i
+        self.fw_B    = nn.Linear(cfg.mem_dim, d * r, bias=False)  # slot → B_i
+        self.fw_o    = nn.Linear(d, d, bias=False)               # output projection
+        self.norm_fw = RMSNorm(d)
+        self.fw_act  = nn.GELU()
+        self.fw_drop = nn.Dropout(cfg.mem_read_dropout)
 
-        # Dynamic collapse for cross-modal: same principle as A_out_net
+        # Dynamic mHC collapse for the read: same principle as A_out_net.
         self.A_cross_net = nn.Linear(d, n_hc, bias=False)
 
-    def _cross_modal(
-        self, h: torch.Tensor, H_thought: torch.Tensor
-    ) -> torch.Tensor:
+    def _cross_modal(self, h: torch.Tensor, bank: torch.Tensor) -> torch.Tensor:
         """
-        h         : [B, T, d]  – current text representations
-        H_thought : [B, M, mem_dim]
-        Returns   : [B, T, d]  – augmented text (residual added inside)
+        h    : [B, T, d]         – current text representations
+        bank : [B, M, mem_dim]   – thought bank (fast-weight codes)
+        Returns [B, T, d] with the fast-weight read added as a residual.
         """
-        if self.read_mode == "fastweight":
-            # W_fast = Σ_i v_i k_iᵀ  [B,d,r]; y = W_fast · q  (linear, no softmax).
-            # The bank IS a weight matrix the model wrote, applied to each token.
-            K = self.fw_k(H_thought)                                # [B,M,r]
-            V = self.fw_v(H_thought)                                # [B,M,d]
-            W_fast = torch.einsum("bmd,bmr->bdr", V, K)             # [B,d,r]
-            W_fast = W_fast / (H_thought.size(1) ** 0.5)            # scale by #slots
-            q = self.fw_q(h)                                        # [B,T,r]
-            y = torch.einsum("bdr,btr->btd", W_fast, q)            # [B,T,d]
-            return h + self.fw_o(self.norm_fw(y))
+        B, M, _ = bank.shape
+        d = h.size(-1)
+        r = self.read_rank
 
-        B, T, d = h.shape
-        M = H_thought.size(1)
-        nh, hd = self.n_heads, self.head_dim
-        scale  = hd ** -0.5
+        A = self.fw_A(bank).view(B, M, r, d)   # [B, M, r, d]
+        Bm = self.fw_B(bank).view(B, M, d, r)  # [B, M, d, r]
 
-        q = self.cross_q(h).view(B, T, nh, hd).transpose(1, 2)      # [B,nh,T,hd]
-        k = self.cross_k(H_thought).view(B, M, nh, hd).transpose(1, 2)  # [B,nh,M,hd]
-        v = self.cross_v(H_thought).view(B, M, nh, hd).transpose(1, 2)
+        ds = d ** -0.5
+        rs = r ** -0.5
+        y0 = self.norm_fw(h)
+        y  = y0
+        for i in range(M):
+            z   = self.fw_act(torch.einsum("brd,btd->btr", A[:, i], y) * ds)  # [B,T,r]
+            upd = torch.einsum("bdr,btr->btd", Bm[:, i], z) * rs              # [B,T,d]
+            y   = y + self.fw_drop(upd)
+        return h + self.fw_o(y - y0)
 
-        w = F.softmax((q @ k.transpose(-2, -1)) * scale, dim=-1)     # [B,nh,T,M]
-        z = (w @ v).transpose(1, 2).contiguous().view(B, T, d)
-        return h + self.cross_o(z)
-
-    def forward(
-        self, X: torch.Tensor, H_thought: Optional[torch.Tensor]
-    ):
+    def forward(self, X: torch.Tensor, bank: Optional[torch.Tensor]):
         """
-        X         : [B, T, n_hc, d_model]
-        H_thought : [B, M, mem_dim] or None
-        Returns   : (X_new, balance_loss)
+        X    : [B, T, n_hc, d_model]
+        bank : [B, M, mem_dim] or None
+        Returns (X_new, balance_loss)
         """
         # 1. Text self-attention (mHC wrapped)
         X = self.mhc_attn(X, lambda h: self._attn(self.norm_attn(h)))
 
-        # 2. Cross-modal injection (thought → text)
-        if H_thought is not None:
-            B, T, n_hc, d = X.shape
+        # 2. Fast-weight read (thought bank → text)
+        if bank is not None and bank.size(1) > 0:
             h0 = (torch.softmax(self.A_cross_net(X.mean(dim=2)), dim=-1).unsqueeze(-1) * X).sum(dim=2)
-            h1 = self._cross_modal(self.norm_cross(h0), H_thought)    # [B, T, d]
-            delta = h1 - h0                                           # [B, T, d]
-            X = X + delta.unsqueeze(2)                                # broadcast
+            h1 = self._cross_modal(h0, bank)          # _cross_modal normalises internally
+            delta = h1 - h0
+            X = X + delta.unsqueeze(2)
 
         # 3. MoE (mHC wrapped)
         bal = torch.zeros((), device=X.device)
@@ -401,29 +340,24 @@ class DualModalBlock(nn.Module):
         return X, bal
 
 
-# ── Dual-stream model ─────────────────────────────────────────────────────────
+# ── Fast-weight dual-stream model ─────────────────────────────────────────────
 
 class DualModalDeepSeekV4Mini(nn.Module):
     """
-    Dual-stream architecture: text and thought streams both using CSA/HCA.
+    Text stream + fast-weight thought bank (single-stream bank).
 
     Forward flow
     ────────────
-    1. Thought stream processes the current mem_bank → H_thought [B,M,mem_dim]
-       (if bank is empty, H_thought = None and we skip cross-modal).
-    2. Text blocks process input tokens; at each block the cross-modal reads
-       H_thought so every layer is aware of the current thought context.
-    3. After all text blocks, ThoughtStream writes a new (gated) thought vector,
-       FIFO-evicting the oldest slot once the bank exceeds max_mem.
+    1. Seed the bank with random-uniform[0,1] slots on a fresh conversation
+       (init_mem is None); otherwise reuse the carried-in bank.
+    2. Text blocks process the input; at each block the bank is READ as fast
+       weights (DualModalBlock._cross_modal).
+    3. After the text blocks, the write head appends one new gated thought vector
+       to the bank (FIFO-evicting the oldest beyond max_mem).
     4. LM head produces logits from the final text hidden states.
 
-    The bank is returned as mem_bank and should be passed back as init_mem on
-    the next forward call for multi-turn / streaming generation.
-
-    Returns a dict:
-      logits        [B, T, vocab_size]
-      balance_loss  scalar – combined text + thought MoE auxiliary loss
-      mem_bank      [B, M', mem_dim] – updated bank (M' ≤ max_mem)
+    The updated bank is returned as `mem_bank`; pass it back as `init_mem` on the
+    next turn for multi-turn / streaming continual learning.
     """
 
     def __init__(self, cfg: DeepSeekV4MiniConfig) -> None:
@@ -437,24 +371,15 @@ class DualModalDeepSeekV4Mini(nn.Module):
             [DualModalBlock(cfg, i) for i in range(cfg.n_layers)]
         )
 
-        # Dynamic output collapse (same as DeepSeekV4Mini)
         self.A_out_net = nn.Linear(cfg.d_model, cfg.n_hc, bias=False)
         self.norm_out  = RMSNorm(cfg.d_model)
 
-        # LM head (weight-tied to embedding)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
-
-        # Embedding init: nn.Embedding defaults to N(0,1), which (with the tied
-        # head and RMSNorm'd hidden states) makes logits std ~= sqrt(d_model) and
-        # blows up the init CE far above ln(vocab). Scale down to std=0.02 so the
-        # model starts near uniform predictions.
         nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
 
-        # Thought stream
+        # Write head for the fast-weight bank.
         self.thought_stream = ThoughtStream(cfg)
-
-    # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(
         self,
@@ -467,58 +392,45 @@ class DualModalDeepSeekV4Mini(nn.Module):
         cfg   = self.cfg
         n_hc  = cfg.n_hc
 
-        # ── Step 1: process existing thought bank (runs ONCE before text blocks) ─
-        # H_thought_pre is injected into every text layer via cross-modal.
-        # After text blocks we reuse it (via _write) to avoid re-running blocks.
-        H_thought_pre: Optional[torch.Tensor] = None
-        thought_bal = torch.zeros((), device=input_ids.device)
-        if init_mem is not None and init_mem.size(1) > 0:
-            if getattr(cfg, "mem_thought_stream", True):
-                H_thought_pre, thought_bal = self.thought_stream._process_only(init_mem)
-            else:
-                # Single-stream: read the bank RAW (no second-modal processing). The
-                # text model writes vectors and reuses them directly as fast weights.
-                H_thought_pre = init_mem
+        # ── Step 1: embed text ────────────────────────────────────────────────
+        h = self.drop(self.embed(input_ids))                              # [B,T,d]
 
-        # ── Step 2: embed text and run dual-modal text blocks ─────────────────
-        h = self.drop(self.embed(input_ids))                               # [B,T,d]
-        X = h.unsqueeze(2).expand(-1, -1, n_hc, -1).contiguous()          # [B,T,n_hc,d]
+        # ── Step 2: seed a fresh bank, or reuse the carried-in one ────────────
+        if init_mem is None or init_mem.size(1) == 0:
+            bank = self.thought_stream.seed_bank(B, h.device, h.dtype)
+        else:
+            bank = init_mem
 
+        # ── Step 3: text blocks read the bank as fast weights ─────────────────
+        X = h.unsqueeze(2).expand(-1, -1, n_hc, -1).contiguous()         # [B,T,n_hc,d]
         total_bal = torch.zeros((), device=X.device)
         for block in self.blocks:
-            X, bal = block(X, H_thought_pre)
+            X, bal = block(X, bank)
             total_bal = total_bal + bal
-        total_bal = (total_bal / cfg.n_layers) + thought_bal
+        total_bal = total_bal / cfg.n_layers
 
-        # ── Step 3: dynamic collapse mHC → text hidden states ────────────────
-        X_mean = X.mean(dim=2)                                            # [B,T,d]
-        A = torch.softmax(self.A_out_net(X_mean), dim=-1)                 # [B,T,n_hc]
-        H_text = (A.unsqueeze(-1) * X).sum(dim=2)                        # [B,T,d]
+        # ── Step 4: dynamic collapse mHC → text hidden states ─────────────────
+        X_mean = X.mean(dim=2)                                           # [B,T,d]
+        A = torch.softmax(self.A_out_net(X_mean), dim=-1)               # [B,T,n_hc]
+        H_text = (A.unsqueeze(-1) * X).sum(dim=2)                       # [B,T,d]
         H_text = self.norm_out(H_text)
 
-        # ── Step 4: gated thought write + FIFO eviction (no re-run of blocks) ──
-        if init_mem is None or init_mem.size(1) == 0:
-            # First forward: write the very first thought vector
-            _, mem_bank, _ = self.thought_stream(H_text, init_mem, pad_mask)
-        else:
-            # Blocks already ran in _process_only; only append the new thought.
-            mem_bank = self.thought_stream._write(H_text, init_mem, pad_mask)
+        # ── Step 5: gated thought write + FIFO eviction ───────────────────────
+        mem_bank = self.thought_stream._write(H_text, bank, pad_mask)
 
-        # ── Step 5: LM head ───────────────────────────────────────────────────
+        # ── Step 6: outputs ───────────────────────────────────────────────────
         out = {
-            "balance_loss":    total_bal,
-            "mem_bank":        mem_bank,
-            "write_alpha":     self.thought_stream.last_write_alpha,      # mean α (telemetry)
-            "write_penalty":   self.thought_stream.last_write_penalty,    # diff budget E[-log(1-α)]
-            "write_alpha_mean": self.thought_stream.last_write_alpha_mean, # diff E[α] (target-rate)
-            "write_redundancy": self.thought_stream.last_write_redundancy, # diff E[max cos to bank]
+            "balance_loss":     total_bal,
+            "mem_bank":         mem_bank,
+            "write_alpha":      self.thought_stream.last_write_alpha,       # mean α (telemetry)
+            "write_penalty":    self.thought_stream.last_write_penalty,     # diff E[-log(1-α)]
+            "write_alpha_mean": self.thought_stream.last_write_alpha_mean,  # diff E[α]
+            "write_redundancy": self.thought_stream.last_write_redundancy,  # diff E[max cos]
         }
         if compute_logits:
             out["logits"] = self.lm_head(H_text)                           # [B,T,V]
         else:
-            # Defer the head to a memory-efficient fused cross-entropy: hand back
-            # the hidden states and the tied head weight instead of [B,T,V] logits.
-            out["hidden"]        = H_text
+            out["hidden"]         = H_text
             out["lm_head_weight"] = self.lm_head.weight
         return out
 
