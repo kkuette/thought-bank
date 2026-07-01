@@ -1,0 +1,80 @@
+# Multi-context KEYED gist task — capacity + read stress for the thought bank.
+#
+# Generalises multiturn_gist to K keyed contexts, each written on its own turn:
+#   establish i (0..K-1) : [Q_i, CTX_{c_i}]   writes (key Q_i, gist c_i)   (masked)
+#   answer turn          : [Q_i] -> s ~ P_{c_i}   read the slot keyed Q_i
+#
+# The model must hold K contexts across turns (capacity) AND address the right one
+# from the query key (read). In multiturn_gist a single write per conversation
+# saturated content_gap, so nothing rewarded selectivity; here the bank must keep
+# K distinct things, so eff_rank should rise toward K if it stores them and
+# content_gap should hold up as K grows — or degrade, mapping the capacity limit.
+#
+# Sweep K (2 -> 4 -> ...) to find where keyed retrieval breaks. content_gap ceiling
+# per query is still ~ln(S)-H(P_c) (~1.56 nats, C=8 S=64 p=0.9); the question is
+# whether it holds at K>1. K=1 ≈ multiturn_gist.
+#
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_gist_kv.yaml
+
+# ── Model (small) ────────────────────────────────────────────────────────────────
+vocab_size: 96               # >= 2 + n_query_slots(2) + n_contexts(8) + n_symbols(64) = 76
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+
+n_hc: 2
+sinkhorn_iters: 20
+
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+
+use_thought_memory: true
+mem_dim: 32
+max_mem: 16
+
+balance_loss_weight: 1.0e-3
+mem_write_diversity: 0.05     # novelty-gated write: keep the K stored contexts distinct
+
+# ── Training ─────────────────────────────────────────────────────────────────────
+training:
+  device: auto
+  seed: 42
+  lr: 3.0e-4
+  muon_lr: 0.003
+  weight_decay: 0.1
+  steps: 3000
+  warmup_steps: 100
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 2          # >=2 so establish-turn write heads get gradient (invariant)
+  grad_accum: 4
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 1000
+  save_dir: checkpoints/multiturn_gist_kv
+  run_name: dsv4mini_multiturn_gist_kv
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_gist_kv/metrics.jsonl
+
+# ── Data ─────────────────────────────────────────────────────────────────────────
+data:
+  task: multiturn_gist_kv
+  n_query_slots: 2            # K keyed contexts to hold simultaneously (sweep this)
+  n_contexts: 8               # candidate contexts per slot
+  n_symbols: 64               # symbol vocabulary answers are drawn from
+  pref_mass: 0.9              # prob mass P_c puts on its block
+  turns_per_conv: 8           # answer turns after the K establish turns
+  batch_size: 64

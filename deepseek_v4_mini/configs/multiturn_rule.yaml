@@ -1,0 +1,98 @@
+# Continual-learning benchmark: learn a NOVEL rule at turn 0, APPLY it later.
+#
+# Each conversation draws a fresh shift rule y = (x + s) mod S (random per conv, so
+# absent from the frozen weights). Turn 0 shows m example pairs; later turns query
+# UNSEEN symbols that must be answered by APPLYING the inferred rule.
+#
+#   turn 0 : [x0, y0, x1, y1, ...]   in-window ICL (loss on applied x-pos j>=1)
+#   turn t : [x_q] -> (x_q + s) mod S   x_q UNSEEN; window holds only x_q
+#
+# Unseen queries are the discriminator: a lookup memory can't answer them, only a
+# forward that inferred+applies the rule can. The rule must cross the turn boundary
+# through the fast-weight bank. rule_acc (accuracy on unseen queries) is the verdict:
+# ->1 if the bank carries an APPLICABLE rule, ->1/S (chance) if not.
+#
+# Read = fast weights: each bank slot parametrises a low-rank MLP layer (A_i [r,d],
+# B_i [d,r]); the token stream is passed through the stack of them (slot -> linear ->
+# GELU -> dropout -> next slot). The bank is seeded with random-uniform[0,1] slots.
+#
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule.yaml
+
+# ── Model ────────────────────────────────────────────────────────────────────────
+vocab_size: 48               # >= 3 + n_symbols(32) = 35
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+
+n_hc: 2
+sinkhorn_iters: 20
+
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+
+# ── Fast-weight thought bank ──────────────────────────────────────────────────────
+mem_dim: 32                  # thought-vector / fast-weight code size
+max_mem: 16                  # FIFO cap
+mem_seed_slots: 4            # random-uniform[0,1] slots seeding a fresh bank
+mem_read_rank: 16            # bottleneck rank of each per-slot fast-weight layer
+mem_read_dropout: 0.0        # dropout inside the fast-weight MLP layers
+
+balance_loss_weight: 1.0e-3
+mem_write_diversity: 0.0     # off during teacher-forced bootstrap (matches the proof)
+
+# ── Write gate + teacher-forced bootstrap ─────────────────────────────────────
+# The read applies any fixed code (read_isolation_emb) and the write can encode s,
+# but joint training sticks at the "ignore-bank" fixed point. Teacher-forcing the
+# bank (clean emb[s] code correlated with the rule id) + distilling the written slot
+# toward it, then annealing β→0, breaks it: rule transport 0.03→~0.97 in the proof.
+mem_write_gate: false              # ungated write (gate attenuates the code; off = cleaner)
+mem_teacher_forcing: true          # multiturn_rule-only teacher-forced bootstrap
+mem_teacher_anneal_start: 300      # β=1 (full teacher) until step 300
+mem_teacher_anneal_end: 500        # β linear→0 by 500; teacher gone after
+mem_teacher_distill_weight: 2.0    # MSE(w0, teacher[s]) weight, scaled by β
+
+# ── Training (stable recipe: halved LR) ──────────────────────────────────────────
+training:
+  device: auto
+  seed: 42
+  lr: 1.5e-4
+  muon_lr: 0.0015
+  weight_decay: 0.1
+  steps: 1500
+  warmup_steps: 100
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  # Full-conversation TBPTT: 1 establish turn + 8 answer turns = 9 turn-slots.
+  # The window flushes at min(mem_bptt_window, grad_accum), so BOTH must be >= 9
+  # for the turn-0 write (which encodes the rule) to receive gradient from every
+  # answer turn. One optimiser step = one full conversation (batch_size lanes).
+  mem_bptt_window: 9
+  grad_accum: 9
+  mem_probe_every: 50
+  log_every: 50
+  save_every: 100000
+  save_dir: checkpoints/multiturn_rule
+  run_name: dsv4mini_multiturn_rule
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule/metrics.jsonl
+
+# ── Data ─────────────────────────────────────────────────────────────────────────
+data:
+  task: multiturn_rule
+  n_symbols: 32               # alphabet size (chance accuracy = 1/32)
+  n_examples: 6               # example pairs shown at turn 0
+  turns_per_conv: 8           # answer turns (unseen queries); n_examples+turns <= n_symbols
+  batch_size: 64

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import yaml
 
@@ -36,30 +35,23 @@ class DeepSeekV4MiniConfig:
     top_k_experts: int = 2     # routed experts activated per token
     d_ff: int = 512            # FFN hidden dim per expert
 
-    # ── Thought Memory bank ───────────────────────────────────────────────────
-    mem_dim: int = 64          # thought vector dimension
-    max_mem: int = 32          # max bank size before consolidation
-    consolidate_k: int = 4     # how many oldest vectors to compress into 1
+    # ── Fast-weight thought bank ──────────────────────────────────────────────
+    # The bank is a rolling FIFO buffer of M thought vectors (dim = mem_dim). It is
+    # READ as fast WEIGHTS: each slot parametrises a low-rank MLP layer applied in
+    # sequence to the text stream (see DualModalBlock._cross_modal). It is WRITTEN by
+    # a gated head that appends one vector per forward. There is no separate
+    # thought-stream transformer — the text model writes vectors and reuses them.
+    mem_dim: int = 64          # thought-vector dimension (= fast-weight code size)
+    max_mem: int = 32          # max bank size (FIFO-evict the oldest beyond this)
+    mem_seed_slots: int = 4    # random-uniform[0,1] slots seeding a fresh bank
+    mem_read_rank: int = 16    # bottleneck rank of each per-slot fast-weight layer
+    mem_read_dropout: float = 0.0  # dropout inside the fast-weight MLP layers
 
-    # ── Thought stream (dual-modal) ───────────────────────────────────────────
-    # Mirrors the text-stream architecture at smaller scale.
-    # Slot index in the bank doubles as temporal encoding (nn.Embedding).
+    # ── Model selection ───────────────────────────────────────────────────────
+    # True  → DualModalDeepSeekV4Mini (text stream + fast-weight thought bank).
+    # False → DeepSeekV4Mini (legacy text-only, optional bolt-on memory below).
     use_dual_stream: bool = True
-    n_mem_layers: int = 2      # thought-stream transformer depth
-    mem_n_heads: int = 2       # query heads in thought attention
-    mem_d_head: int = 16       # KV head dim in thought attention
-    mem_d_latent_q: int = 16   # low-rank query dim in thought attention
-    mem_csa_m: int = 2         # CSA compression factor for thought stream
-    mem_hca_m: int = 4         # HCA compression factor for thought stream
-    mem_top_k: int = 4         # top-k blocks in thought CSA
-    mem_n_win: int = 4         # sliding window in thought attention
-    mem_n_experts: int = 2     # routed experts in thought MoE
-    mem_n_shared: int = 1      # shared experts in thought MoE
-    mem_top_k_experts: int = 1 # activated routed experts per thought token
-    mem_d_ff: int = 64         # FFN dim in thought MoE
-
-    # ── Legacy single-stream thought memory (DeepSeekV4Mini only) ───────────
-    use_thought_memory: bool = False    # bolt-on sequential memory for the legacy model
+    use_thought_memory: bool = False    # legacy DeepSeekV4Mini bolt-on memory only
 
     # ── Training ──────────────────────────────────────────────────────────────
     balance_loss_weight: float = 1e-4   # MoE balance loss weight (paper §4.2.2: 0.0001)
@@ -70,9 +62,33 @@ class DeepSeekV4MiniConfig:
     # Novelty-gated write: penalise the cosine of each new write to the closest
     # existing bank slot (adds weight · E[max_j cos(m_new, slot_j)] to the loss).
     # Trains the write head to store DIVERSE thoughts instead of near-duplicates —
-    # without it the bank collapses to ~1 effective vector (eff. rank ~1.5/16).
-    # 0.0 = off.
+    # without it the bank collapses to ~1 effective vector. 0.0 = off.
     mem_write_diversity: float = 0.0
+    # Target-rate objective on the write gate: adds weight · (E[α] - target)² to the
+    # loss. Unlike mem_write_cost (monotone, only pushes α→0), this has a stable
+    # minimum at α=target, so it curbs BOTH α→1 (over-write, duplicate pollution)
+    # and α→0 (never write) — the two ways the bank collapses. weight 0.0 = off.
+    mem_write_target: float = 0.0        # target E[α] (e.g. 0.5); 0.0 disables via weight
+    mem_write_target_weight: float = 0.0
+
+    # ── Write gate ────────────────────────────────────────────────────────────
+    # When False the write head is UNGATED: the appended slot is the pure normalised
+    # thought (no scalar α, no per-dim content gate p). The gate otherwise attenuates
+    # the written vector, diminishing the code it carries; ablating it removes a
+    # coordination variable during bootstrap. Keep OFF while bootstrapping the
+    # fast-weight transport, re-enable for streaming write selectivity.
+    mem_write_gate: bool = True
+
+    # ── Teacher-forced bank bootstrap (multiturn_rule) ────────────────────────
+    # Breaks the "ignore-bank" fixed point: during bootstrap the read consumes a
+    # CLEAN teacher code correlated with the latent rule id (a meta-training signal —
+    # the id is latent at inference), while a distill loss pulls the WRITTEN slot
+    # toward that teacher. The read's code is annealed teacher→written (β: 1→0).
+    # Only wired for multiturn_rule (needs the ground-truth rule id per conversation).
+    mem_teacher_forcing: bool = False
+    mem_teacher_anneal_start: int = 300      # β=1 until this optimiser step
+    mem_teacher_anneal_end: int = 500        # β linear→0 by here, then 0 (teacher gone)
+    mem_teacher_distill_weight: float = 2.0  # weight on MSE(w0, teacher[s]); scaled by β
 
     # ── Factory helpers ───────────────────────────────────────────────────────
     @classmethod
@@ -83,12 +99,7 @@ class DeepSeekV4MiniConfig:
             csa_m=4, hca_m=16, top_k_csa=4, n_win=8,
             d_latent_q=32, n_groups=1, n_experts=4,
             top_k_experts=1, d_ff=256, sinkhorn_iters=3,
-            # thought stream
-            mem_dim=32, max_mem=16, consolidate_k=4,
-            n_mem_layers=2, mem_n_heads=1, mem_d_head=16,
-            mem_d_latent_q=16, mem_csa_m=2, mem_hca_m=4,
-            mem_top_k=2, mem_n_win=4, mem_n_experts=2,
-            mem_d_ff=64,
+            mem_dim=32, max_mem=16, mem_seed_slots=4, mem_read_rank=16,
         )
 
     @classmethod
@@ -99,12 +110,7 @@ class DeepSeekV4MiniConfig:
             csa_m=4, hca_m=32, top_k_csa=8, n_win=16,
             d_latent_q=64, n_groups=2, n_experts=8,
             top_k_experts=2, d_ff=512,
-            # thought stream
-            mem_dim=64, max_mem=32, consolidate_k=8,
-            n_mem_layers=2, mem_n_heads=2, mem_d_head=16,
-            mem_d_latent_q=16, mem_csa_m=2, mem_hca_m=8,
-            mem_top_k=4, mem_n_win=4, mem_n_experts=2,
-            mem_d_ff=128,
+            mem_dim=64, max_mem=32, mem_seed_slots=4, mem_read_rank=16,
         )
 
     @classmethod
