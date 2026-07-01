@@ -171,8 +171,13 @@ class ThoughtStream(nn.Module):
         # in train.py; minimising it pushes each write away from its closest stored
         # neighbour, raising the bank's effective rank (≈1.5/16 without pressure).
         self.last_write_redundancy: Optional[torch.Tensor] = None
-
-    # ── Internal helpers ──────────────────────────────────────────────────────
+        # Differentiable batch-mean of α for a TARGET-RATE objective. A monotone
+        # budget (last_write_penalty) can only push α toward 0, so it either fails to
+        # curb α→1 or overshoots to α→0 (both collapse the bank). Pulling E[α] toward
+        # a target with mem_write_target_weight·(E[α]-target)² has a stable minimum at
+        # the target and still allows α to be bimodal per-example (write some, skip
+        # some) — the rate is controlled, not each decision.
+        self.last_write_alpha_mean: Optional[torch.Tensor] = None
 
     def _process(self, mem_bank: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run thought blocks on mem_bank. Returns (H_thought, balance_loss)."""
@@ -314,6 +319,8 @@ class ThoughtStream(nn.Module):
         # Differentiable write budget E[-log(1-α)] = E[softplus(z)] (stable form).
         # train.py adds mem_write_cost * this to the loss as the per-write cost.
         self.last_write_penalty = F.softplus(z).mean()
+        # Differentiable E[α] for the target-rate objective (train.py weights it).
+        self.last_write_alpha_mean = alpha.mean()
         # Novelty: cosine of the new write to the closest existing (stop-grad) slot.
         # train.py adds mem_write_diversity * this so the head learns to write vectors
         # unlike what is already stored (gradient flows through m, not the bank).

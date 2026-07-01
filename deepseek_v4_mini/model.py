@@ -482,6 +482,7 @@ class DualModalDeepSeekV4Mini(nn.Module):
             "mem_bank":        mem_bank,
             "write_alpha":     self.thought_stream.last_write_alpha,      # mean α (telemetry)
             "write_penalty":   self.thought_stream.last_write_penalty,    # diff budget E[-log(1-α)]
+            "write_alpha_mean": self.thought_stream.last_write_alpha_mean, # diff E[α] (target-rate)
             "write_redundancy": self.thought_stream.last_write_redundancy, # diff E[max cos to bank]
         }
         if compute_logits:

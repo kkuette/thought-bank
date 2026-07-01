@@ -73,6 +73,13 @@ class DeepSeekV4MiniConfig:
     # without it the bank collapses to ~1 effective vector (eff. rank ~1.5/16).
     # 0.0 = off.
     mem_write_diversity: float = 0.0
+    # Target-rate objective on the write gate: adds weight · (E[α] - target)² to the
+    # loss. Unlike mem_write_cost (monotone, only pushes α→0), this has a stable
+    # minimum at α=target, so it curbs BOTH α→1 (over-write, duplicate pollution)
+    # and α→0 (never write) — the two ways the bank collapses. Controls the write
+    # RATE while letting α stay bimodal per-example. weight 0.0 = off.
+    mem_write_target: float = 0.0        # target E[α] (e.g. 0.5); 0.0 disables via weight
+    mem_write_target_weight: float = 0.0
 
     # ── Factory helpers ───────────────────────────────────────────────────────
     @classmethod
