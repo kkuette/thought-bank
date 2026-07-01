@@ -312,15 +312,27 @@ class DualModalBlock(nn.Module):
         self._moe  = moe
 
         # Cross-modal: text [B,T,d] reads from thought [B,M,mem_dim]
-        # Standard multi-head cross-attention (M is small)
-        assert d % cfg.n_heads == 0
-        self.cross_q    = nn.Linear(d, d, bias=False)
-        self.cross_k    = nn.Linear(cfg.mem_dim, d, bias=False)
-        self.cross_v    = nn.Linear(cfg.mem_dim, d, bias=False)
-        self.cross_o    = nn.Linear(d, d, bias=False)
+        self.read_mode  = getattr(cfg, "mem_read", "attn")
         self.norm_cross = RMSNorm(d)
-        self.n_heads    = cfg.n_heads
-        self.head_dim   = d // cfg.n_heads
+        if self.read_mode == "fastweight":
+            # Bank builds a linear map W_fast = Σ vᵢkᵢᵀ [d,r]; the token is passed
+            # THROUGH it (no softmax) — memory as WEIGHTS, not attended data.
+            r = int(getattr(cfg, "mem_read_rank", 16))
+            self.read_rank = r
+            self.fw_k = nn.Linear(cfg.mem_dim, r, bias=False)   # slot keys  -> R^r
+            self.fw_v = nn.Linear(cfg.mem_dim, d, bias=False)   # slot values-> R^d
+            self.fw_q = nn.Linear(d, r, bias=False)             # token query-> R^r
+            self.fw_o = nn.Linear(d, d, bias=False)
+            self.norm_fw = RMSNorm(d)
+        else:
+            # Standard multi-head cross-attention (M is small).
+            assert d % cfg.n_heads == 0
+            self.cross_q  = nn.Linear(d, d, bias=False)
+            self.cross_k  = nn.Linear(cfg.mem_dim, d, bias=False)
+            self.cross_v  = nn.Linear(cfg.mem_dim, d, bias=False)
+            self.cross_o  = nn.Linear(d, d, bias=False)
+            self.n_heads  = cfg.n_heads
+            self.head_dim = d // cfg.n_heads
 
         # Dynamic collapse for cross-modal: same principle as A_out_net
         self.A_cross_net = nn.Linear(d, n_hc, bias=False)
@@ -333,6 +345,17 @@ class DualModalBlock(nn.Module):
         H_thought : [B, M, mem_dim]
         Returns   : [B, T, d]  – augmented text (residual added inside)
         """
+        if self.read_mode == "fastweight":
+            # W_fast = Σ_i v_i k_iᵀ  [B,d,r]; y = W_fast · q  (linear, no softmax).
+            # The bank IS a weight matrix the model wrote, applied to each token.
+            K = self.fw_k(H_thought)                                # [B,M,r]
+            V = self.fw_v(H_thought)                                # [B,M,d]
+            W_fast = torch.einsum("bmd,bmr->bdr", V, K)             # [B,d,r]
+            W_fast = W_fast / (H_thought.size(1) ** 0.5)            # scale by #slots
+            q = self.fw_q(h)                                        # [B,T,r]
+            y = torch.einsum("bdr,btr->btd", W_fast, q)            # [B,T,d]
+            return h + self.fw_o(self.norm_fw(y))
+
         B, T, d = h.shape
         M = H_thought.size(1)
         nh, hd = self.n_heads, self.head_dim
@@ -450,7 +473,12 @@ class DualModalDeepSeekV4Mini(nn.Module):
         H_thought_pre: Optional[torch.Tensor] = None
         thought_bal = torch.zeros((), device=input_ids.device)
         if init_mem is not None and init_mem.size(1) > 0:
-            H_thought_pre, thought_bal = self.thought_stream._process_only(init_mem)
+            if getattr(cfg, "mem_thought_stream", True):
+                H_thought_pre, thought_bal = self.thought_stream._process_only(init_mem)
+            else:
+                # Single-stream: read the bank RAW (no second-modal processing). The
+                # text model writes vectors and reuses them directly as fast weights.
+                H_thought_pre = init_mem
 
         # ── Step 2: embed text and run dual-modal text blocks ─────────────────
         h = self.drop(self.embed(input_ids))                               # [B,T,d]

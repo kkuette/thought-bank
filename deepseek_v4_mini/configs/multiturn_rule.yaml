@@ -1,0 +1,83 @@
+# Continual-learning benchmark: learn a NOVEL rule at turn 0, APPLY it later.
+#
+# Each conversation draws a fresh shift rule y = (x + s) mod S (random per conv, so
+# absent from the frozen weights). Turn 0 shows m example pairs; later turns query
+# UNSEEN symbols that must be answered by APPLYING the inferred rule.
+#
+#   turn 0 : [x0, y0, x1, y1, ...]   in-window ICL (loss on applied x-pos j>=1)
+#   turn t : [x_q] -> (x_q + s) mod S   x_q UNSEEN; window holds only x_q
+#
+# Unseen queries are the discriminator: a lookup memory can't answer them, only a
+# forward that inferred+applies the rule can. The rule must cross the turn boundary
+# through the bank. rule_acc (accuracy on unseen queries) is the verdict: ->1 if the
+# bank carries an applicable rule, ->1/S (chance) if not. CE floor 0 with rule, ln(S)
+# without.
+#
+# A/B: mem_read=attn (bank as DATA, additive) vs mem_read=fastweight (bank as WEIGHTS,
+# the token is passed through W_fast = Σ vᵢkᵢᵀ). Override mem_read on the CLI/patch.
+#
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule.yaml
+
+# ── Model ────────────────────────────────────────────────────────────────────────
+vocab_size: 48               # >= 3 + n_symbols(32) = 35
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+
+n_hc: 2
+sinkhorn_iters: 20
+
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+
+use_thought_memory: true
+mem_dim: 32
+max_mem: 16
+
+mem_read: attn               # attn | fastweight  (the A/B knob)
+mem_read_rank: 16            # rank of W_fast (fastweight only)
+
+balance_loss_weight: 1.0e-3
+mem_write_diversity: 0.05
+
+# ── Training (stable recipe: halved LR) ──────────────────────────────────────────
+training:
+  device: auto
+  seed: 42
+  lr: 1.5e-4
+  muon_lr: 0.0015
+  weight_decay: 0.1
+  steps: 1000
+  warmup_steps: 100
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 2
+  grad_accum: 4
+  mem_probe_every: 50
+  log_every: 50
+  save_every: 100000
+  save_dir: checkpoints/multiturn_rule
+  run_name: dsv4mini_multiturn_rule
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule/metrics.jsonl
+
+# ── Data ─────────────────────────────────────────────────────────────────────────
+data:
+  task: multiturn_rule
+  n_symbols: 32               # alphabet size (chance accuracy = 1/32)
+  n_examples: 6               # example pairs shown at turn 0
+  turns_per_conv: 8           # answer turns (unseen queries); n_examples+turns <= n_symbols
+  batch_size: 64

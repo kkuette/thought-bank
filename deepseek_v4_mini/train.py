@@ -559,6 +559,67 @@ def _build_synthetic_multiturn_kv(cfg_dict: dict):
     return KVDS()
 
 
+def _build_synthetic_rule(cfg_dict: dict):
+    """Continual-learning task: a NOVEL rule presented at turn 0, APPLIED later.
+
+    Each conversation draws a fresh modular-shift rule y = (x + s) mod S, s in
+    1..S-1 — random per conversation, so it is NOT in the frozen weights. Turn 0
+    shows m example pairs [x_i, (x_i+s)%S]; later turns query symbols that were NOT
+    shown and must be answered by APPLYING the rule.
+
+        turn 0 : [x_0, y_0, x_1, y_1, ...]  in-window ICL (loss on applied x-pos j>=1)
+        turn t : [x_q] -> (x_q + s) mod S    x_q UNSEEN; window has only x_q
+
+    The unseen queries are the discriminator: a lookup memory (storing the shown
+    pairs) can't answer them; only a forward pass that INFERRED the rule and APPLIES
+    it can. And the rule must cross the turn boundary through the bank (the answer
+    window holds no examples). So this separates "the forward has learned" from "has
+    a note in context" — the fast-weights hypothesis. Deterministic: CE floor 0 with
+    the rule carried, ln(S) without.
+
+    Vocab: 0=PAD, symbols=[SYM_OFF, SYM_OFF+S).  Set vocab_size >= SYM_OFF + n_symbols.
+    """
+    d      = cfg_dict["data"]
+    bs     = int(d["batch_size"])
+    S      = int(d.get("n_symbols", 32))
+    m      = int(d.get("n_examples", 6))         # example pairs shown at turn 0
+    turns  = int(d.get("turns_per_conv", 8))     # answer turns (unseen queries)
+    SYM_OFF = 3
+    assert m + turns <= S, "need m examples + distinct unseen queries within S symbols"
+
+    class RuleDS:
+        def __iter__(self):
+            while True:
+                s      = [int(v) for v in torch.randint(1, S, (bs,))]
+                ex     = []                       # shown example inputs per lane
+                unseen = []                       # query pool (disjoint from ex) per lane
+                for b in range(bs):
+                    perm = torch.randperm(S).tolist()
+                    ex.append(perm[:m]); unseen.append(perm[m:])
+                # turn 0: interleaved example pairs, loss on applied x-positions (j>=1)
+                X = torch.zeros((bs, 2 * m), dtype=torch.long)
+                Y = torch.zeros((bs, 2 * m), dtype=torch.long)
+                Msk = torch.zeros((bs, 2 * m), dtype=torch.bool)
+                for b in range(bs):
+                    for j, xi in enumerate(ex[b]):
+                        yi = (xi + s[b]) % S
+                        X[b, 2 * j] = SYM_OFF + xi;  X[b, 2 * j + 1] = SYM_OFF + yi
+                        Y[b, 2 * j] = SYM_OFF + yi;  Y[b, 2 * j + 1] = SYM_OFF + xi
+                        Msk[b, 2 * j] = (j >= 1)     # j=0 unlearnable (shift unknown yet)
+                yield X, Y, Msk, torch.ones(bs, dtype=torch.bool)
+                # answer turns: unseen query -> apply the rule (window holds only x_q)
+                for t in range(turns):
+                    xq = torch.zeros((bs, 1), dtype=torch.long)
+                    yq = torch.zeros((bs, 1), dtype=torch.long)
+                    for b in range(bs):
+                        q = unseen[b][t % len(unseen[b])]
+                        xq[b, 0] = SYM_OFF + q
+                        yq[b, 0] = SYM_OFF + (q + s[b]) % S
+                    yield xq, yq, torch.ones((bs, 1), dtype=torch.bool), torch.zeros(bs, dtype=torch.bool)
+
+    return RuleDS()
+
+
 def _build_dataloader(cfg_dict: dict, tokenizer, split: str = "train"):
     """Thin wrapper around HF streaming dataset → fixed-length batches."""
     if cfg_dict["data"].get("task") == "associative_recall":
@@ -569,6 +630,8 @@ def _build_dataloader(cfg_dict: dict, tokenizer, split: str = "train"):
         return _build_synthetic_multiturn(cfg_dict)
     if cfg_dict["data"].get("task") == "multiturn_gist_kv":
         return _build_synthetic_multiturn_kv(cfg_dict)
+    if cfg_dict["data"].get("task") == "multiturn_rule":
+        return _build_synthetic_rule(cfg_dict)
     if cfg_dict["data"].get("task") == "multiturn":
         return _build_multiturn_loader(cfg_dict, tokenizer, cfg_dict["data"].get("split", "train_sft"))
     if cfg_dict["data"].get("persist"):
@@ -1266,6 +1329,92 @@ def synthetic_multiturn_kv_probe(
     }
 
 
+def synthetic_rule_probe(
+    model: nn.Module,
+    cfg_dict: dict,
+    *,
+    fused_ce: bool,
+    ce_chunk: int,
+    balance_w: float,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+    n_conv: int = 48,
+) -> dict:
+    """Probe for the continual-learning rule task (see _build_synthetic_rule).
+
+    Per conversation: show m example pairs of a fresh shift rule at turn 0, then
+    query UNSEEN symbols. Averages CE and accuracy over the answer turns under the
+    real/zero/ablate arms. content_gap = ce_zero - ce_real and acc_real are the
+    verdict: if the bank carries an APPLICABLE rule, ce_real→0 and acc_real→1 on
+    unseen queries (which a lookup memory cannot do). Uses logits for accuracy.
+    """
+    d      = cfg_dict["data"]
+    S      = int(d.get("n_symbols", 32))
+    m      = int(d.get("n_examples", 6))
+    turns  = int(d.get("turns_per_conv", 8))
+    SYM_OFF = 3
+
+    was_training = model.training
+    model.eval()
+    ts = getattr(model, "thought_stream", None)
+    orig_new = ts._new_thought if ts is not None else None
+
+    convs = []                                    # same convs across arms
+    for _ in range(n_conv):
+        s    = int(torch.randint(1, S, (1,)))
+        perm = torch.randperm(S).tolist()
+        ex, unseen = perm[:m], perm[m:m + turns]
+        convs.append((s, ex, unseen))
+
+    def run(zero_content: bool, ablate: bool):
+        if ts is not None:
+            ts._new_thought = (
+                (lambda H, b=None, p=None: torch.zeros_like(orig_new(H, b, p))) if zero_content else orig_new
+            )
+        ces, correct, total = [], 0, 0
+        for s, ex, unseen in convs:
+            mem = None
+            x0 = []
+            for xi in ex:
+                x0 += [SYM_OFF + xi, SYM_OFF + (xi + s) % S]
+            x0 = torch.tensor([x0], device=device)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                out = model(x0, init_mem=None, compute_logits=True)
+            if not ablate:
+                mem = out["mem_bank"].detach()
+            for q in unseen:
+                xq = torch.tensor([[SYM_OFF + q]], device=device)
+                yq = torch.tensor([[SYM_OFF + (q + s) % S]], device=device)
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    out = model(xq, init_mem=(None if ablate else mem), compute_logits=True)
+                    _, lg = compute_loss(out, yq, balance_w, ce_chunk)
+                pred = int(out["logits"][0, -1].argmax())
+                correct += int(pred == int(yq[0, 0])); total += 1
+                if not ablate:
+                    mem = out["mem_bank"].detach()
+                ces.append(lg["ce"])
+        if ts is not None:
+            ts._new_thought = orig_new
+        return (sum(ces) / max(1, len(ces)) if ces else 0.0), (correct / max(1, total)), mem
+
+    ce_real, acc_real, mem = run(zero_content=False, ablate=False)
+    ce_zero, acc_zero, _   = run(zero_content=True,  ablate=False)
+    ce_abl,  acc_abl,  _   = run(zero_content=False, ablate=True)
+
+    if was_training:
+        model.train()
+    return {
+        "mem_ablation_gap": ce_abl - ce_real,
+        "content_gap":      ce_zero - ce_real,
+        "rule_acc":         acc_real,             # accuracy on UNSEEN queries (the verdict)
+        "rule_acc_ablate":  acc_abl,
+        "mem_eff_rank":     _effective_rank(mem) if mem is not None else 0.0,
+        "mem_slots_final":  float(mem.size(1)) if mem is not None else 0.0,
+        "mem_turns":        float(1 + turns),
+    }
+
+
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 
 def _save(path: Path, model: nn.Module, opt: "Muon", step: int) -> None:
@@ -1296,7 +1445,8 @@ def main() -> None:
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
     # Synthetic tasks have no text: keep vocab_size from the yaml, no tokenizer.
-    if data_cfg.get("task") in ("associative_recall", "latent_context", "multiturn_gist", "multiturn_gist_kv"):
+    if data_cfg.get("task") in ("associative_recall", "latent_context", "multiturn_gist",
+                                "multiturn_gist_kv", "multiturn_rule"):
         tokenizer = None
         tqdm.write(f"Synthetic task: {data_cfg['task']}  (vocab_size={model_cfg.vocab_size})")
     else:
@@ -1381,8 +1531,8 @@ def main() -> None:
     mem_bptt_window = max(1, int(train_cfg.get("mem_bptt_window", 2)))
     mem_probe_every = int(train_cfg.get("mem_probe_every", 0))  # 0 = off
     mem_persist     = bool(data_cfg.get("persist", False))      # carry bank across steps
-    mem_multiturn   = data_cfg.get("task") in ("multiturn", "multiturn_gist", "multiturn_gist_kv")  # per-turn forward
-    mem_synth_mt    = data_cfg.get("task") in ("multiturn_gist", "multiturn_gist_kv")  # synthetic probe (no tokenizer)
+    mem_multiturn   = data_cfg.get("task") in ("multiturn", "multiturn_gist", "multiturn_gist_kv", "multiturn_rule")  # per-turn forward
+    mem_synth_mt    = data_cfg.get("task") in ("multiturn_gist", "multiturn_gist_kv", "multiturn_rule")  # synthetic probe (no tokenizer)
     persist_chunks  = int(train_cfg.get("persist_probe_chunks", 6))
     log_every   = int(train_cfg.get("log_every", 50))
     save_every  = int(train_cfg.get("save_every", 1000))
@@ -1489,9 +1639,11 @@ def main() -> None:
         # Multi-turn probe: turn-cadenced content_gap + effective rank
         if mem_probe_every and mem_multiturn and step % mem_probe_every == 0:
             if mem_synth_mt:
-                probe_fn = (synthetic_multiturn_kv_probe
-                            if data_cfg.get("task") == "multiturn_gist_kv"
-                            else synthetic_multiturn_probe)
+                _synth_task = data_cfg.get("task")
+                probe_fn = {
+                    "multiturn_gist_kv": synthetic_multiturn_kv_probe,
+                    "multiturn_rule":    synthetic_rule_probe,
+                }.get(_synth_task, synthetic_multiturn_probe)
                 mp = probe_fn(
                     model, raw, fused_ce=fused_ce, ce_chunk=ce_chunk,
                     balance_w=balance_w, device=device, amp_dtype=amp_dtype, use_amp=use_amp,
@@ -1503,11 +1655,13 @@ def main() -> None:
                 )
             logs.update(mp)
             if mp:
+                acc = (f"  rule_acc={mp['rule_acc']:.3f}(abl {mp['rule_acc_ablate']:.3f})"
+                       if "rule_acc" in mp else "")
                 tqdm.write(
                     f"  [mt-probe] ablation_gap={mp['mem_ablation_gap']:+.4f}"
                     f"  content_gap={mp['content_gap']:+.4f}"
                     f"  eff_rank={mp['mem_eff_rank']:.2f}/{mp['mem_slots_final']:.0f}"
-                    f"  turns={mp['mem_turns']:.0f}"
+                    f"  turns={mp['mem_turns']:.0f}{acc}"
                 )
 
         # Memory usefulness probe (ablation: CE with vs without the bank)

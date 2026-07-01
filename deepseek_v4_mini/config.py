@@ -58,6 +58,19 @@ class DeepSeekV4MiniConfig:
     mem_top_k_experts: int = 1 # activated routed experts per thought token
     mem_d_ff: int = 64         # FFN dim in thought MoE
 
+    # ── Cross-modal READ mechanism (how text consumes the bank) ─────────────
+    # "attn"       : softmax cross-attention — reads the bank as DATA (additive note).
+    # "fastweight" : the bank builds a linear map W_fast = Σ vᵢkᵢᵀ and the token is
+    #                passed THROUGH it (no softmax) — reads the bank as WEIGHTS (the
+    #                model applies parameters it wrote). See dsv4mini fast-weights goal.
+    mem_read: str = "attn"
+    mem_read_rank: int = 16    # rank r of W_fast (fastweight mode only)
+    # Whether to run the separate thought-stream transformer over the bank before
+    # reading it (this is the "second modal"). True = dual-stream (bank is processed
+    # then read). False = single-stream: the bank is read RAW, so the text model
+    # writes vectors and reuses them directly — the faithful fast-weights setup.
+    mem_thought_stream: bool = True
+
     # ── Legacy single-stream thought memory (DeepSeekV4Mini only) ───────────
     use_thought_memory: bool = False    # bolt-on sequential memory for the legacy model
 
