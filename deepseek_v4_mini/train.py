@@ -1478,17 +1478,33 @@ def main() -> None:
         f"Muon params: {sum(p.numel() for p in muon_params):,}  "
         f"Adam params: {sum(p.numel() for p in adam_params):,}"
     )
-    opt = Muon(
-        muon_params, lr=muon_lr, momentum=0.95, nesterov=True, ns_steps=10, wd=wd,
-        adam_params=adam_params, adam_lr=adam_lr, adam_betas=(0.9, 0.95), adam_wd=wd,
-    )
+    use_muon = bool(train_cfg.get("use_muon", True))
+    if use_muon:
+        opt = Muon(
+            muon_params, lr=muon_lr, momentum=0.95, nesterov=True, ns_steps=10, wd=wd,
+            adam_params=adam_params, adam_lr=adam_lr, adam_betas=(0.9, 0.95), adam_wd=wd,
+        )
+    else:
+        # All-AdamW mode: the Muon group is kept as a lr=0 no-op so the
+        # scheduler/checkpoint paths stay identical; every param is actually
+        # updated by the bundled AdamW.
+        opt = Muon(
+            muon_params, lr=0.0, momentum=0.0, nesterov=False, ns_steps=1, wd=0.0,
+            adam_params=adam_params + muon_params, adam_lr=adam_lr,
+            adam_betas=(0.9, 0.95), adam_wd=wd,
+        )
+        tqdm.write("use_muon=false: ALL params on AdamW")
 
     total_steps   = int(train_cfg.get("steps", 10_000))
     warmup_steps  = int(train_cfg.get("warmup_steps", 200))
 
+    lr_schedule = str(train_cfg.get("lr_schedule", "cosine"))
+
     def _lr_fn(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
+        if lr_schedule == "constant":
+            return 1.0
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
 
@@ -1566,13 +1582,15 @@ def main() -> None:
     if tf_on:
         S_rule      = int(data_cfg.get("n_symbols", 32))
         teacher_emb = nn.Embedding(S_rule, model_cfg.mem_dim).to(device)
-        teacher_opt = optim.AdamW(teacher_emb.parameters(), lr=adam_lr, weight_decay=wd)
+        teacher_lr  = float(train_cfg.get("teacher_lr", 3e-4))
+        teacher_opt = optim.AdamW(teacher_emb.parameters(), lr=teacher_lr, weight_decay=wd)
         tqdm.write(f"Teacher-forcing ON: S={S_rule} anneal[{tf_a0},{tf_a1}] distill_w={tf_dw} "
                    f"gate={'on' if model_cfg.mem_write_gate else 'off'}")
     def _beta_at(s: int) -> float:
         if s <= tf_a0: return 1.0
         if s >= tf_a1: return 0.0
         return 1.0 - (s - tf_a0) / max(1, tf_a1 - tf_a0)
+    tf_distill_last = 0.0    # telemetry: last turn-0 distill MSE (alignment progress)
 
     model.train()
     step  = 0          # optimiser steps (one per grad_accum micro-batches)
@@ -1606,8 +1624,13 @@ def main() -> None:
                     init_mem = None
                 else:
                     init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
+            # pad_mask gates which positions the WRITE head can pool. For
+            # multiturn_rule, lmask is a LOSS mask (turn 0 supervises only the
+            # applied-x positions) but every token is real — the write must see
+            # the full window (x AND y symbols) to infer the rule.
+            wmask = (x != 0) if data_cfg.get("task") == "multiturn_rule" else lmask
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                out = model(x, init_mem=init_mem, compute_logits=not fused_ce, pad_mask=lmask)
+                out = model(x, init_mem=init_mem, compute_logits=not fused_ce, pad_mask=wmask)
                 loss, logs = compute_loss(
                     out, y, balance_w, ce_chunk, _write_cost_at(step), write_div,
                     write_tgt, write_tgt_w, loss_mask=lmask,
@@ -1622,7 +1645,11 @@ def main() -> None:
                 distill = F.mse_loss(w0.float(), t_s.detach().float())
                 code   = (beta * t_s + (1.0 - beta) * w0).unsqueeze(1)
                 mem_bank = torch.cat([mem_bank[:, :-1], code], dim=1)
-                loss = loss + (beta * tf_dw) * distill
+                # distill is a PER-CONVERSATION loss but rides on the turn-0 micro,
+                # which the window divides by grad_accum — pre-multiply so its
+                # effective weight is the configured tf_dw (matches the proof).
+                loss = loss + (beta * tf_dw * grad_accum) * distill
+                tf_distill_last = float(distill.detach())
             persist_mem = mem_bank                         # keep graph within the window
             seg_loss = scaler.scale(loss / grad_accum)
             window_loss = seg_loss if window_loss is None else window_loss + seg_loss
@@ -1746,6 +1773,9 @@ def main() -> None:
                     )
 
         if step % log_every == 0 or step == 1:
+            if tf_on:
+                logs["tf_distill"] = tf_distill_last
+                logs["tf_beta"]    = _beta_at(step)
             tqdm.write(
                 f"step={step:>6}  ce={logs['ce']:.4f}  ppl={logs['ppl']:.2f}"
                 f"  balance={logs['balance']:.4f}"
@@ -1756,6 +1786,7 @@ def main() -> None:
                 + (f"  redund={logs['write_redund']:.3f}" if "write_redund" in logs else "")
                 + (f"  erank={logs['mem_eff_rank']:.2f}" if "mem_eff_rank" in logs else "")
                 + (f"  gap={logs['mem_ablation_gap']:+.3f}" if "mem_ablation_gap" in logs else "")
+                + (f"  distill={logs['tf_distill']:.3f}(β={logs['tf_beta']:.2f})" if "tf_distill" in logs else "")
                 + f"  lr={opt.param_groups[0]['lr']:.2e}  tok/s={tok_s:.0f}"
             )
             rec = {"step": step, "lr": opt._adam.param_groups[0]["lr"], **logs}
