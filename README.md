@@ -2,12 +2,18 @@
 
 Research repo exploring **persistent thought memory** for language models. The
 active line of work is **`deepseek_v4_mini`**: a small reproduction of the
-DeepSeek-V4 architecture fused with a **dual-stream thought-memory bank** — a text
-stream plus a second stream that maintains a compressed "gist" of what has already
-happened and carries it forward.
+DeepSeek-V4 architecture fused with a **fast-weight thought bank** — a rolling
+memory the model reads as *weights* (a per-slot low-rank MLP applied to the token
+stream) and writes to itself, targeting **continual learning at inference without
+a backward pass**.
 
-The driving question: *is an external memory bank actually useful, and when?*
-This session answered it (see [Findings](#-findings)).
+The driving questions, in the order they were answered:
+1. *Is an external memory bank useful at all, and when?* → only when persistent,
+   and judged by `content_gap` ([historical findings](#-findings-historical-memory-as-data-era)).
+2. *Can a rule cross turn boundaries as a fast weight?* → yes: 0.948 (K=1) / 0.99
+   (K=2 keyed), after a teacher-forced bootstrap breaks the ignore-bank fixed point.
+3. *Does the memory POLICY (retain / forget) have to be engineered?* → **no — it
+   emerges end-to-end** ([current findings](#-findings-fast-weight-memory-current)).
 
 > **Legacy:** the earlier diffusion / 3D-thought-tensor prototype lives under
 > [`diffusion_thought_tensor/`](diffusion_thought_tensor/) and [`docs/old/`](docs/old/).
@@ -18,26 +24,28 @@ This session answered it (see [Findings](#-findings)).
 ## 🧠 Core idea
 
 ```
-        thought stream  [B, M, mem_dim]         (the running "gist" / memory bank)
-                 │  cross-modal at every layer
-                 ▼
-        text stream     [B, T, d_model]         (predicts the next token)
+        thought bank  [B, M, mem_dim]           (fast-weight codes, FIFO)
+                 │  read as WEIGHTS at every block:
+                 │  each slot → hypernet → low-rank MLP layer, applied
+                 ▼  sequentially to the token stream (GELU between slots)
+        text stream   [B, T, d_model]           (predicts the next token)
                  │
                  ▼
-        gated write  α·p·m   →   append to bank   →   FIFO-evict oldest
+        write (once per turn)  m = norm(thought_head(pool(H_text)))
+                 →  append to bank  →  FIFO-evict oldest past max_mem
                  │
-        bank carried to the next segment / sequence
+        bank carried to the next turn / segment
 ```
 
 - **Text stream** does next-token prediction (CSA/HCA attention + MoE, mHC residuals).
-- **Thought stream** is a second small transformer over the memory bank
-  `[B, M, mem_dim]`, slot index = temporal position (slot 0 oldest, slot M-1 newest).
-- **Gated write**: each segment produces a candidate thought `α·p·m` where the
-  scalar `α = sigmoid(write_decision)` is the model's *write/skip* choice and `p`
-  is a per-dimension content gate. The bank is FIFO-capped at `max_mem`.
-- The bank is the **only cross-segment channel**: the text stream's attention is
-  capped to one `mem_segment_len` window, so anything older must travel through
-  the bank.
+- **The bank is read as fast weights, not attended data**: each slot is expanded
+  by a learned hypernet into a low-rank MLP layer; the token stream passes
+  *through* the stack of slot-layers. What the model wrote becomes part of its
+  own forward pass — a rule inferred at turn 0 can be *applied* at turn 20.
+- **Write once per turn** (optionally gated `α·p·m`; gate off in the current
+  recipe). The bank is FIFO-capped at `max_mem`.
+- The bank is the **only cross-turn channel**: each turn is a separate forward,
+  so anything older than the current window must travel through the bank.
 
 Full architecture notes (mHC, CSA, HCA, MoE, thought stream) are in the package
 README: [`deepseek_v4_mini/README.md`](deepseek_v4_mini/README.md).
@@ -65,6 +73,11 @@ python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist.yaml  # c
 # memory diagnostics (synthetic, no tokenizer)
 python -m deepseek_v4_mini.train deepseek_v4_mini/configs/synth_recall.yaml  # addressable recall
 python -m deepseek_v4_mini.train deepseek_v4_mini/configs/gist.yaml          # latent-context gist
+
+# continual-rule benchmark (fast-weight transport; the active line of work)
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule.yaml         # K=1 reference
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_horizon.yaml # rehearsal emergence
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_switch.yaml  # forgetting test
 ```
 > Scripts importing the package need `PYTHONPATH=<repo-root>`.
 
@@ -101,7 +114,30 @@ Offline analysis: [`deepseek_v4_mini/eval_memory.py`](deepseek_v4_mini/eval_memo
 
 ---
 
-## 📊 Findings
+## 📊 Findings — fast-weight memory (current)
+
+Benchmark: `multiturn_rule` — each conversation draws a fresh shift rule
+`y=(x+s)%32`, shows it once, then queries **unseen** symbols on later turns; the
+rule can only cross turn boundaries through the bank. Chance 0.031, ICL ceiling ≈0.49.
+
+| Question | Verdict |
+|---|---|
+| Can a rule be transported as a fast weight? | **0.948** (K=1) — after a teacher-forced bootstrap breaks the "ignore-bank" fixed point (distillation is the active ingredient; the model then invents its own codes) |
+| Can several rules be routed by key? | **0.99** (K=2) — the old K=2 wall was the fixed point, not addressing |
+| Does it generalize to unseen rules? | **No** — 0.97 train / 0.011 held-out; interleaved holdout = 0.000 exact (snapping). The write builds a correct circular code manifold (held codes placed ON-manifold); the **read** only decodes trained points → recognition within a meta-learned family, not open induction |
+| Does FIFO eviction kill long-horizon memory? | **No cliff** — the model learns to re-encode the rule in its query-turn writes (noisy partial copies, redundancy across slots). Rehearsal **emerges** from TBPTT pressure alone; cost: ~0.48 plateau at 24-turn maintenance (vs 0.95 @9 turns) |
+| Does learned rehearsal prevent forgetting (squatting)? | **No** — mid-conversation rule switch: STICK = 0.000 at acc 0.795 (zero answers with the old rule), pre/post 0.80/0.79. Forgetting is *active*: the old code is still in the bank yet never used (recency override) |
+
+**Headline: memory policy — retention AND replacement — is task-adaptive and
+emerges end-to-end.** No write gate, LRU, or allocation mechanism was needed;
+FIFO + learned write content suffice. Mechanistic evidence:
+[`deepseek_v4_mini/analysis/`](deepseek_v4_mini/analysis/README.md). Open fronts:
+rehearsal precision (consolidation), read generalization (code-space
+augmentation), the joint retain-then-drop test (running), Muon retest.
+
+---
+
+## 📊 Findings (historical, memory-as-data era)
 
 **The memory bank only earns its keep when it is allowed to *persist* across
 sequences.** Resetting it every sequence (the default) makes it look useless.
@@ -172,6 +208,7 @@ slot count identical:
 | `configs/code_persist.yaml` | codeparrot (Python) | bank **persists** across steps |
 | `configs/synth_recall.yaml` | synthetic | addressable key→value recall test |
 | `configs/gist.yaml` | synthetic | latent-context (gist) test |
+| `configs/multiturn_rule*.yaml` | synthetic | continual-rule benchmark family (K=1/K=2, held-out, horizon, switch, joint) — see the [package README](deepseek_v4_mini/README.md) |
 
 Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/README.md)):
 
@@ -189,10 +226,12 @@ Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/R
 ## 📁 Repository layout
 
 ```
-deepseek_v4_mini/        ← active project (dual-stream thought memory)
+deepseek_v4_mini/        ← active project (fast-weight thought bank)
   model.py  memory.py  attention.py  moe.py  mhc.py  config.py  train.py
   eval_memory.py         ← offline PPL with/without the bank
-  configs/               ← tiny, small, code, code_persist, synth_recall, gist
+  analysis/              ← mechanistic diagnostics + campaign results
+  configs/               ← tiny, small, code, code_persist, synth_recall, gist,
+                           multiturn_rule family (k2, heldout, horizon, switch, joint)
 thought_lm_minimal/      ← minimal thought-LM baseline
 diffusion_thought_tensor/, docs/old/   ← legacy diffusion prototype (reference only)
 checkpoints/, runs/      ← training outputs

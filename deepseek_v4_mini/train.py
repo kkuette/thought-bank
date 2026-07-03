@@ -582,42 +582,127 @@ def _build_synthetic_rule(cfg_dict: dict):
     d      = cfg_dict["data"]
     bs     = int(d["batch_size"])
     S      = int(d.get("n_symbols", 32))
-    m      = int(d.get("n_examples", 6))         # example pairs shown at turn 0
+    m      = int(d.get("n_examples", 6))         # example pairs shown per presentation turn
     turns  = int(d.get("turns_per_conv", 8))     # answer turns (unseen queries)
+    K      = int(d.get("n_contexts", 1))         # rules per conversation, each behind a key
+    # Held-out pool: either an explicit list (interleaved holdout — tests READ
+    # interpolation on the code manifold) or the tail above train_shift_max
+    # (contiguous block — the extrapolation worst case).
+    held   = sorted(int(v) for v in d.get("heldout_shifts", []))
+    s_max  = int(d.get("train_shift_max", S - 1))
+    train_pool = [v for v in range(1, s_max + 1) if v not in held]
+    # Rule switch: after `switch_at` query turns, RE-present a fresh rule s2 != s1
+    # mid-conversation (bank carried, no reset) and query s2 for the remaining
+    # turns. Tests retention POLICY: the model must drop s1, not just retain.
+    sw     = int(d.get("switch_at", 0))
     SYM_OFF = 3
-    assert m + turns <= S, "need m examples + distinct unseen queries within S symbols"
+    KEY_OFF = SYM_OFF + S                        # key tokens live above the symbols
+    # each phase draws its own perm, so the unseen-query budget is per phase
+    max_phase = max(sw, turns - sw) if sw else turns
+    assert m + max_phase <= S, "need m examples + distinct unseen queries within S symbols"
+    assert train_pool, "empty training shift pool"
+    if K > 1:
+        assert int(cfg_dict.get("vocab_size", 0)) >= KEY_OFF + K, \
+            "vocab_size must cover SYM_OFF + n_symbols + n_contexts key tokens"
+    if sw:
+        assert K == 1, "switch_at requires n_contexts=1 (keyless conversations)"
+        assert 0 < sw < turns, "switch_at must fall inside the conversation"
+        assert len(train_pool) >= 2, "switch needs two distinct shifts"
 
+    # Turn-slot layout (K=1 keeps the exact legacy format, no key token):
+    #   presentation turn k : [key_k?, x_0, y_0, ..., x_{m-1}, y_{m-1}]   rule s_k
+    #   answer turn t       : [key_k?, x_q] with k = t % K               apply s_k
+    # The 5th yielded element is the rule id for teacher-forcing: s_k on
+    # presentation turns, -1 on answer turns (the blend must not fire there).
     class RuleDS:
         def __iter__(self):
+            off = 1 if K > 1 else 0              # key token prefix width
+            pool_t = torch.tensor(train_pool, dtype=torch.long)
+
+            def _present(s_k, ex_k, reset: bool):
+                # presentation segment: [x_0, y_0, ..., x_{m-1}, y_{m-1}] (K=1)
+                L = 2 * m
+                X = torch.zeros((bs, L), dtype=torch.long)
+                Y = torch.zeros((bs, L), dtype=torch.long)
+                Msk = torch.zeros((bs, L), dtype=torch.bool)
+                for b in range(bs):
+                    for j, xi in enumerate(ex_k[b]):
+                        yi = (xi + int(s_k[b])) % S
+                        X[b, 2 * j] = SYM_OFF + xi
+                        X[b, 2 * j + 1] = SYM_OFF + yi
+                        Y[b, 2 * j] = SYM_OFF + yi
+                        Msk[b, 2 * j] = (j >= 1)
+                return X, Y, Msk, torch.full((bs,), reset, dtype=torch.bool), s_k.clone()
+
+            def _query(s_k, unseen_k, t_ph):
+                xq = torch.zeros((bs, 1), dtype=torch.long)
+                yq = torch.zeros((bs, 1), dtype=torch.long)
+                msk = torch.ones((bs, 1), dtype=torch.bool)
+                for b in range(bs):
+                    pool = unseen_k[b]
+                    q = pool[t_ph % len(pool)]
+                    xq[b, 0] = SYM_OFF + q
+                    yq[b, 0] = SYM_OFF + (q + int(s_k[b])) % S
+                return xq, yq, msk, torch.zeros(bs, dtype=torch.bool), torch.full((bs,), -1, dtype=torch.long)
+
+            if sw:
+                while True:
+                    # two distinct rules per lane; s2 re-presented mid-conversation
+                    s1 = pool_t[torch.randint(0, len(pool_t), (bs,))]
+                    s2 = pool_t[torch.randint(0, len(pool_t), (bs,))]
+                    while bool((s2 == s1).any()):
+                        clash = s2 == s1
+                        s2[clash] = pool_t[torch.randint(0, len(pool_t), (int(clash.sum()),))]
+                    exs, uns = [], []
+                    for s_k in (s1, s2):
+                        ex_k, un_k = [], []
+                        for b in range(bs):
+                            perm = torch.randperm(S).tolist()
+                            ex_k.append(perm[:m]); un_k.append(perm[m:])
+                        exs.append(ex_k); uns.append(un_k)
+                    yield _present(s1, exs[0], reset=True)
+                    for t in range(sw):
+                        yield _query(s1, uns[0], t)
+                    yield _present(s2, exs[1], reset=False)   # bank carried: s1 must be DROPPED
+                    for t in range(turns - sw):
+                        yield _query(s2, uns[1], t)
             while True:
-                s      = [int(v) for v in torch.randint(1, S, (bs,))]
-                s_t    = torch.tensor(s, dtype=torch.long)   # rule id per lane (teacher-forcing)
-                ex     = []                       # shown example inputs per lane
-                unseen = []                       # query pool (disjoint from ex) per lane
+                s      = pool_t[torch.randint(0, len(pool_t), (bs, K))]
+                ex     = [[] for _ in range(bs)]  # per lane, per context: shown inputs
+                unseen = [[] for _ in range(bs)]  # per lane, per context: query pool
                 for b in range(bs):
-                    perm = torch.randperm(S).tolist()
-                    ex.append(perm[:m]); unseen.append(perm[m:])
-                # turn 0: interleaved example pairs, loss on applied x-positions (j>=1)
-                X = torch.zeros((bs, 2 * m), dtype=torch.long)
-                Y = torch.zeros((bs, 2 * m), dtype=torch.long)
-                Msk = torch.zeros((bs, 2 * m), dtype=torch.bool)
-                for b in range(bs):
-                    for j, xi in enumerate(ex[b]):
-                        yi = (xi + s[b]) % S
-                        X[b, 2 * j] = SYM_OFF + xi;  X[b, 2 * j + 1] = SYM_OFF + yi
-                        Y[b, 2 * j] = SYM_OFF + yi;  Y[b, 2 * j + 1] = SYM_OFF + xi
-                        Msk[b, 2 * j] = (j >= 1)     # j=0 unlearnable (shift unknown yet)
-                # 5th element = rule id per lane (used only by teacher-forcing at turn 0)
-                yield X, Y, Msk, torch.ones(bs, dtype=torch.bool), s_t
-                # answer turns: unseen query -> apply the rule (window holds only x_q)
-                for t in range(turns):
-                    xq = torch.zeros((bs, 1), dtype=torch.long)
-                    yq = torch.zeros((bs, 1), dtype=torch.long)
+                    for k in range(K):
+                        perm = torch.randperm(S).tolist()
+                        ex[b].append(perm[:m]); unseen[b].append(perm[m:])
+                for k in range(K):
+                    L = off + 2 * m
+                    X = torch.zeros((bs, L), dtype=torch.long)
+                    Y = torch.zeros((bs, L), dtype=torch.long)
+                    Msk = torch.zeros((bs, L), dtype=torch.bool)
+                    if off:
+                        X[:, 0] = KEY_OFF + k
                     for b in range(bs):
-                        q = unseen[b][t % len(unseen[b])]
-                        xq[b, 0] = SYM_OFF + q
-                        yq[b, 0] = SYM_OFF + (q + s[b]) % S
-                    yield xq, yq, torch.ones((bs, 1), dtype=torch.bool), torch.zeros(bs, dtype=torch.bool), s_t
+                        for j, xi in enumerate(ex[b][k]):
+                            yi = (xi + int(s[b, k])) % S
+                            X[b, off + 2 * j] = SYM_OFF + xi
+                            X[b, off + 2 * j + 1] = SYM_OFF + yi
+                            Y[b, off + 2 * j] = SYM_OFF + yi
+                            Msk[b, off + 2 * j] = (j >= 1)   # j=0 unlearnable (shift unknown yet)
+                    yield X, Y, Msk, torch.full((bs,), k == 0, dtype=torch.bool), s[:, k].clone()
+                for t in range(turns):
+                    k = t % K
+                    xq = torch.zeros((bs, off + 1), dtype=torch.long)
+                    yq = torch.zeros((bs, off + 1), dtype=torch.long)
+                    msk = torch.zeros((bs, off + 1), dtype=torch.bool)
+                    if off:
+                        xq[:, 0] = KEY_OFF + k
+                    msk[:, off] = True
+                    for b in range(bs):
+                        pool = unseen[b][k]
+                        q = pool[(t // K) % len(pool)]
+                        xq[b, off] = SYM_OFF + q
+                        yq[b, off] = SYM_OFF + (q + int(s[b, k])) % S
+                    yield xq, yq, msk, torch.zeros(bs, dtype=torch.bool), torch.full((bs,), -1, dtype=torch.long)
 
     return RuleDS()
 
@@ -1355,58 +1440,117 @@ def synthetic_rule_probe(
     S      = int(d.get("n_symbols", 32))
     m      = int(d.get("n_examples", 6))
     turns  = int(d.get("turns_per_conv", 8))
+    K      = int(d.get("n_contexts", 1))
     SYM_OFF = 3
+    KEY_OFF = SYM_OFF + S
 
     was_training = model.training
     model.eval()
     ts = getattr(model, "thought_stream", None)
     orig_new = ts._new_thought if ts is not None else None
 
-    convs = []                                    # same convs across arms
-    for _ in range(n_conv):
-        s    = int(torch.randint(1, S, (1,)))
-        perm = torch.randperm(S).tolist()
-        ex, unseen = perm[:m], perm[m:m + turns]
-        convs.append((s, ex, unseen))
+    held  = sorted(int(v) for v in d.get("heldout_shifts", []))
+    s_max = int(d.get("train_shift_max", S - 1))
+    train_pool = [v for v in range(1, s_max + 1) if v not in held]
+    held_pool  = held if held else list(range(s_max + 1, S))
+    sw    = int(d.get("switch_at", 0))           # rule switch: s2 re-presented at turn sw
+    n_ctx = 2 if sw else K
 
-    def run(zero_content: bool, ablate: bool):
+    def _make_convs(pool):
+        cs = []
+        for _ in range(n_conv):
+            ctxs = []
+            for _k in range(n_ctx):
+                while True:
+                    s = pool[int(torch.randint(0, len(pool), (1,)))]
+                    if not (sw and _k == 1 and s == ctxs[0][0] and len(pool) > 1):
+                        break
+                perm = torch.randperm(S).tolist()
+                ctxs.append((s, perm[:m], perm[m:]))
+            cs.append(ctxs)
+        return cs
+
+    convs = _make_convs(train_pool)               # same convs across arms
+
+    @torch.no_grad()
+    def run(zero_content: bool, ablate: bool, convs=convs):
+        # All conversations share the same per-turn sequence length, so they run as
+        # independent batch lanes (one bank per lane, exactly like training).
         if ts is not None:
             ts._new_thought = (
                 (lambda H, b=None, p=None: torch.zeros_like(orig_new(H, b, p))) if zero_content else orig_new
             )
-        ces, correct, total = [], 0, 0
-        for s, ex, unseen in convs:
-            mem = None
-            x0 = []
-            for xi in ex:
-                x0 += [SYM_OFF + xi, SYM_OFF + (xi + s) % S]
-            x0 = torch.tensor([x0], device=device)
+        key = (lambda k: [KEY_OFF + k]) if K > 1 else (lambda k: [])
+        n = len(convs)
+        ces = []
+        corr_t = [0] * turns
+        tot_t  = [0] * turns
+        stick_c, post_c = 0, 0                  # post-switch answers matching OLD rule s1
+        mem = None
+
+        def present(kk, mem):
+            rows = []
+            for ctxs in convs:
+                s, ex, _ = ctxs[kk]
+                row = key(kk if not sw else 0)
+                for xi in ex:
+                    row += [SYM_OFF + xi, SYM_OFF + (xi + s) % S]
+                rows.append(row)
+            x0 = torch.tensor(rows, device=device)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                out = model(x0, init_mem=None, compute_logits=True)
+                out = model(x0, init_mem=mem, compute_logits=False)
+            return out["mem_bank"].detach()
+
+        if not ablate:
+            for kk in range(1 if sw else K):     # with a switch, s2 is presented mid-conv
+                mem = present(kk, mem)
+        for t in range(turns):
+            if sw and t == sw and not ablate:
+                mem = present(1, mem)            # bank carried, no reset: s1 must be dropped
+            if sw:
+                k, idx = (1, t - sw) if t >= sw else (0, t)
+            else:
+                k, idx = t % K, t // K
+            rows, ys, ys_old = [], [], []
+            for ctxs in convs:
+                s, _, unseen = ctxs[k]
+                q = unseen[idx % len(unseen)]
+                rows.append(key(k if not sw else 0) + [SYM_OFF + q])
+                ys.append(SYM_OFF + (q + s) % S)
+                if sw and t >= sw:
+                    ys_old.append(SYM_OFF + (q + ctxs[0][0]) % S)
+            xq = torch.tensor(rows, device=device)
+            y_true = torch.tensor(ys, device=device)
+            yq = torch.zeros_like(xq); yq[:, -1] = y_true
+            lmq = torch.zeros_like(xq, dtype=torch.bool); lmq[:, -1] = True
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                out = model(xq, init_mem=(None if ablate else mem), compute_logits=True)
+                _, lg = compute_loss(out, yq, balance_w, ce_chunk, loss_mask=lmq)
+            pred = out["logits"][:, -1].argmax(dim=-1)
+            corr_t[t] += int((pred == y_true).sum()); tot_t[t] += n
+            if sw and t >= sw:
+                stick_c += int((pred == torch.tensor(ys_old, device=device)).sum())
+                post_c  += n
             if not ablate:
                 mem = out["mem_bank"].detach()
-            for q in unseen:
-                xq = torch.tensor([[SYM_OFF + q]], device=device)
-                yq = torch.tensor([[SYM_OFF + (q + s) % S]], device=device)
-                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                    out = model(xq, init_mem=(None if ablate else mem), compute_logits=True)
-                    _, lg = compute_loss(out, yq, balance_w, ce_chunk)
-                pred = int(out["logits"][0, -1].argmax())
-                correct += int(pred == int(yq[0, 0])); total += 1
-                if not ablate:
-                    mem = out["mem_bank"].detach()
-                ces.append(lg["ce"])
+            ces.append(lg["ce"])
         if ts is not None:
             ts._new_thought = orig_new
-        return (sum(ces) / max(1, len(ces)) if ces else 0.0), (correct / max(1, total)), mem
+        acc_bt = [c / max(1, nt) for c, nt in zip(corr_t, tot_t)]
+        acc = sum(corr_t) / max(1, sum(tot_t))
+        run.stick = stick_c / max(1, post_c)
+        return (sum(ces) / max(1, len(ces)) if ces else 0.0), acc, mem, acc_bt
 
-    ce_real, acc_real, mem = run(zero_content=False, ablate=False)
-    ce_zero, acc_zero, _   = run(zero_content=True,  ablate=False)
-    ce_abl,  acc_abl,  _   = run(zero_content=False, ablate=True)
+    ce_real, acc_real, mem, acc_bt = run(zero_content=False, ablate=False)
+    stick_real = run.stick if sw else None
+    ce_zero, acc_zero, _, _        = run(zero_content=True,  ablate=False)
+    ce_abl,  acc_abl,  _, _        = run(zero_content=False, ablate=True)
 
-    if was_training:
-        model.train()
-    return {
+    if turns >= 12:
+        # long-horizon runs: per-turn accuracy exposes the FIFO-eviction cliff
+        tqdm.write("  [horizon] acc/turn: " + " ".join(f"{a:.2f}" for a in acc_bt))
+
+    out = {
         "mem_ablation_gap": ce_abl - ce_real,
         "content_gap":      ce_zero - ce_real,
         "rule_acc":         acc_real,             # accuracy on UNSEEN queries (the verdict)
@@ -1415,6 +1559,22 @@ def synthetic_rule_probe(
         "mem_slots_final":  float(mem.size(1)) if mem is not None else 0.0,
         "mem_turns":        float(1 + turns),
     }
+    if turns >= 12:
+        q = max(1, turns // 4)
+        out["rule_acc_late"] = float(sum(acc_bt[-q:]) / q)   # last quarter: post-eviction
+    if sw:
+        out["rule_acc_pre"]  = float(sum(acc_bt[:sw]) / sw)
+        out["rule_acc_post"] = float(sum(acc_bt[sw:]) / max(1, turns - sw))
+        out["rule_stick"]    = float(stick_real)   # post-switch answers still using s1
+    if held_pool:
+        # generalization arm: shifts NEVER seen in training (held-out pool)
+        _, acc_held, _, _ = run(zero_content=False, ablate=False,
+                                convs=_make_convs(held_pool))
+        out["rule_acc_held"] = acc_held
+
+    if was_training:
+        model.train()
+    return out
 
 
 # ── Checkpointing ─────────────────────────────────────────────────────────────
@@ -1467,6 +1627,14 @@ def main() -> None:
         model = DeepSeekV4Mini(model_cfg).to(device)
         tqdm.write("Architecture: DeepSeekV4Mini (no memory bank)")
     tqdm.write(f"Model: {model.num_params():,} parameters")
+
+    # torch.compile: fuses the many tiny kernels (per-slot fast-weight read,
+    # Sinkhorn, short turns) that leave the GPU launch-bound on this model size.
+    # In-place nn.Module.compile() keeps state_dict keys clean (no _orig_mod.).
+    # dynamic=True: turn lengths and bank size vary — avoid a recompile per shape.
+    if bool(train_cfg.get("compile", False)):
+        model.compile(dynamic=True)
+        tqdm.write("torch.compile ON (dynamic=True)")
 
     # ── Optimiser ─────────────────────────────────────────────────────────────
     muon_lr   = float(train_cfg.get("muon_lr", 0.02))
@@ -1553,7 +1721,7 @@ def main() -> None:
     mem_synth_mt    = data_cfg.get("task") in ("multiturn_gist", "multiturn_gist_kv", "multiturn_rule")  # synthetic probe (no tokenizer)
     persist_chunks  = int(train_cfg.get("persist_probe_chunks", 6))
     log_every   = int(train_cfg.get("log_every", 50))
-    save_every  = int(train_cfg.get("save_every", 1000))
+    save_every  = int(train_cfg.get("save_every", 100))
     save_dir    = Path(train_cfg.get("save_dir", f"checkpoints/{run_name}"))
     balance_w   = float(model_cfg.balance_loss_weight)
     write_cost  = float(getattr(model_cfg, "mem_write_cost", 0.0))       # write-sparsity budget
@@ -1636,9 +1804,10 @@ def main() -> None:
                     write_tgt, write_tgt_w, loss_mask=lmask,
                 )
             mem_bank = out["mem_bank"]
-            if tf_on and rule_s is not None and bool(reset.all()):
-                # Turn 0: blend the written slot toward a clean teacher code and
-                # distill the write toward it; both fade as β→0 (teacher removed).
+            if tf_on and rule_s is not None and bool((rule_s >= 0).all()):
+                # Presentation turn (rule id valid; -1 on answer turns): blend the
+                # written slot toward a clean teacher code and distill the write
+                # toward it; both fade as β→0 (teacher removed).
                 beta   = _beta_at(step)
                 w0     = mem_bank[:, -1]
                 t_s    = teacher_emb(rule_s).to(mem_bank.dtype)
@@ -1733,6 +1902,13 @@ def main() -> None:
             if mp:
                 acc = (f"  rule_acc={mp['rule_acc']:.3f}(abl {mp['rule_acc_ablate']:.3f})"
                        if "rule_acc" in mp else "")
+                acc += (f"  rule_HELD={mp['rule_acc_held']:.3f}"
+                        if "rule_acc_held" in mp else "")
+                acc += (f"  rule_LATE={mp['rule_acc_late']:.3f}"
+                        if "rule_acc_late" in mp else "")
+                acc += (f"  pre/post={mp['rule_acc_pre']:.3f}/{mp['rule_acc_post']:.3f}"
+                        f"  STICK={mp['rule_stick']:.3f}"
+                        if "rule_stick" in mp else "")
                 tqdm.write(
                     f"  [mt-probe] ablation_gap={mp['mem_ablation_gap']:+.4f}"
                     f"  content_gap={mp['content_gap']:+.4f}"

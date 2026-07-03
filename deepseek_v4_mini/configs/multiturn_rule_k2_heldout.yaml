@@ -73,7 +73,7 @@ training:
   teacher_lr: 3e-4              # teacher AdamW LR (matches the scratchpad proof)
   muon_lr: 0.00075              # halved: 1.5e-3 eroded the bank-usage solution post-anneal (peak-then-collapse)
   weight_decay: 0.1
-  steps: 1500
+  steps: 2000                   # K=2 is harder: routing must be learned on top of transport
   warmup_steps: 0               # scratchpad has none; warmup desynced the anneal from model maturity
   grad_clip: 1.0
   precision: bf16
@@ -82,13 +82,13 @@ training:
   # The window flushes at min(mem_bptt_window, grad_accum), so BOTH must be >= 9
   # for the turn-0 write (which encodes the rule) to receive gradient from every
   # answer turn. One optimiser step = one full conversation (batch_size lanes).
-  mem_bptt_window: 9
-  grad_accum: 9
-  mem_probe_every: 50
+  mem_bptt_window: 10          # K(2) presentation turns + 8 answer turns
+  grad_accum: 10
+  mem_probe_every: 100
   log_every: 50
-  save_every: 100
+  save_every: 100            # checkpoint trail: geometry at the held BUMP vs collapsed end
   save_dir: checkpoints/multiturn_rule
-  run_name: dsv4mini_multiturn_rule
+  run_name: dsv4mini_multiturn_rule_k2_heldout
   tensorboard: false
   metrics_file: runs/dsv4mini_multiturn_rule/metrics.jsonl
 
@@ -97,5 +97,7 @@ data:
   task: multiturn_rule
   n_symbols: 32               # alphabet size (chance accuracy = 1/32)
   n_examples: 6               # example pairs shown at turn 0
-  turns_per_conv: 8           # answer turns (unseen queries); n_examples+turns <= n_symbols
+  turns_per_conv: 8           # answer turns, cycling over contexts (4 queries per rule)
+  n_contexts: 2               # TWO rules per conversation, each behind a key token
+  train_shift_max: 24         # train on s in 1..24; probe reports rule_HELD on 25..31
   batch_size: 64

@@ -82,20 +82,20 @@ training:
   # The window flushes at min(mem_bptt_window, grad_accum), so BOTH must be >= 9
   # for the turn-0 write (which encodes the rule) to receive gradient from every
   # answer turn. One optimiser step = one full conversation (batch_size lanes).
-  mem_bptt_window: 9
-  grad_accum: 9
-  mem_probe_every: 50
+  mem_bptt_window: 25          # full conversation: 1 presentation + 24 answer turns
+  grad_accum: 25
+  mem_probe_every: 100
   log_every: 50
   save_every: 100
-  save_dir: checkpoints/multiturn_rule
-  run_name: dsv4mini_multiturn_rule
+  save_dir: checkpoints/multiturn_rule_horizon
+  run_name: dsv4mini_multiturn_rule_horizon
   tensorboard: false
-  metrics_file: runs/dsv4mini_multiturn_rule/metrics.jsonl
+  metrics_file: runs/dsv4mini_multiturn_rule_horizon/metrics.jsonl
 
 # ── Data ─────────────────────────────────────────────────────────────────────────
 data:
   task: multiturn_rule
   n_symbols: 32               # alphabet size (chance accuracy = 1/32)
   n_examples: 6               # example pairs shown at turn 0
-  turns_per_conv: 8           # answer turns (unseen queries); n_examples+turns <= n_symbols
+  turns_per_conv: 24          # LONG horizon: rule slot FIFO-evicted at query turn ~16 (4 seeds + rule + 11 writes fill max_mem=16) -> cliff test + rehearsal-emergence pressure
   batch_size: 64
