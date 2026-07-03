@@ -83,6 +83,17 @@ class DeepSeekV4MiniConfig:
     mem_code_mixup_p: float = 0.0
     # EMA momentum for the per-shift code dictionary the mixup draws from.
     mem_code_mixup_momentum: float = 0.99
+    # Step at which midpoint injection starts (the EMA dictionary builds from
+    # step 0 regardless). Early injection feeds immature-EMA midpoints into 30%
+    # of presentations and stalls base learning (v2 stalled at 0.14@600 with
+    # start=0); inject only once the model writes real codes.
+    mem_code_mixup_start: int = 0
+    # STRUCTURAL smoothness for the read: spectral normalization on the fw_A /
+    # fw_B hypernet maps (slot code → low-rank layer weights). Caps the read's
+    # Lipschitz constant wrt the CODE, making razor decision boundaries between
+    # neighbouring codes inexpressible — the lever against snapping that data
+    # pressure (noise, mixup) could not provide.
+    mem_read_spectral_norm: bool = False
     # Target-rate objective on the write gate: adds weight · (E[α] - target)² to the
     # loss. Unlike mem_write_cost (monotone, only pushes α→0), this has a stable
     # minimum at α=target, so it curbs BOTH α→1 (over-write, duplicate pollution)

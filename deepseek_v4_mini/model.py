@@ -280,6 +280,10 @@ class DualModalBlock(nn.Module):
         self.read_rank = r
         self.fw_A    = nn.Linear(cfg.mem_dim, r * d, bias=False)  # slot → A_i
         self.fw_B    = nn.Linear(cfg.mem_dim, d * r, bias=False)  # slot → B_i
+        if bool(getattr(cfg, "mem_read_spectral_norm", False)):
+            from torch.nn.utils.parametrizations import spectral_norm
+            self.fw_A = spectral_norm(self.fw_A)
+            self.fw_B = spectral_norm(self.fw_B)
         self.fw_o    = nn.Linear(d, d, bias=False)               # output projection
         self.norm_fw = RMSNorm(d)
         self.fw_act  = nn.GELU()

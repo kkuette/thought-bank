@@ -1755,20 +1755,36 @@ def main() -> None:
     # Code-space mixup: EMA dictionary of the presentation code the read actually
     # consumes (post teacher-blend), one slot per shift. Midpoints of trained
     # neighbours are injected with the middle rule's labels (see config).
-    mix_p   = float(getattr(model_cfg, "mem_code_mixup_p", 0.0))
-    mix_mom = float(getattr(model_cfg, "mem_code_mixup_momentum", 0.99))
-    mix_ema = mix_cnt = mix_ok_s = None
+    mix_p     = float(getattr(model_cfg, "mem_code_mixup_p", 0.0))
+    mix_mom   = float(getattr(model_cfg, "mem_code_mixup_momentum", 0.99))
+    mix_start = int(getattr(model_cfg, "mem_code_mixup_start", 0))
+    mix_ema = mix_cnt = mix_pairs = None
     if tf_on and mix_p > 0.0:
+        # v2, GENERALIZED SYMMETRIC PAIRS: for each trained mid s, ALL trained
+        # pairs (s-d, s+d), d >= 1 — many geometries per mid, so memorizing the
+        # supervised midpoints is costlier than learning "midpoint = mean rule".
+        # (v1, d=1 only: 8 supervised mids were memorized — train 0.992, held
+        # 0.003.) Held shifts never appear as mid or endpoint: no leakage.
         _held = set(int(v) for v in (data_cfg.get("heldout_shifts") or []))
         _S    = int(data_cfg.get("n_symbols", 32))
-        mix_ok_s = torch.zeros(_S, dtype=torch.bool, device=device)
-        for _s in range(2, _S - 1):          # needs s-1 >= 1 and s+1 <= S-1
-            if not ({_s - 1, _s, _s + 1} & _held):
-                mix_ok_s[_s] = True
+        # Span cap: the code manifold is CIRCULAR, so the chord midpoint of
+        # (s-d, s+d) only points at s for the short arc (d < S/4); beyond that
+        # it points at the antipode. Cap well below S/4 to keep the injected
+        # midpoints on the right side and the renormalization well-conditioned.
+        _D    = min(6, _S // 4 - 1)
+        mix_pairs = torch.zeros(_S, _D, dtype=torch.bool, device=device)  # [s, d-1]
+        for _s in range(1, _S):
+            if _s in _held:
+                continue
+            for _d in range(1, _D + 1):
+                a, b = _s - _d, _s + _d
+                if 1 <= a and b <= _S - 1 and a not in _held and b not in _held:
+                    mix_pairs[_s, _d - 1] = True
         mix_ema = torch.zeros(_S, model_cfg.mem_dim, device=device)
         mix_cnt = torch.zeros(_S, device=device)
-        tqdm.write(f"Code mixup ON: p={mix_p} mom={mix_mom} "
-                   f"eligible_mids={int(mix_ok_s.sum())}/{_S - 2}")
+        _mids = int((mix_pairs.any(dim=1)).sum())
+        tqdm.write(f"Code mixup ON (v2 pairs): p={mix_p} mom={mix_mom} "
+                   f"eligible_mids={_mids} pairs={int(mix_pairs.sum())}")
     if tf_on:
         tqdm.write(f"Teacher-forcing ON: S={S_rule} anneal[{tf_a0},{tf_a1}] distill_w={tf_dw} "
                    f"gate={'on' if model_cfg.mem_write_gate else 'off'}")
@@ -1839,10 +1855,16 @@ def main() -> None:
                     slot = mem_bank[:, -1].detach().float()
                     mix_ema[rule_s] = mix_mom * mix_ema[rule_s] + (1.0 - mix_mom) * slot
                     mix_cnt[rule_s] += 1
-                    sm1 = (rule_s - 1).clamp(0, mix_ema.size(0) - 1)
-                    sp1 = (rule_s + 1).clamp(0, mix_ema.size(0) - 1)
-                    ok = (mix_ok_s[rule_s] & (mix_cnt[sm1] > 0) & (mix_cnt[sp1] > 0)
+                    # sample one valid span d per lane, uniformly over its pairs
+                    cand = mix_pairs[rule_s]                               # [B, D]
+                    r    = torch.rand_like(cand, dtype=torch.float32).masked_fill(~cand, -1.0)
+                    dsp  = r.argmax(dim=1) + 1                             # [B] chosen d
+                    sm1  = (rule_s - dsp).clamp(0, mix_ema.size(0) - 1)
+                    sp1  = (rule_s + dsp).clamp(0, mix_ema.size(0) - 1)
+                    ok = (cand.any(dim=1) & (mix_cnt[sm1] > 0) & (mix_cnt[sp1] > 0)
                           & (torch.rand(rule_s.size(0), device=device) < mix_p))
+                    if step < mix_start:
+                        ok = torch.zeros_like(ok)   # EMA warms up; no injection yet
                     if bool(ok.any()):
                         a, b = mix_ema[sm1], mix_ema[sp1]
                         mid  = 0.5 * (a + b)
