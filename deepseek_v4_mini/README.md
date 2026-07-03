@@ -219,14 +219,46 @@ The script streams from HuggingFace datasets or generates synthetic data for the
 `multiturn_rule` tasks. It logs to `runs/<run_name>/metrics.jsonl` and saves checkpoints.
 
 **Probes** run every `mem_probe_every` steps. For `multiturn_rule`, `synthetic_rule_probe`
-reports `rule_acc` (accuracy on **unseen** queries via the carried bank — the verdict; chance
-= `1/n_symbols`) and its no-bank ablation. For streaming runs, `content_gap` is the memory
-metric to trust:
+(batched across conversations — cheap) reports `rule_acc` (accuracy on **unseen** queries via
+the carried bank — the verdict; chance = `1/n_symbols`) and its no-bank ablation, plus,
+depending on the task knobs:
+
+| Probe metric | When | Meaning |
+|---|---|---|
+| `rule_HELD` | `heldout_shifts` / `train_shift_max` set | accuracy on shifts never trained — the generalization arm |
+| `[horizon] acc/turn` + `rule_LATE` | `turns_per_conv ≥ 12` | per-turn accuracy profile (exposes a FIFO-eviction cliff) and last-quarter mean |
+| `pre/post` + `STICK` | `switch_at` set | accuracy before/after the mid-conversation rule switch, and the fraction of post-switch answers still using the OLD rule (squatting diagnostic) |
+
+For streaming runs, `content_gap` is the memory metric to trust:
 
 > `persist_gap` (bank carried vs reset each chunk) conflates the *content* written into slots
 > with the bank *structure* (slot count + positional structure). Re-running the carried arm
 > with writes **zeroed** isolates them: `content_gap = CE_zero − CE_real` is the pure content
 > benefit. On the code dataset ~2/3 of `persist_gap` was structural — trust `content_gap`.
+
+---
+
+## Experiments & results (`multiturn_rule` campaign)
+
+Recipe for all runs: all-AdamW `lr 3e-4` **constant** (no warmup), teacher-forced bootstrap
+annealed over steps [300,500], write gate off. Chance = 0.031, in-window ICL ceiling ≈ 0.49.
+
+| Experiment | Config | Result |
+|---|---|---|
+| K=1 cross-turn transport | `multiturn_rule.yaml` | **0.948** @1500 — the bootstrap breaks the ignore-bank fixed point |
+| no-distill ablation | (flag) | chance forever — distillation is the active ingredient |
+| K=2 keyed routing | `multiturn_rule_k2.yaml` | **0.99** — two rules held + routed by key; the old K=2 wall was the fixed point, not addressing |
+| held-out shifts (contiguous) | `multiturn_rule_k2_heldout.yaml` | 0.97 train / **0.011 held** — recognition within a closed repertoire, not open rule induction |
+| held-out shifts (interleaved) | `multiturn_rule_k2_interleaved.yaml` | rule_HELD = **0.000** (snapping to trained neighbours); no spontaneous interpolation, irregular coverage hurts everywhere |
+| persistence horizon (24 turns) | `multiturn_rule_horizon.yaml` | **no FIFO cliff** — rehearsal emerges from TBPTT pressure alone; cost: ~0.48 plateau (vs 0.95 @9 turns) |
+| rule switch (12+12) | `multiturn_rule_switch.yaml` | **STICK = 0.000** @acc 0.795 — old rule dropped *actively* (recency override: s1 still in the bank, never used) |
+| joint retain-then-drop (24+16) | `multiturn_rule_joint.yaml` | in progress |
+
+**Headline:** memory *policy* — retention (rehearsal past eviction) AND replacement (dropping
+a superseded rule) — is task-adaptive and **emerges end-to-end**; no gate/LRU/allocation
+mechanism was needed. The write generalizes (circular code manifold, held shifts placed
+correctly ON-manifold); the **read** is the generalization blocker and the rehearsal-precision
+bottleneck. Mechanistic evidence and per-script details: [`analysis/`](analysis/README.md).
 
 ---
 
@@ -267,9 +299,19 @@ Training/data knobs (YAML `training:` / `data:`):
 | Parameter | Description |
 |---|---|
 | `mem_segment_len` | Attention window per segment; smaller ⇒ more reliance on the bank |
-| `mem_bptt_window` | TBPTT span; **≥2 required** to train the write head |
+| `mem_bptt_window` | TBPTT span; **≥2 required** to train the write head — for `multiturn_rule`, set it (and `grad_accum`) to the full conversation length (presentations + turns) so credit reaches every write |
 | `mem_probe_every` | How often to run the probes |
 | `data.persist` | `true` ⇒ per-file ordered lanes + carry the bank across steps |
+
+`multiturn_rule` task knobs (`data:`):
+
+| Parameter | Description |
+|---|---|
+| `n_symbols` / `n_examples` | alphabet size S (chance = 1/S) / example pairs per presentation |
+| `turns_per_conv` | unseen-query turns per conversation; ≥12 enables the per-turn horizon probe (FIFO eviction of the presentation slot happens at query turn 16) |
+| `n_contexts` (K) | rules per conversation, each behind a key token (keyed routing) |
+| `heldout_shifts` / `train_shift_max` | held-out generalization arm: explicit list (interleaved) or contiguous tail above the max |
+| `switch_at` | mid-conversation rule switch (K=1): s2 re-presented at that turn, bank carried, no reset — enables `pre/post` + `STICK` |
 
 ---
 
@@ -285,12 +327,23 @@ deepseek_v4_mini/
   model.py       — DeepSeekV4Mini, DualModalDeepSeekV4Mini, DualModalBlock (fast-weight read)
   train.py       — training loop, probes, synthetic tasks, teacher-forced bootstrap
   eval_memory.py — offline PPL with vs without the bank
+  analysis/      — offline mechanistic diagnostics + campaign results (see its README)
+    code_geometry.py     — write-code manifold structure + held-code placement
+    rehearsal_inspect.py — do query-turn writes re-encode the rule? (horizon)
+    switch_inspect.py    — per-turn write similarity across the rule switch
+    canonical_ident.py   — which rule does a write encode, vs canonical codes
   configs/
     tiny.yaml / small.yaml   — TinyStories
     code_persist.yaml        — code, bank persists across sequences
     synth_recall.yaml        — synthetic addressable-recall diagnostic
     gist.yaml                — synthetic latent-context (gist) diagnostic
-    multiturn_rule.yaml      — continual-rule benchmark (fast-weight transport + teacher-forcing)
+    multiturn_rule.yaml              — continual-rule benchmark (the K=1 reference, 0.948)
+    multiturn_rule_k2.yaml           — K=2 keyed routing (0.99)
+    multiturn_rule_k2_heldout.yaml   — contiguous held-out shifts (generalization arm)
+    multiturn_rule_k2_interleaved.yaml — interleaved held-out (interpolation test)
+    multiturn_rule_horizon.yaml      — 24-turn persistence horizon (rehearsal emergence)
+    multiturn_rule_switch.yaml       — mid-conversation rule switch (forgetting test)
+    multiturn_rule_joint.yaml        — retain-then-drop joint test (24+16)
 ```
 
 ---

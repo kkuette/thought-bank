@@ -82,20 +82,23 @@ training:
   # The window flushes at min(mem_bptt_window, grad_accum), so BOTH must be >= 9
   # for the turn-0 write (which encodes the rule) to receive gradient from every
   # answer turn. One optimiser step = one full conversation (batch_size lanes).
-  mem_bptt_window: 9
-  grad_accum: 9
-  mem_probe_every: 50
+  mem_bptt_window: 26          # 2 presentations + 24 answer turns
+  grad_accum: 26
+  mem_probe_every: 100
   log_every: 50
   save_every: 100
-  save_dir: checkpoints/multiturn_rule
-  run_name: dsv4mini_multiturn_rule
+  save_dir: checkpoints/multiturn_rule_switch
+  run_name: dsv4mini_multiturn_rule_switch
   tensorboard: false
-  metrics_file: runs/dsv4mini_multiturn_rule/metrics.jsonl
+  metrics_file: runs/dsv4mini_multiturn_rule_switch/metrics.jsonl
 
 # ── Data ─────────────────────────────────────────────────────────────────────────
 data:
   task: multiturn_rule
   n_symbols: 32               # alphabet size (chance accuracy = 1/32)
   n_examples: 6               # example pairs shown at turn 0
-  turns_per_conv: 8           # answer turns (unseen queries); n_examples+turns <= n_symbols
+  turns_per_conv: 24          # LONG horizon over two rule phases (12 + 12)
+  switch_at: 12               # rule SWITCH: s2 re-presented mid-conv (bank carried, no
+                              # reset) -> retention POLICY test: unconditional rehearsal
+                              # of s1 becomes a measurable fault (rule_stick)
   batch_size: 64
