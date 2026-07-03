@@ -31,6 +31,7 @@ Chance = 0.031, in-window ICL ceiling ≈ 0.49. Recipe for all runs: all-AdamW
 | persistence horizon (`multiturn_rule_horizon.yaml`, 24 turns, slot evicted @16) | **no FIFO cliff** — rehearsal emerges from TBPTT pressure alone; cost: plateau ~0.48 (vs 0.95 @9 turns), uniform across turns |
 | rule switch (`multiturn_rule_switch.yaml`, 12+12 turns) | **STICK = 0.000** at acc 0.795 — zero post-switch answers with the old rule; pre/post 0.80/0.79; forgetting is active (recency override), not just FIFO cleanup |
 | joint test (`multiturn_rule_joint.yaml`, 24+16 turns) | **0.747/0.746 pre/post, STICK 0.02** @1200 (plateau) — full retain-then-drop: 24-turn maintenance THROUGH eviction, then clean replacement; maintenance beats the horizon model (0.74 vs 0.48) — switch pressure *improves* retention; rehearsal happens in a covert code (see `joint_inspect.py`) |
+| Muon retest (`multiturn_rule_muon.yaml` / `_muon_cos.yaml`) | constant LR: no collapse but unstable band 0.83-0.95; **cosine: 0.99 @1000, stable** — new default recipe (~1.75× faster than the AdamW baseline) |
 
 Bottom line: **memory policy — retention AND replacement — is task-adaptive
 and emerges end-to-end**; no gate/LRU/allocation mechanism was needed, even

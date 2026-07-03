@@ -84,7 +84,7 @@ training:
   # answer turn. One optimiser step = one full conversation (batch_size lanes).
   mem_bptt_window: 9
   grad_accum: 9
-  mem_probe_every: 50
+  mem_probe_every: 100
   log_every: 50
   save_every: 100
   save_dir: checkpoints/multiturn_rule_muon

@@ -135,7 +135,8 @@ FIFO + learned write content suffice, even under joint retain-then-replace
 pressure. Mechanistic evidence:
 [`deepseek_v4_mini/analysis/`](deepseek_v4_mini/analysis/README.md). Open fronts:
 maintenance precision (consolidation), read generalization (code-space
-augmentation), Muon retest.
+augmentation). Optimizer: Muon + cosine is the validated default
+(0.99@1000 on the K=1 reference, ~1.75× faster than the AdamW baseline).
 
 ---
 

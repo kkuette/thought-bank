@@ -240,8 +240,11 @@ For streaming runs, `content_gap` is the memory metric to trust:
 
 ## Experiments & results (`multiturn_rule` campaign)
 
-Recipe for all runs: all-AdamW `lr 3e-4` **constant** (no warmup), teacher-forced bootstrap
-annealed over steps [300,500], write gate off. Chance = 0.031, in-window ICL ceiling ≈ 0.49.
+Recipe for the campaign runs below: all-AdamW `lr 3e-4` **constant** (no warmup),
+teacher-forced bootstrap annealed over steps [300,500], write gate off. Chance = 0.031,
+in-window ICL ceiling ≈ 0.49. **Current default for new runs**: Muon + cosine
+(`multiturn_rule_muon_cos.yaml`) — validated at 0.99@1000 on the K=1 reference,
+~1.75× faster than the AdamW baseline (see the optimizer rows below).
 
 | Experiment | Config | Result |
 |---|---|---|
@@ -253,6 +256,8 @@ annealed over steps [300,500], write gate off. Chance = 0.031, in-window ICL cei
 | persistence horizon (24 turns) | `multiturn_rule_horizon.yaml` | **no FIFO cliff** — rehearsal emerges from TBPTT pressure alone; cost: ~0.48 plateau (vs 0.95 @9 turns) |
 | rule switch (12+12) | `multiturn_rule_switch.yaml` | **STICK = 0.000** @acc 0.795 — old rule dropped *actively* (recency override: s1 still in the bank, never used) |
 | joint retain-then-drop (24+16) | `multiturn_rule_joint.yaml` | **0.747/0.746 pre/post, STICK 0.02** @1200 — maintenance through eviction THEN clean replacement; beats horizon's maintenance (0.74 vs 0.48); rehearsal uses a covert code, off the presentation manifold (`analysis/joint_inspect.py`) |
+| Muon retest, constant LR | `multiturn_rule_muon.yaml` | no collapse (the historical peak-then-collapse was the pad_mask/warmup/distill bugs) and ~2× faster early (0.74@600), but the top end is **unstable**: band 0.83–0.95, touches 0.945 without holding |
+| Muon + cosine decay | `multiturn_rule_muon_cos.yaml` | **0.99 @1000** (probes 850–1000: 0.951/0.984/0.971/0.990) — stable, above the AdamW baseline, ~1.75× faster; **new default recipe** |
 
 **Headline:** memory *policy* — retention (rehearsal past eviction) AND replacement (dropping
 a superseded rule) — is task-adaptive and **emerges end-to-end**; no gate/LRU/allocation
