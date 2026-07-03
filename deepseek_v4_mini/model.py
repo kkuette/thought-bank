@@ -276,6 +276,11 @@ class DualModalBlock(nn.Module):
         self._moe  = moe
 
         # ── Fast-weight read: slot → low-rank MLP layer (A_i [r,d], B_i [d,r]) ──
+        # mem_read_layers restricts which blocks read the bank (empty = all).
+        # Reading at every block composes code-dependent transforms in depth —
+        # code sensitivity escalates even with SN per matrix.
+        _rl = list(getattr(cfg, "mem_read_layers", []) or [])
+        self.read_bank = (not _rl) or (layer_idx in _rl)
         r = int(cfg.mem_read_rank)
         self.read_rank = r
         self.fw_A    = nn.Linear(cfg.mem_dim, r * d, bias=False)  # slot → A_i
@@ -325,7 +330,7 @@ class DualModalBlock(nn.Module):
         X = self.mhc_attn(X, lambda h: self._attn(self.norm_attn(h)))
 
         # 2. Fast-weight read (thought bank → text)
-        if bank is not None and bank.size(1) > 0:
+        if self.read_bank and bank is not None and bank.size(1) > 0:
             h0 = (torch.softmax(self.A_cross_net(X.mean(dim=2)), dim=-1).unsqueeze(-1) * X).sum(dim=2)
             h1 = self._cross_modal(h0, bank)          # _cross_modal normalises internally
             delta = h1 - h0

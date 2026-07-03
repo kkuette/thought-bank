@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -94,6 +94,11 @@ class DeepSeekV4MiniConfig:
     # neighbouring codes inexpressible — the lever against snapping that data
     # pressure (noise, mixup) could not provide.
     mem_read_spectral_norm: bool = False
+    # Which blocks read the bank as fast weights. Empty list = all blocks
+    # (historical behaviour). Reading at every block composes code-dependent
+    # transforms in depth, so code sensitivity escalates polynomially even
+    # with SN per matrix; a single late read makes the slope cap global.
+    mem_read_layers: list = field(default_factory=list)
     # Target-rate objective on the write gate: adds weight · (E[α] - target)² to the
     # loss. Unlike mem_write_cost (monotone, only pushes α→0), this has a stable
     # minimum at α=target, so it curbs BOTH α→1 (over-write, duplicate pollution)
