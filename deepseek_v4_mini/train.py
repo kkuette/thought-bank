@@ -1752,6 +1752,24 @@ def main() -> None:
         teacher_emb = nn.Embedding(S_rule, model_cfg.mem_dim).to(device)
         teacher_lr  = float(train_cfg.get("teacher_lr", 3e-4))
         teacher_opt = optim.AdamW(teacher_emb.parameters(), lr=teacher_lr, weight_decay=wd)
+    # Code-space mixup: EMA dictionary of the presentation code the read actually
+    # consumes (post teacher-blend), one slot per shift. Midpoints of trained
+    # neighbours are injected with the middle rule's labels (see config).
+    mix_p   = float(getattr(model_cfg, "mem_code_mixup_p", 0.0))
+    mix_mom = float(getattr(model_cfg, "mem_code_mixup_momentum", 0.99))
+    mix_ema = mix_cnt = mix_ok_s = None
+    if tf_on and mix_p > 0.0:
+        _held = set(int(v) for v in (data_cfg.get("heldout_shifts") or []))
+        _S    = int(data_cfg.get("n_symbols", 32))
+        mix_ok_s = torch.zeros(_S, dtype=torch.bool, device=device)
+        for _s in range(2, _S - 1):          # needs s-1 >= 1 and s+1 <= S-1
+            if not ({_s - 1, _s, _s + 1} & _held):
+                mix_ok_s[_s] = True
+        mix_ema = torch.zeros(_S, model_cfg.mem_dim, device=device)
+        mix_cnt = torch.zeros(_S, device=device)
+        tqdm.write(f"Code mixup ON: p={mix_p} mom={mix_mom} "
+                   f"eligible_mids={int(mix_ok_s.sum())}/{_S - 2}")
+    if tf_on:
         tqdm.write(f"Teacher-forcing ON: S={S_rule} anneal[{tf_a0},{tf_a1}] distill_w={tf_dw} "
                    f"gate={'on' if model_cfg.mem_write_gate else 'off'}")
     def _beta_at(s: int) -> float:
@@ -1814,6 +1832,25 @@ def main() -> None:
                 distill = F.mse_loss(w0.float(), t_s.detach().float())
                 code   = (beta * t_s + (1.0 - beta) * w0).unsqueeze(1)
                 mem_bank = torch.cat([mem_bank[:, :-1], code], dim=1)
+                if mix_ema is not None:
+                    # Track the code the read consumes at presentation (post-blend),
+                    # then swap in the neighbours' midpoint for a random subset of
+                    # eligible lanes — labels stay those of the middle rule s.
+                    slot = mem_bank[:, -1].detach().float()
+                    mix_ema[rule_s] = mix_mom * mix_ema[rule_s] + (1.0 - mix_mom) * slot
+                    mix_cnt[rule_s] += 1
+                    sm1 = (rule_s - 1).clamp(0, mix_ema.size(0) - 1)
+                    sp1 = (rule_s + 1).clamp(0, mix_ema.size(0) - 1)
+                    ok = (mix_ok_s[rule_s] & (mix_cnt[sm1] > 0) & (mix_cnt[sp1] > 0)
+                          & (torch.rand(rule_s.size(0), device=device) < mix_p))
+                    if bool(ok.any()):
+                        a, b = mix_ema[sm1], mix_ema[sp1]
+                        mid  = 0.5 * (a + b)
+                        tgt  = 0.5 * (a.norm(dim=1) + b.norm(dim=1))
+                        mid  = mid * (tgt / mid.norm(dim=1).clamp_min(1e-6)).unsqueeze(1)
+                        new_slot = torch.where(ok.unsqueeze(1), mid.to(mem_bank.dtype),
+                                               mem_bank[:, -1])
+                        mem_bank = torch.cat([mem_bank[:, :-1], new_slot.unsqueeze(1)], dim=1)
                 # distill is a PER-CONVERSATION loss but rides on the turn-0 micro,
                 # which the window divides by grad_accum — pre-multiply so its
                 # effective weight is the configured tf_dw (matches the proof).

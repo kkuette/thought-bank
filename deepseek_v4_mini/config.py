@@ -64,6 +64,25 @@ class DeepSeekV4MiniConfig:
     # Trains the write head to store DIVERSE thoughts instead of near-duplicates —
     # without it the bank collapses to ~1 effective vector. 0.0 = off.
     mem_write_diversity: float = 0.0
+    # Code-space augmentation: std of Gaussian noise added to each newly written
+    # vector during TRAINING only. Forces the read to decode a neighbourhood of
+    # each stored code rather than the exact trained points — the lever for
+    # held-out-rule generalization (the read snaps to trained codes without it).
+    # Scale is relative to the RMSNorm'd write (per-dim RMS ≈ 1). 0.0 = off.
+    # NEGATIVE RESULT (2026-07-03, σ=0.1, K=2 interleaved): train 0.995 / held
+    # 0.000 exact — noise teaches local robustness but actively REINFORCES
+    # snapping (a midpoint code falls in a neighbour's cloud, where supervision
+    # says "behave like the neighbour"). Kept as a regularizer knob only.
+    mem_write_noise: float = 0.0
+    # Code-space mixup: with probability p per presentation lane, replace the
+    # stored rule code by the MIDPOINT of the EMA codes of the two neighbouring
+    # rules (s-1, s+1) while keeping the labels of s — supervises the read at
+    # points BETWEEN trained codes so interpolation is learned as a law of the
+    # manifold. Only fires when s-1, s+1 (and s) are all trained shifts → no
+    # held-out leakage. Requires mem_teacher_forcing plumbing (rule ids).
+    mem_code_mixup_p: float = 0.0
+    # EMA momentum for the per-shift code dictionary the mixup draws from.
+    mem_code_mixup_momentum: float = 0.99
     # Target-rate objective on the write gate: adds weight · (E[α] - target)² to the
     # loss. Unlike mem_write_cost (monotone, only pushes α→0), this has a stable
     # minimum at α=target, so it curbs BOTH α→1 (over-write, duplicate pollution)

@@ -99,6 +99,8 @@ class ThoughtStream(nn.Module):
     ) -> torch.Tensor:
         """Append a new gated thought vector and FIFO-evict the oldest slot."""
         m_new    = self._new_thought(H_text, mem_bank, pad_mask)   # [B, 1, mem_dim]
+        if self.training and self.cfg.mem_write_noise > 0.0:
+            m_new = m_new + self.cfg.mem_write_noise * torch.randn_like(m_new)
         mem_bank = torch.cat([mem_bank, m_new], dim=1)
         if mem_bank.size(1) > self.cfg.max_mem:
             mem_bank = mem_bank[:, -self.cfg.max_mem:, :]
