@@ -252,7 +252,7 @@ annealed over steps [300,500], write gate off. Chance = 0.031, in-window ICL cei
 | held-out shifts (interleaved) | `multiturn_rule_k2_interleaved.yaml` | rule_HELD = **0.000** (snapping to trained neighbours); no spontaneous interpolation, irregular coverage hurts everywhere |
 | persistence horizon (24 turns) | `multiturn_rule_horizon.yaml` | **no FIFO cliff** — rehearsal emerges from TBPTT pressure alone; cost: ~0.48 plateau (vs 0.95 @9 turns) |
 | rule switch (12+12) | `multiturn_rule_switch.yaml` | **STICK = 0.000** @acc 0.795 — old rule dropped *actively* (recency override: s1 still in the bank, never used) |
-| joint retain-then-drop (24+16) | `multiturn_rule_joint.yaml` | in progress |
+| joint retain-then-drop (24+16) | `multiturn_rule_joint.yaml` | **0.747/0.746 pre/post, STICK 0.02** @1200 — maintenance through eviction THEN clean replacement; beats horizon's maintenance (0.74 vs 0.48); rehearsal uses a covert code, off the presentation manifold (`analysis/joint_inspect.py`) |
 
 **Headline:** memory *policy* — retention (rehearsal past eviction) AND replacement (dropping
 a superseded rule) — is task-adaptive and **emerges end-to-end**; no gate/LRU/allocation

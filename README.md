@@ -127,13 +127,15 @@ rule can only cross turn boundaries through the bank. Chance 0.031, ICL ceiling 
 | Does it generalize to unseen rules? | **No** — 0.97 train / 0.011 held-out; interleaved holdout = 0.000 exact (snapping). The write builds a correct circular code manifold (held codes placed ON-manifold); the **read** only decodes trained points → recognition within a meta-learned family, not open induction |
 | Does FIFO eviction kill long-horizon memory? | **No cliff** — the model learns to re-encode the rule in its query-turn writes (noisy partial copies, redundancy across slots). Rehearsal **emerges** from TBPTT pressure alone; cost: ~0.48 plateau at 24-turn maintenance (vs 0.95 @9 turns) |
 | Does learned rehearsal prevent forgetting (squatting)? | **No** — mid-conversation rule switch: STICK = 0.000 at acc 0.795 (zero answers with the old rule), pre/post 0.80/0.79. Forgetting is *active*: the old code is still in the bank yet never used (recency override) |
+| Can it retain through eviction AND then replace? | **Yes** (joint, 24+16 turns) — 0.747/0.746 pre/post, STICK 0.02, no per-turn cliff. Maintenance *beats* the horizon model (0.74 vs 0.48): retain-then-replace pressure improves the retention code. Rehearsal happens in a **covert code** — no canonical rule identity, anti-correlated with the presentation write — keeping the maintenance traffic off the presentation manifold so a new rule can override cleanly |
 
 **Headline: memory policy — retention AND replacement — is task-adaptive and
 emerges end-to-end.** No write gate, LRU, or allocation mechanism was needed;
-FIFO + learned write content suffice. Mechanistic evidence:
+FIFO + learned write content suffice, even under joint retain-then-replace
+pressure. Mechanistic evidence:
 [`deepseek_v4_mini/analysis/`](deepseek_v4_mini/analysis/README.md). Open fronts:
-rehearsal precision (consolidation), read generalization (code-space
-augmentation), the joint retain-then-drop test (running), Muon retest.
+maintenance precision (consolidation), read generalization (code-space
+augmentation), Muon retest.
 
 ---
 
