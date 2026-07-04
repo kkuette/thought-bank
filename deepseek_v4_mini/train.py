@@ -1685,6 +1685,13 @@ def synthetic_rule_probe(
         _, acc_held, _, _ = run(zero_content=False, ablate=False,
                                 convs=_make_convs(held_pool))
         out["rule_acc_held"] = acc_held
+    blind_pool = sorted(int(v) for v in (d.get("teacher_blind_shifts") or []))
+    if blind_pool:
+        # intra-run control: TRAIN rules the teacher never touched (no blend,
+        # no distill) — installs like the taught ones ⇔ the kick is per-circuit
+        _, acc_blind, _, _ = run(zero_content=False, ablate=False,
+                                 convs=_make_convs(blind_pool))
+        out["rule_acc_blind"] = acc_blind
 
     if was_training:
         model.train()
@@ -1919,6 +1926,21 @@ def main() -> None:
         else:
             teacher_lr  = float(train_cfg.get("teacher_lr", 3e-4))
             teacher_opt = optim.AdamW(teacher_emb.parameters(), lr=teacher_lr, weight_decay=wd)
+    # Teacher-blind control rules: trained normally (CE, curriculum) but NEVER
+    # touched by the blend or the distill — the intra-run arm of the
+    # kill-the-crutch test. If they install like their taught neighbours, the
+    # teacher kick is per-circuit (one bootstrap organizes the read for every
+    # rule); if they stay at chance, the kick is per-rule.
+    tf_blind_lut = None
+    if tf_on:
+        _blind = sorted(int(v) for v in (data_cfg.get("teacher_blind_shifts") or []))
+        if _blind:
+            _held_b = set(int(v) for v in (data_cfg.get("heldout_shifts") or []))
+            assert not (_held_b & set(_blind)), "teacher_blind_shifts must be TRAIN rules"
+            tf_blind_lut = torch.zeros(S_rule, dtype=torch.bool, device=device)
+            tf_blind_lut[torch.tensor(_blind, device=device)] = True
+            tqdm.write(f"Teacher-blind rules: {len(_blind)} train rules excluded from "
+                       f"blend+distill (intra-run per-circuit control)")
     # Code-space mixup: EMA dictionary of the presentation code the read actually
     # consumes (post teacher-blend), one slot per shift. Midpoints of trained
     # neighbours are injected with the middle rule's labels (see config).
@@ -2043,13 +2065,22 @@ def main() -> None:
                 beta   = _beta_at(step)
                 w0     = mem_bank[:, -1]
                 t_s    = teacher_emb(rule_s).to(mem_bank.dtype)
+                taught = None if tf_blind_lut is None else ~tf_blind_lut[rule_s]
                 if bool(getattr(model_cfg, "mem_teacher_distill_cosine", False)):
                     # direction-only distill: shrinking ‖w0‖ pays nothing
-                    distill = (1.0 - F.cosine_similarity(
-                        w0.float(), t_s.detach().float(), dim=1)).mean()
+                    per = 1.0 - F.cosine_similarity(
+                        w0.float(), t_s.detach().float(), dim=1)
                 else:
-                    distill = F.mse_loss(w0.float(), t_s.detach().float())
-                code   = (beta * t_s + (1.0 - beta) * w0).unsqueeze(1)
+                    per = ((w0.float() - t_s.detach().float()) ** 2).mean(dim=1)
+                if taught is None:
+                    distill = per.mean()
+                else:
+                    # blind lanes: no distill pull, no blend — pure TBPTT gradient
+                    distill = (per * taught).sum() / taught.sum().clamp_min(1)
+                code   = beta * t_s + (1.0 - beta) * w0
+                if taught is not None:
+                    code = torch.where(taught.unsqueeze(1), code, w0)
+                code   = code.unsqueeze(1)
                 mem_bank = torch.cat([mem_bank[:, :-1], code], dim=1)
                 if mix_ema is not None:
                     # Track the code the read consumes at presentation (post-blend),
@@ -2226,6 +2257,8 @@ def main() -> None:
                        if "rule_acc" in mp else "")
                 acc += (f"  rule_HELD={mp['rule_acc_held']:.3f}"
                         if "rule_acc_held" in mp else "")
+                acc += (f"  rule_BLIND={mp['rule_acc_blind']:.3f}"
+                        if "rule_acc_blind" in mp else "")
                 acc += (f"  rule_LATE={mp['rule_acc_late']:.3f}"
                         if "rule_acc_late" in mp else "")
                 acc += (f"  pre/post={mp['rule_acc_pre']:.3f}/{mp['rule_acc_post']:.3f}"
