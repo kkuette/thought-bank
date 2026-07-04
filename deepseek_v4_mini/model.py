@@ -283,7 +283,10 @@ class DualModalBlock(nn.Module):
         self.read_bank = (not _rl) or (layer_idx in _rl)
         r = int(cfg.mem_read_rank)
         self.read_rank = r
-        self.fw_A    = nn.Linear(cfg.mem_dim, r * d, bias=False)  # slot → A_i
+        # SwiGLU read: fw_A emits TWO maps per slot (gate A_g, value A_v).
+        self.fw_swiglu = bool(getattr(cfg, "mem_read_swiglu", False))
+        _na = 2 if self.fw_swiglu else 1
+        self.fw_A    = nn.Linear(cfg.mem_dim, _na * r * d, bias=False)  # slot → A_i
         self.fw_B    = nn.Linear(cfg.mem_dim, d * r, bias=False)  # slot → B_i
         if bool(getattr(cfg, "mem_read_spectral_norm", False)):
             from torch.nn.utils.parametrizations import spectral_norm
@@ -307,15 +310,21 @@ class DualModalBlock(nn.Module):
         d = h.size(-1)
         r = self.read_rank
 
-        A = self.fw_A(bank).view(B, M, r, d)   # [B, M, r, d]
-        Bm = self.fw_B(bank).view(B, M, d, r)  # [B, M, d, r]
+        _na = 2 if self.fw_swiglu else 1
+        A = self.fw_A(bank).view(B, M, _na, r, d)  # [B, M, 1|2, r, d]
+        Bm = self.fw_B(bank).view(B, M, d, r)      # [B, M, d, r]
 
         ds = d ** -0.5
         rs = r ** -0.5
         y0 = self.norm_fw(h)
         y  = y0
         for i in range(M):
-            z   = self.fw_act(torch.einsum("brd,btd->btr", A[:, i], y) * ds)  # [B,T,r]
+            if self.fw_swiglu:
+                zg = torch.einsum("brd,btd->btr", A[:, i, 0], y) * ds
+                zv = torch.einsum("brd,btd->btr", A[:, i, 1], y) * ds
+                z  = (F.silu(zg) * zv).clamp(-8.0, 8.0)                       # gated, clamped
+            else:
+                z = self.fw_act(torch.einsum("brd,btd->btr", A[:, i, 0], y) * ds)  # [B,T,r]
             upd = torch.einsum("bdr,btr->btd", Bm[:, i], z) * rs              # [B,T,d]
             y   = y + self.fw_drop(upd)
         return h + self.fw_o(y - y0)

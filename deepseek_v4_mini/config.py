@@ -94,6 +94,11 @@ class DeepSeekV4MiniConfig:
     # neighbouring codes inexpressible — the lever against snapping that data
     # pressure (noise, mixup) could not provide.
     mem_read_spectral_norm: bool = False
+    # Gated (SwiGLU-style) fast-weight read: z = clamp(silu(A_g·y) ⊙ (A_v·y)).
+    # The code then gates the token stream MULTIPLICATIVELY (half-FiLM) instead
+    # of only shaping an additive residual — the functional form "apply a rule"
+    # wants. Clamped (DSv4 "SwiGLU clamping") to keep the product stable.
+    mem_read_swiglu: bool = False
     # Which blocks read the bank as fast weights. Empty list = all blocks
     # (historical behaviour). Reading at every block composes code-dependent
     # transforms in depth, so code sensitivity escalates polynomially even
@@ -121,8 +126,38 @@ class DeepSeekV4MiniConfig:
     # toward that teacher. The read's code is annealed teacher→written (β: 1→0).
     # Only wired for multiturn_rule (needs the ground-truth rule id per conversation).
     mem_teacher_forcing: bool = False
+    # Fixed Fourier teacher codes instead of a learned embedding: code[s] =
+    # [cos(2πks/S), sin(2πks/S)]_k (torus product for the affine family). The
+    # circle geometry is IMPOSED — held rules sit literally between trained
+    # codes — and "apply s" becomes composing a rotation (what grokking nets
+    # discover by themselves on modular arithmetic; Nanda et al.). No teacher
+    # optimizer: the codes are buffers.
+    mem_teacher_fourier: bool = False
+    # Cap Fourier frequencies at k ≤ kmax (cycled to fill mem_dim). Full-spectrum
+    # codes ask the write head for high-frequency trig of s (k up to mem_dim/2 —
+    # sign flips every few symbols): expensive for a 3M model. Low-k codes keep
+    # the circle geometry (and interpolation) with a smooth, cheap s → code map.
+    # 0 = full spectrum (k = 1..mem_dim/2).
+    mem_teacher_fourier_kmax: int = 0
+    # Distill on DIRECTION only: 1 − cos(w0, teacher[s]) instead of MSE. The MSE
+    # against (near) zero-mean fixed targets has a rule-free descent path — shrink
+    # ‖w0‖ toward 0 and collect MSE → 1.0 without encoding anything (dsv4f@1000:
+    # RMS(w) 0.674, cos(w, target) −0.004, distill 1.46 = the constant-writer
+    # value exactly). Cosine closes that loophole: only alignment pays.
+    mem_teacher_distill_cosine: bool = False
     mem_teacher_anneal_start: int = 300      # β=1 until this optimiser step
     mem_teacher_anneal_end: int = 500        # β linear→0 by here, then 0 (teacher gone)
+    # Adaptive anneal trigger — PULL-EARLIER ONLY. "ce_below" starts the anneal at
+    # the FIXED window above, or earlier if the train-CE EMA drops under
+    # ln(n_symbols) − margin first (teacher code demonstrably in use → something to
+    # hand over; each β=1 step past that is dead time — distill alone never teaches
+    # the write to identify s while the teacher hands the answer over). The fixed
+    # window MUST stay as fallback: in s256L v2 CE sat at ln S through ALL of β=1
+    # yet the anneal cracked at ~1000 — read organization is silent below CE, so a
+    # CE gate can never be the only path to annealing. "" = fixed window only.
+    mem_teacher_anneal_trigger: str = ""     # "" | "ce_below"
+    mem_teacher_anneal_margin: float = 0.5   # trigger threshold: ln(n_symbols) − margin
+    mem_teacher_anneal_len: int = 500        # anneal duration once triggered
     mem_teacher_distill_weight: float = 2.0  # weight on MSE(w0, teacher[s]); scaled by β
 
     # ── Factory helpers ───────────────────────────────────────────────────────
