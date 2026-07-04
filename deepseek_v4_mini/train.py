@@ -559,6 +559,58 @@ def _build_synthetic_multiturn_kv(cfg_dict: dict):
     return KVDS()
 
 
+def _rule_space(d: dict):
+    """Rule space for multiturn_rule: family, pools and evaluator.
+
+    Families (data.rule_family):
+      shift  (default) : y = (x + s) mod S — rules are the S-1 non-trivial shifts;
+                         held-out via heldout_shifts / train_shift_max (1D circle).
+      affine           : y = (a·x + s) mod S, a coprime to S — φ(S)·S rules on a
+                         2D torus (16·32 = 512 for S=32). This is the task-DIVERSITY
+                         squeeze: with ~450 trained rules, memorizing one read cell
+                         per rule costs more hypernet capacity than learning the
+                         (a, s) law (Raventós et al. 2023: past a diversity
+                         threshold, ICL flips from repertoire lookup to
+                         generalization). Held-out via heldout_rule_mod m: pairs
+                         with (a_idx + s) % m == 0 — grid-interleaved on the torus,
+                         so every held rule has trained neighbours at distance 1 in
+                         BOTH directions (a and s). The identity rule (a=1, s=0) is
+                         excluded from both pools.
+
+    Rules travel as flat ids rid = a_idx * S + s (shift family: rid = s, a_idx = 0
+    with units = [1] — legacy ids unchanged). Returns
+    (units, n_rules, train_pool, held_pool, apply) with apply(rid, x) -> y.
+    """
+    S   = int(d.get("n_symbols", 32))
+    fam = str(d.get("rule_family", "shift"))
+    if fam == "affine":
+        units   = [u for u in range(1, S) if math.gcd(u, S) == 1]
+        n_rules = len(units) * S
+        mod     = int(d.get("heldout_rule_mod", 8))
+        train_pool, held_pool = [], []
+        for rid in range(n_rules):
+            a_i, s = divmod(rid, S)
+            if units[a_i] == 1 and s == 0:
+                continue                              # identity: trivially solvable
+            if mod and (a_i + s) % mod == 0:
+                held_pool.append(rid)
+            else:
+                train_pool.append(rid)
+    else:
+        units   = [1]
+        n_rules = S
+        held    = sorted(int(v) for v in d.get("heldout_shifts", []))
+        s_max   = int(d.get("train_shift_max", S - 1))
+        train_pool = [v for v in range(1, s_max + 1) if v not in held]
+        held_pool  = held if held else list(range(s_max + 1, S))
+
+    def apply(rid: int, x: int) -> int:
+        a_i, s = divmod(int(rid), S)
+        return (units[a_i] * x + s) % S
+
+    return units, n_rules, train_pool, held_pool, apply
+
+
 def _build_synthetic_rule(cfg_dict: dict):
     """Continual-learning task: a NOVEL rule presented at turn 0, APPLIED later.
 
@@ -585,12 +637,9 @@ def _build_synthetic_rule(cfg_dict: dict):
     m      = int(d.get("n_examples", 6))         # example pairs shown per presentation turn
     turns  = int(d.get("turns_per_conv", 8))     # answer turns (unseen queries)
     K      = int(d.get("n_contexts", 1))         # rules per conversation, each behind a key
-    # Held-out pool: either an explicit list (interleaved holdout — tests READ
-    # interpolation on the code manifold) or the tail above train_shift_max
-    # (contiguous block — the extrapolation worst case).
-    held   = sorted(int(v) for v in d.get("heldout_shifts", []))
-    s_max  = int(d.get("train_shift_max", S - 1))
-    train_pool = [v for v in range(1, s_max + 1) if v not in held]
+    # Rule pools + evaluator come from the rule space (shift or affine family);
+    # rules travel as flat ids, _apply(rid, x) evaluates them.
+    _units, _n_rules, train_pool, _held_pool, _apply = _rule_space(d)
     # Rule switch: after `switch_at` query turns, RE-present a fresh rule s2 != s1
     # mid-conversation (bank carried, no reset) and query s2 for the remaining
     # turns. Tests retention POLICY: the model must drop s1, not just retain.
@@ -627,7 +676,7 @@ def _build_synthetic_rule(cfg_dict: dict):
                 Msk = torch.zeros((bs, L), dtype=torch.bool)
                 for b in range(bs):
                     for j, xi in enumerate(ex_k[b]):
-                        yi = (xi + int(s_k[b])) % S
+                        yi = _apply(int(s_k[b]), xi)
                         X[b, 2 * j] = SYM_OFF + xi
                         X[b, 2 * j + 1] = SYM_OFF + yi
                         Y[b, 2 * j] = SYM_OFF + yi
@@ -642,7 +691,7 @@ def _build_synthetic_rule(cfg_dict: dict):
                     pool = unseen_k[b]
                     q = pool[t_ph % len(pool)]
                     xq[b, 0] = SYM_OFF + q
-                    yq[b, 0] = SYM_OFF + (q + int(s_k[b])) % S
+                    yq[b, 0] = SYM_OFF + _apply(int(s_k[b]), q)
                 return xq, yq, msk, torch.zeros(bs, dtype=torch.bool), torch.full((bs,), -1, dtype=torch.long)
 
             if sw:
@@ -683,7 +732,7 @@ def _build_synthetic_rule(cfg_dict: dict):
                         X[:, 0] = KEY_OFF + k
                     for b in range(bs):
                         for j, xi in enumerate(ex[b][k]):
-                            yi = (xi + int(s[b, k])) % S
+                            yi = _apply(int(s[b, k]), xi)
                             X[b, off + 2 * j] = SYM_OFF + xi
                             X[b, off + 2 * j + 1] = SYM_OFF + yi
                             Y[b, off + 2 * j] = SYM_OFF + yi
@@ -701,7 +750,7 @@ def _build_synthetic_rule(cfg_dict: dict):
                         pool = unseen[b][k]
                         q = pool[(t // K) % len(pool)]
                         xq[b, off] = SYM_OFF + q
-                        yq[b, off] = SYM_OFF + (q + int(s[b, k])) % S
+                        yq[b, off] = SYM_OFF + _apply(int(s[b, k]), q)
                     yield xq, yq, msk, torch.zeros(bs, dtype=torch.bool), torch.full((bs,), -1, dtype=torch.long)
 
     return RuleDS()
@@ -1449,10 +1498,7 @@ def synthetic_rule_probe(
     ts = getattr(model, "thought_stream", None)
     orig_new = ts._new_thought if ts is not None else None
 
-    held  = sorted(int(v) for v in d.get("heldout_shifts", []))
-    s_max = int(d.get("train_shift_max", S - 1))
-    train_pool = [v for v in range(1, s_max + 1) if v not in held]
-    held_pool  = held if held else list(range(s_max + 1, S))
+    _units, _n_rules, train_pool, held_pool, _apply = _rule_space(d)
     sw    = int(d.get("switch_at", 0))           # rule switch: s2 re-presented at turn sw
     n_ctx = 2 if sw else K
 
@@ -1494,7 +1540,7 @@ def synthetic_rule_probe(
                 s, ex, _ = ctxs[kk]
                 row = key(kk if not sw else 0)
                 for xi in ex:
-                    row += [SYM_OFF + xi, SYM_OFF + (xi + s) % S]
+                    row += [SYM_OFF + xi, SYM_OFF + _apply(s, xi)]
                 rows.append(row)
             x0 = torch.tensor(rows, device=device)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
@@ -1516,9 +1562,9 @@ def synthetic_rule_probe(
                 s, _, unseen = ctxs[k]
                 q = unseen[idx % len(unseen)]
                 rows.append(key(k if not sw else 0) + [SYM_OFF + q])
-                ys.append(SYM_OFF + (q + s) % S)
+                ys.append(SYM_OFF + _apply(s, q))
                 if sw and t >= sw:
-                    ys_old.append(SYM_OFF + (q + ctxs[0][0]) % S)
+                    ys_old.append(SYM_OFF + _apply(ctxs[0][0], q))
             xq = torch.tensor(rows, device=device)
             y_true = torch.tensor(ys, device=device)
             yq = torch.zeros_like(xq); yq[:, -1] = y_true
@@ -1748,7 +1794,7 @@ def main() -> None:
     tf_a1 = int(getattr(model_cfg, "mem_teacher_anneal_end", 500))
     tf_dw = float(getattr(model_cfg, "mem_teacher_distill_weight", 2.0))
     if tf_on:
-        S_rule      = int(data_cfg.get("n_symbols", 32))
+        S_rule      = _rule_space(data_cfg)[1]    # rule count (shift: S; affine: φ(S)·S)
         teacher_emb = nn.Embedding(S_rule, model_cfg.mem_dim).to(device)
         teacher_lr  = float(train_cfg.get("teacher_lr", 3e-4))
         teacher_opt = optim.AdamW(teacher_emb.parameters(), lr=teacher_lr, weight_decay=wd)
@@ -1760,6 +1806,8 @@ def main() -> None:
     mix_start = int(getattr(model_cfg, "mem_code_mixup_start", 0))
     mix_ema = mix_cnt = mix_pairs = None
     if tf_on and mix_p > 0.0:
+        assert str(data_cfg.get("rule_family", "shift")) == "shift", \
+            "code mixup pairs are 1D-circle (shift family) only"
         # v2, GENERALIZED SYMMETRIC PAIRS: for each trained mid s, ALL trained
         # pairs (s-d, s+d), d >= 1 — many geometries per mid, so memorizing the
         # supervised midpoints is costlier than learning "midpoint = mean rule".
