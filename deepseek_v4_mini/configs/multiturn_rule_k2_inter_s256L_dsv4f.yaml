@@ -49,7 +49,7 @@ mem_seed_slots: 4            # random-uniform[0,1] slots seeding a fresh bank
 mem_read_rank: 16            # bottleneck rank of each per-slot fast-weight layer
 mem_read_dropout: 0.0        # dropout inside the fast-weight MLP layers
 
-balance_loss_weight: 1.0e-3
+balance_loss_weight: 1.0e-4    # DSv4 weight (was 1e-3): the balance term weighed ~0.16 vs CE moves of ~0.7 — auxiliary pressure eased for consolidation
 mem_write_diversity: 0.0     # off during teacher-forced bootstrap (matches the proof)
 mem_code_mixup_p: 0.0         # OFF: decouple — mixup stalls train installation (~0.5 band) with or without SN
 mem_code_mixup_start: 500
@@ -59,8 +59,10 @@ mem_code_mixup_start: 500
 # but joint training sticks at the "ignore-bank" fixed point. Teacher-forcing the
 # bank (clean emb[s] code correlated with the rule id) + distilling the written slot
 # toward it, then annealing β→0, breaks it: rule transport 0.03→~0.97 in the proof.
+mem_read_swiglu: true          # gated read (half-FiLM): silu(A_g·y)⊙(A_v·y), clamped ±8 (DSv4 SwiGLU clamping)
 mem_write_gate: false              # ungated write (gate attenuates the code; off = cleaner)
-mem_teacher_forcing: true          # multiturn_rule-only teacher-forced bootstrap
+mem_teacher_forcing: true
+mem_teacher_fourier: true      # FIXED Fourier codes: full-rank, separated, interpolable — anti-collapse pressure via distill (write_code_probe verdict: learned-teacher codes collapsed, s undecodable at step 2000)          # multiturn_rule-only teacher-forced bootstrap
 mem_teacher_anneal_start: 800     # v1 [300,600] starved: at step 300 s256L matched affineL v2's trajectory to the third decimal (distill 1.642, CE=ln S flat, erank 1.4) and v2's crack only came at 600-700 under FULL beta=1 — the write/read organization needs ~600 steps of teacher regardless of family; 800 = crack expected ~500-700 for 255 codes + margin
 mem_teacher_anneal_end: 1300
 mem_teacher_distill_weight: 2.0    # MSE(w0, teacher[s]) weight, scaled by β
@@ -71,10 +73,13 @@ training:
   seed: 42
   lr: 3e-4                      # scratchpad recipe (all-AdamW diagnostic)
   use_muon: true                # validated recipe (K=1: 0.974@800)
-  lr_schedule: cosine           # validated recipe
+  lr_schedule: wsd             # DSv4: hold peak through search+installation, decay only at the end
+  wsd_decay_start: 2200        # full LR until here (fissure ~1000 + installation), cosine to 10% floor by 3000
   teacher_lr: 3e-4              # teacher AdamW LR (matches the scratchpad proof)
-  muon_lr: 0.00075              # halved: 1.5e-3 eroded the bank-usage solution post-anneal (peak-then-collapse)
+  muon_lr: 0.00375              # RMS-match ON: effective update RMS = 0.2*lr = 7.5e-4 on EVERY matrix — same validated effective LR on the backbone, ~8x boost on the fw hypernets (previously RMS ~0.1 there)
   weight_decay: 0.1
+  muon_rms_match: true          # DSv4/Kimi update-RMS convention (see muon_lr)
+  adam_eps: 1.0e-20             # DSv4 AdamW epsilon
   steps: 3000                   # 224 rules to install
   warmup_steps: 0               # scratchpad has none; warmup desynced the anneal from model maturity
   grad_clip: 1.0
@@ -89,10 +94,10 @@ training:
   mem_probe_every: 100
   log_every: 50
   save_every: 100            # checkpoint trail: geometry at the held BUMP vs collapsed end
-  save_dir: checkpoints/multiturn_rule_k2_inter_s256L
-  run_name: dsv4mini_multiturn_rule_k2_inter_s256L
+  save_dir: checkpoints/multiturn_rule_k2_inter_s256L_dsv4f
+  run_name: dsv4mini_multiturn_rule_k2_inter_s256L_dsv4f
   tensorboard: false
-  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s256L/metrics.jsonl
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s256L_dsv4f/metrics.jsonl
 
 # ── Data ─────────────────────────────────────────────────────────────────────────
 data:

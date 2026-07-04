@@ -82,18 +82,21 @@ class Muon(optim.Optimizer):
         nesterov: bool = True,
         ns_steps: int = 5,
         wd: float = 0.0,
+        rms_match: bool = False,
         adam_params=None,
         adam_lr: float = 3e-4,
         adam_betas: tuple = (0.9, 0.95),
         adam_wd: float = 0.1,
+        adam_eps: float = 1e-8,
     ) -> None:
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
-                        ns_steps=ns_steps, wd=wd)
+                        ns_steps=ns_steps, wd=wd, rms_match=rms_match)
         super().__init__(params, defaults)
         # Internal AdamW for non-matrix params
         if adam_params is not None:
             self._adam = optim.AdamW(
-                adam_params, lr=adam_lr, betas=adam_betas, weight_decay=adam_wd
+                adam_params, lr=adam_lr, betas=adam_betas, weight_decay=adam_wd,
+                eps=adam_eps,
             )
         else:
             self._adam = None
@@ -127,8 +130,16 @@ class Muon(optim.Optimizer):
                 # Orthogonalise 2-D updates via Newton-Schulz
                 if update.ndim == 2:
                     update = _zeropower_via_newtonschulz(update.float(), ns_steps)
-                    # Scale to match RMS of a standard normal (Jordan et al.)
-                    update = update * (update.size(1) ** 0.5)
+                    if group["rms_match"]:
+                        # DeepSeek-V4/Kimi convention: rescale so update RMS = 0.2
+                        # for EVERY shape — one lr serves square backbone blocks and
+                        # tall hypernet maps alike. The legacy sqrt(cols) scaling
+                        # gives RMS 1.0 on squares but ~0.1 on the fw_A/fw_B
+                        # hypernets: the read trains ~8x slower than the backbone.
+                        update = update * (0.2 * max(update.shape) ** 0.5)
+                    else:
+                        # Scale to match RMS of a standard normal (Jordan et al.)
+                        update = update * (update.size(1) ** 0.5)
 
                 if wd != 0.0:
                     p.mul_(1.0 - lr * wd)
@@ -611,6 +622,40 @@ def _rule_space(d: dict):
     return units, n_rules, train_pool, held_pool, apply
 
 
+def _fourier_codes(d: dict, dim: int) -> torch.Tensor:
+    """Fixed teacher codes: Fourier features on the rule manifold (unit RMS).
+
+    shift  : rid = s on a circle of size S → pairs cos/sin(2πks/S), k = 1..dim/2.
+    affine : rid = a_i·S + s on a torus U×S → half the dims carry s-frequencies,
+             half carry a-frequencies.
+    """
+    S   = int(d.get("n_symbols", 32))
+    fam = str(d.get("rule_family", "shift"))
+    units = [u for u in range(1, S) if math.gcd(u, S) == 1] if fam == "affine" else [1]
+    U, n_rules = len(units), len(units) * S if fam == "affine" else S
+
+    kmax = int(d.get("_fourier_kmax", 0))     # injected by the caller (model cfg)
+
+    def _feats(vals: torch.Tensor, period: int, n_pairs: int) -> torch.Tensor:
+        k  = torch.arange(1, n_pairs + 1, dtype=torch.float32)          # [F]
+        if kmax > 0:
+            k = (k - 1) % kmax + 1            # cycle k = 1..kmax to fill the dims
+        th = 2 * math.pi * vals.float().unsqueeze(1) * k / period        # [N, F]
+        return torch.stack([th.cos(), th.sin()], dim=-1).flatten(1)      # [N, 2F]
+
+    rid = torch.arange(n_rules)
+    if U == 1:
+        codes = _feats(rid, S, dim // 2)
+    else:
+        a_i, s = rid // S, rid % S
+        half = (dim // 2) // 2 * 2                                       # even split
+        codes = torch.cat([_feats(s, S, half // 2),
+                           _feats(a_i, U, (dim - half) // 2)], dim=1)
+    if codes.size(1) < dim:                                              # odd-dim padding
+        codes = torch.cat([codes, torch.zeros(n_rules, dim - codes.size(1))], dim=1)
+    return codes * (2.0 ** 0.5)                                          # RMS 1 per code
+
+
 def _build_synthetic_rule(cfg_dict: dict):
     """Continual-learning task: a NOVEL rule presented at turn 0, APPLIED later.
 
@@ -663,10 +708,32 @@ def _build_synthetic_rule(cfg_dict: dict):
     #   answer turn t       : [key_k?, x_q] with k = t % K               apply s_k
     # The 5th yielded element is the rule id for teacher-forcing: s_k on
     # presentation turns, -1 on answer turns (the blend must not fire there).
+    # Diversity curriculum: draw rules from a growing prefix of a (seeded)
+    # shuffle of the train pool. Bootstraps the circuit on few rules (fast crack,
+    # validated recipe) then dilates toward the full pool — separates "build the
+    # circuit" from "generalize it to N rules". The training loop drives
+    # cfg_dict["_curriculum"]["frac"] from step/curriculum_full_step.
+    cur_n0 = int(d.get("curriculum_rules_start", 0))       # 0 = curriculum off
+    if cur_n0:
+        cfg_dict.setdefault("_curriculum", {"frac": 0.0})
+        assert not sw, "curriculum not wired for switch conversations"
+
     class RuleDS:
         def __iter__(self):
             off = 1 if K > 1 else 0              # key token prefix width
             pool_t = torch.tensor(train_pool, dtype=torch.long)
+            g = torch.Generator().manual_seed(1234)
+            pool_shuf = pool_t[torch.randperm(len(pool_t), generator=g)]
+
+            def _cur_pool():
+                if not cur_n0:
+                    return pool_t
+                cur = cfg_dict["_curriculum"]
+                if "n" in cur:                       # mastery-gated: absolute pool size
+                    n = int(cur["n"])
+                else:                                # clock ramp: frac of the full pool
+                    n = max(cur_n0, int(round(float(cur["frac"]) * len(pool_t))))
+                return pool_shuf[:min(n, len(pool_t))]
 
             def _present(s_k, ex_k, reset: bool):
                 # presentation segment: [x_0, y_0, ..., x_{m-1}, y_{m-1}] (K=1)
@@ -716,7 +783,8 @@ def _build_synthetic_rule(cfg_dict: dict):
                     for t in range(turns - sw):
                         yield _query(s2, uns[1], t)
             while True:
-                s      = pool_t[torch.randint(0, len(pool_t), (bs, K))]
+                cp     = _cur_pool()
+                s      = cp[torch.randint(0, len(cp), (bs, K))]
                 ex     = [[] for _ in range(bs)]  # per lane, per context: shown inputs
                 unseen = [[] for _ in range(bs)]  # per lane, per context: query pool
                 for b in range(bs):
@@ -1674,6 +1742,16 @@ def main() -> None:
         tqdm.write("Architecture: DeepSeekV4Mini (no memory bank)")
     tqdm.write(f"Model: {model.num_params():,} parameters")
 
+    # ── Warm restart (SGDR-style) ─────────────────────────────────────────────
+    # Load MODEL weights only from a prior checkpoint; optimizer and LR schedule
+    # start fresh. Use case: a cosine that died under a late-engaging circuit —
+    # restarting restores LR without re-paying the teacher bootstrap.
+    init_from = train_cfg.get("init_from")
+    if init_from:
+        ckpt = torch.load(init_from, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        tqdm.write(f"Warm restart ← {init_from} (step {ckpt['step']}); fresh optimizer/schedule")
+
     # torch.compile: fuses the many tiny kernels (per-slot fast-weight read,
     # Sinkhorn, short turns) that leave the GPU launch-bound on this model size.
     # In-place nn.Module.compile() keeps state_dict keys clean (no _orig_mod.).
@@ -1692,11 +1770,17 @@ def main() -> None:
         f"Muon params: {sum(p.numel() for p in muon_params):,}  "
         f"Adam params: {sum(p.numel() for p in adam_params):,}"
     )
-    use_muon = bool(train_cfg.get("use_muon", True))
+    use_muon  = bool(train_cfg.get("use_muon", True))
+    rms_match = bool(train_cfg.get("muon_rms_match", False))
+    adam_eps  = float(train_cfg.get("adam_eps", 1e-8))
+    if rms_match:
+        tqdm.write("Muon RMS-match ON: update RMS = 0.2 for all shapes (DSv4 convention)")
     if use_muon:
         opt = Muon(
             muon_params, lr=muon_lr, momentum=0.95, nesterov=True, ns_steps=10, wd=wd,
+            rms_match=rms_match,
             adam_params=adam_params, adam_lr=adam_lr, adam_betas=(0.9, 0.95), adam_wd=wd,
+            adam_eps=adam_eps,
         )
     else:
         # All-AdamW mode: the Muon group is kept as a lr=0 no-op so the
@@ -1713,12 +1797,28 @@ def main() -> None:
     warmup_steps  = int(train_cfg.get("warmup_steps", 200))
 
     lr_schedule = str(train_cfg.get("lr_schedule", "cosine"))
+    # WSD (warmup-stable-decay, DSv4): hold peak LR through search AND
+    # installation, cosine-decay to the 10% floor only over the final stretch.
+    # Antidote to the dying-cosine trap: late-cracking circuits (fissure ~1000+)
+    # otherwise consolidate on a fading LR.
+    wsd_decay_start = int(train_cfg.get("wsd_decay_start", int(total_steps * 0.75)))
+    # Dynamic-pacing companion: when the anneal window is pulled by a trigger
+    # (curriculum mastery / ce_below), re-anchor the decay to the anneal END
+    # (+offset) — search at full LR under the teacher, cool down only once β=0.
+    # The configured wsd_decay_start stays as the fallback if no trigger fires.
+    wsd_decay_at_anneal_end = bool(train_cfg.get("wsd_decay_at_anneal_end", False))
+    wsd_decay_offset        = int(train_cfg.get("wsd_decay_offset", 0))
 
     def _lr_fn(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
         if lr_schedule == "constant":
             return 1.0
+        if lr_schedule == "wsd":
+            if step < wsd_decay_start:
+                return 1.0
+            progress = (step - wsd_decay_start) / max(1, total_steps - wsd_decay_start)
+            return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
 
@@ -1793,11 +1893,32 @@ def main() -> None:
     tf_a0 = int(getattr(model_cfg, "mem_teacher_anneal_start", 300))
     tf_a1 = int(getattr(model_cfg, "mem_teacher_anneal_end", 500))
     tf_dw = float(getattr(model_cfg, "mem_teacher_distill_weight", 2.0))
+    tf_trigger = str(getattr(model_cfg, "mem_teacher_anneal_trigger", ""))
+    tf_alen    = int(getattr(model_cfg, "mem_teacher_anneal_len", 500))
+    # ce_below: β stays 1 until the train-CE EMA proves the read exploits the
+    # teacher (CE < ln S − margin); the anneal then runs [now, now+len].
+    tf_ce_thresh = (math.log(int(data_cfg.get("n_symbols", 32)))
+                    - float(getattr(model_cfg, "mem_teacher_anneal_margin", 0.5)))
+    tf_ce_ema: Optional[float] = None
+    tf_fired = False   # ce_below: PULL-EARLIER only — the fixed [tf_a0,tf_a1] stays
+                       # as the fallback (v2: CE sat at ln S through all of β=1 yet
+                       # the anneal cracked at ~1000 — organization is silent below
+                       # CE, so a CE gate must never be the only way to anneal)
     if tf_on:
         S_rule      = _rule_space(data_cfg)[1]    # rule count (shift: S; affine: φ(S)·S)
         teacher_emb = nn.Embedding(S_rule, model_cfg.mem_dim).to(device)
-        teacher_lr  = float(train_cfg.get("teacher_lr", 3e-4))
-        teacher_opt = optim.AdamW(teacher_emb.parameters(), lr=teacher_lr, weight_decay=wd)
+        if bool(getattr(model_cfg, "mem_teacher_fourier", False)):
+            _kmax = int(getattr(model_cfg, "mem_teacher_fourier_kmax", 0))
+            with torch.no_grad():
+                teacher_emb.weight.copy_(_fourier_codes(
+                    {**data_cfg, "_fourier_kmax": _kmax}, model_cfg.mem_dim).to(device))
+            teacher_emb.weight.requires_grad_(False)
+            teacher_opt = None                    # fixed codes: nothing to train
+            tqdm.write(f"Teacher codes: FIXED Fourier features ({S_rule} rules, RMS 1, "
+                       f"kmax={_kmax or model_cfg.mem_dim // 2})")
+        else:
+            teacher_lr  = float(train_cfg.get("teacher_lr", 3e-4))
+            teacher_opt = optim.AdamW(teacher_emb.parameters(), lr=teacher_lr, weight_decay=wd)
     # Code-space mixup: EMA dictionary of the presentation code the read actually
     # consumes (post teacher-blend), one slot per shift. Midpoints of trained
     # neighbours are injected with the middle rule's labels (see config).
@@ -1834,7 +1955,9 @@ def main() -> None:
         tqdm.write(f"Code mixup ON (v2 pairs): p={mix_p} mom={mix_mom} "
                    f"eligible_mids={_mids} pairs={int(mix_pairs.sum())}")
     if tf_on:
-        tqdm.write(f"Teacher-forcing ON: S={S_rule} anneal[{tf_a0},{tf_a1}] distill_w={tf_dw} "
+        _win = (f"[{tf_a0},{tf_a1}] or earlier if ce<{tf_ce_thresh:.2f} (len={tf_alen})"
+                if tf_trigger == "ce_below" else f"[{tf_a0},{tf_a1}]")
+        tqdm.write(f"Teacher-forcing ON: S={S_rule} anneal={_win} distill_w={tf_dw} "
                    f"gate={'on' if model_cfg.mem_write_gate else 'off'}")
     def _beta_at(s: int) -> float:
         if s <= tf_a0: return 1.0
@@ -1850,8 +1973,35 @@ def main() -> None:
     pbar  = tqdm(total=total_steps, desc="Training")
     persist_mem: Optional[torch.Tensor] = None   # bank carried across steps
     window_loss = None                            # multi-turn TBPTT window accumulator
+    cur_full = int(data_cfg.get("curriculum_full_step", 0))  # diversity curriculum ramp end
+    # Mastery-gated curriculum (dsv4h): the pool DOUBLES only when the train-CE EMA
+    # proves the current pool is exploited (dsv4g falsified the clock ramp: frac=step/800
+    # gave the 16-rule regime <50 steps — the mastery phase never existed). A stalled
+    # stage is a verdict, not a bug: it localizes the lock at that pool size.
+    cur_mastery  = str(data_cfg.get("curriculum_mode", "")) == "mastery"
+    cur_thresh   = float(data_cfg.get("curriculum_ce_thresh", 5.0))
+    cur_dwell    = int(data_cfg.get("curriculum_dwell_min", 150))   # min steps per stage
+    cur_full_n   = int(data_cfg.get("curriculum_pool_full_n", 0))   # train-pool size; >0
+                                    # couples the anneal to the curriculum: teacher time
+                                    # ∝ rule count, so β=1 holds until the FULL pool is
+                                    # MASTERED (next CE-EMA gate crossing at full size),
+                                    # then the anneal is pulled to [now, now+len].
+                                    # curriculum_anneal_margin>0 = legacy fixed offset
+                                    # from the pool-full doubling instead (dsv4h: 300).
+    cur_post_full = int(data_cfg.get("curriculum_anneal_margin", 0))
+    cur_anneal_at_n = int(data_cfg.get("curriculum_anneal_at_n", 0))  # >0: pull the anneal
+                                    # at the MASTERY of that pool size (early crutch exit)
+                                    # while the curriculum keeps doubling — the remaining
+                                    # rules must install teacher-free (write generalization)
+    cur_ce_ema: Optional[float] = None
+    cur_stage_from = 0                                # step at which the current stage began
 
     for batch in dl:
+        if "_curriculum" in raw:
+            if cur_mastery:
+                raw["_curriculum"].setdefault("n", int(data_cfg.get("curriculum_rules_start", 16)))
+            else:
+                raw["_curriculum"]["frac"] = (step / cur_full) if cur_full > 0 else 1.0
         if mem_multiturn:
             # One TURN-SLOT of B lanes (padded). The bank persists across slots
             # within a conversation, resets per-lane at a conversation boundary, and
@@ -1893,7 +2043,12 @@ def main() -> None:
                 beta   = _beta_at(step)
                 w0     = mem_bank[:, -1]
                 t_s    = teacher_emb(rule_s).to(mem_bank.dtype)
-                distill = F.mse_loss(w0.float(), t_s.detach().float())
+                if bool(getattr(model_cfg, "mem_teacher_distill_cosine", False)):
+                    # direction-only distill: shrinking ‖w0‖ pays nothing
+                    distill = (1.0 - F.cosine_similarity(
+                        w0.float(), t_s.detach().float(), dim=1)).mean()
+                else:
+                    distill = F.mse_loss(w0.float(), t_s.detach().float())
                 code   = (beta * t_s + (1.0 - beta) * w0).unsqueeze(1)
                 mem_bank = torch.cat([mem_bank[:, :-1], code], dim=1)
                 if mix_ema is not None:
@@ -1980,6 +2135,66 @@ def main() -> None:
         sched_step()
 
         step += 1
+        if cur_mastery and "_curriculum" in raw:
+            ce_now = float(logs["ce"])
+            cur_ce_ema = ce_now if cur_ce_ema is None else 0.98 * cur_ce_ema + 0.02 * ce_now
+            if cur_ce_ema < cur_thresh and (step - cur_stage_from) >= cur_dwell:
+                n_old = int(raw["_curriculum"]["n"])
+                if cur_full_n > 0 and n_old >= cur_full_n:
+                    # Pool already full: this gate crossing = FULL POOL MASTERED.
+                    # Same judge as the stages decides when the crutch can leave.
+                    if tf_on and not tf_fired:
+                        tf_fired = True
+                        tf_a0, tf_a1 = step, step + tf_alen
+                        tqdm.write(f"[curriculum] full pool ({cur_full_n}) mastered "
+                                   f"(CE EMA < {cur_thresh:.3f}) @ step {step}: "
+                                   f"anneal pulled to [{tf_a0},{tf_a1}]")
+                        if wsd_decay_at_anneal_end and lr_schedule == "wsd":
+                            wsd_decay_start = tf_a1 + wsd_decay_offset
+                            tqdm.write(f"[lr] WSD decay re-anchored to anneal end: "
+                                       f"start @ {wsd_decay_start}")
+                    cur_stage_from = step             # re-arm the dwell, stop log spam
+                    cur_ce_ema = None
+                else:
+                    raw["_curriculum"]["n"] = n_old * 2   # _cur_pool clamps to the full pool
+                    cur_stage_from = step
+                    cur_ce_ema = None                 # fresh EMA: judge the NEW pool only
+                    tqdm.write(f"[curriculum] CE EMA < {cur_thresh:.3f} @ step {step}: "
+                               f"pool {n_old} -> {n_old * 2}")
+                    if tf_on and not tf_fired and cur_anneal_at_n > 0 and n_old >= cur_anneal_at_n:
+                        # early crutch exit: pool of size n_old just proved mastered
+                        tf_fired = True
+                        tf_a0, tf_a1 = step, step + tf_alen
+                        tqdm.write(f"[curriculum] pool {n_old} mastered >= anneal_at_n "
+                                   f"({cur_anneal_at_n}): anneal pulled to [{tf_a0},{tf_a1}] "
+                                   f"— remaining rules install teacher-free")
+                        if wsd_decay_at_anneal_end and lr_schedule == "wsd":
+                            wsd_decay_start = tf_a1 + wsd_decay_offset
+                            tqdm.write(f"[lr] WSD decay re-anchored to anneal end: "
+                                       f"start @ {wsd_decay_start}")
+                    if (tf_on and not tf_fired and cur_post_full > 0
+                            and cur_full_n > 0 and n_old * 2 >= cur_full_n):
+                        # legacy fixed-margin coupling (dsv4h): anneal at doubling+margin
+                        tf_fired = True
+                        tf_a0, tf_a1 = step + cur_post_full, step + cur_post_full + tf_alen
+                        tqdm.write(f"[curriculum] pool FULL ({cur_full_n}): anneal pulled to "
+                                   f"[{tf_a0},{tf_a1}]")
+                        if wsd_decay_at_anneal_end and lr_schedule == "wsd":
+                            wsd_decay_start = tf_a1 + wsd_decay_offset
+                            tqdm.write(f"[lr] WSD decay re-anchored to anneal end: "
+                                       f"start @ {wsd_decay_start}")
+        if tf_on and tf_trigger == "ce_below" and not tf_fired and step < tf_a0:
+            ce_now = float(logs["ce"])
+            tf_ce_ema = ce_now if tf_ce_ema is None else 0.98 * tf_ce_ema + 0.02 * ce_now
+            if tf_ce_ema < tf_ce_thresh:
+                tf_fired = True
+                tf_a0, tf_a1 = step, step + tf_alen
+                tqdm.write(f"[anneal-trigger] CE EMA {tf_ce_ema:.3f} < {tf_ce_thresh:.3f} "
+                           f"@ step {step}: anneal pulled in to [{tf_a0},{tf_a1}]")
+                if wsd_decay_at_anneal_end and lr_schedule == "wsd":
+                    wsd_decay_start = tf_a1 + wsd_decay_offset
+                    tqdm.write(f"[lr] WSD decay re-anchored to anneal end: "
+                               f"start @ {wsd_decay_start}")
         dt    = time.perf_counter() - t0
         tok_s = toks / dt
         t0    = time.perf_counter()

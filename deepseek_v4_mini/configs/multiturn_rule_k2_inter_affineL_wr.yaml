@@ -1,0 +1,93 @@
+# affineL v3 — WARM RESTART (SGDR) of affineL v2 from step 2200.
+#
+# v2 diagnosis: the delayed anneal [1000,1500] pushed the whole consolidation
+# phase into the dying half of the 4000-step cosine. The circuit engaged at
+# ~1900 (CE 2.74->2.18, held staircase 0.07->0.125 tracking rule_acc) then
+# plateaued at 0.11-0.13 with lr already < 3.6e-4 and falling. Classic twin:
+# cosine dead before convergence -> warm restart (Loshchilov & Hutter, SGDR).
+#
+# ONE variable vs the v2 tail: the LR (restored to peak 7.5e-4, fresh cosine).
+# Model weights loaded from step_2200.pt; optimizer/schedule fresh. Teacher
+# OFF — the checkpoint does not carry teacher_emb, and re-annealing against a
+# fresh random teacher would wreck the bootstrapped circuit; at v2's tail
+# beta=0 so teacher-off is functionally identical.
+#
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_k2_inter_affineL_wr.yaml
+
+# ── Model (identical to affineL) ─────────────────────────────────────────────
+vocab_size: 48
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+
+n_hc: 2
+sinkhorn_iters: 20
+
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+
+# ── Fast-weight thought bank (identical to affineL) ─────────────────────────
+mem_dim: 64
+max_mem: 16
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+
+balance_loss_weight: 1.0e-3
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+
+# Teacher OFF: circuit already bootstrapped in v2 (anneal done, beta=0); see header.
+mem_write_gate: false
+mem_teacher_forcing: false
+
+# ── Training: fresh cosine from the validated peak ───────────────────────────
+training:
+  device: auto
+  seed: 42
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: cosine
+  muon_lr: 0.00075              # restored peak; decays to 7.5e-5 floor by step 2000
+  weight_decay: 0.1
+  steps: 2000
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  init_from: checkpoints/multiturn_rule_k2_inter_affineL/step_2200.pt
+  mem_bptt_window: 10
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_affineL_wr
+  run_name: dsv4mini_multiturn_rule_k2_inter_affineL_wr
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_affineL_wr/metrics.jsonl
+
+# ── Data (identical to affineL) ──────────────────────────────────────────────
+data:
+  task: multiturn_rule
+  n_symbols: 32
+  n_examples: 6
+  turns_per_conv: 8
+  n_contexts: 2
+  rule_family: affine
+  heldout_rule_mod: 8
+  batch_size: 64
+
+mem_read_spectral_norm: false
+mem_read_layers: [0]

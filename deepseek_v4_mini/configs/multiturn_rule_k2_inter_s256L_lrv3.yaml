@@ -61,8 +61,8 @@ mem_code_mixup_start: 500
 # toward it, then annealing β→0, breaks it: rule transport 0.03→~0.97 in the proof.
 mem_write_gate: false              # ungated write (gate attenuates the code; off = cleaner)
 mem_teacher_forcing: true          # multiturn_rule-only teacher-forced bootstrap
-mem_teacher_anneal_start: 800     # v1 [300,600] starved: at step 300 s256L matched affineL v2's trajectory to the third decimal (distill 1.642, CE=ln S flat, erank 1.4) and v2's crack only came at 600-700 under FULL beta=1 — the write/read organization needs ~600 steps of teacher regardless of family; 800 = crack expected ~500-700 for 255 codes + margin
-mem_teacher_anneal_end: 1300
+mem_teacher_anneal_start: 1100    # LR-v3: crack expected earlier under 2x LR; anneal ends (1600) where the cosine recrosses the validated 7.5e-4 — search hot, consolidate safe
+mem_teacher_anneal_end: 1600
 mem_teacher_distill_weight: 2.0    # MSE(w0, teacher[s]) weight, scaled by β
 
 # ── Training (stable recipe: halved LR) ──────────────────────────────────────────
@@ -73,7 +73,7 @@ training:
   use_muon: true                # validated recipe (K=1: 0.974@800)
   lr_schedule: cosine           # validated recipe
   teacher_lr: 3e-4              # teacher AdamW LR (matches the scratchpad proof)
-  muon_lr: 0.00075              # halved: 1.5e-3 eroded the bank-usage solution post-anneal (peak-then-collapse)
+  muon_lr: 0.0015              # LR-v3: high peak for the search phase; cosine recrosses the validated 7.5e-4 at ~step 1600, where consolidation lands
   weight_decay: 0.1
   steps: 3000                   # 224 rules to install
   warmup_steps: 0               # scratchpad has none; warmup desynced the anneal from model maturity
@@ -89,10 +89,10 @@ training:
   mem_probe_every: 100
   log_every: 50
   save_every: 100            # checkpoint trail: geometry at the held BUMP vs collapsed end
-  save_dir: checkpoints/multiturn_rule_k2_inter_s256L
-  run_name: dsv4mini_multiturn_rule_k2_inter_s256L
+  save_dir: checkpoints/multiturn_rule_k2_inter_s256L_lrv3
+  run_name: dsv4mini_multiturn_rule_k2_inter_s256L_lrv3
   tensorboard: false
-  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s256L/metrics.jsonl
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s256L_lrv3/metrics.jsonl
 
 # ── Data ─────────────────────────────────────────────────────────────────────────
 data:
