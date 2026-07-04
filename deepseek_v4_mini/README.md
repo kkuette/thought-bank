@@ -240,8 +240,11 @@ For streaming runs, `content_gap` is the memory metric to trust:
 
 ## Experiments & results (`multiturn_rule` campaign)
 
-Recipe for all runs: all-AdamW `lr 3e-4` **constant** (no warmup), teacher-forced bootstrap
-annealed over steps [300,500], write gate off. Chance = 0.031, in-window ICL ceiling ≈ 0.49.
+Recipe for the campaign runs below: all-AdamW `lr 3e-4` **constant** (no warmup),
+teacher-forced bootstrap annealed over steps [300,500], write gate off. Chance = 0.031,
+in-window ICL ceiling ≈ 0.49. **Current default for new runs**: Muon + cosine +
+early anneal [150,350] (`multiturn_rule_muon_cos_early.yaml`) — 0.974@800 on the
+K=1 reference, ~2× faster than the AdamW baseline (see the optimizer rows below).
 
 | Experiment | Config | Result |
 |---|---|---|
@@ -252,13 +255,36 @@ annealed over steps [300,500], write gate off. Chance = 0.031, in-window ICL cei
 | held-out shifts (interleaved) | `multiturn_rule_k2_interleaved.yaml` | rule_HELD = **0.000** (snapping to trained neighbours); no spontaneous interpolation, irregular coverage hurts everywhere |
 | persistence horizon (24 turns) | `multiturn_rule_horizon.yaml` | **no FIFO cliff** — rehearsal emerges from TBPTT pressure alone; cost: ~0.48 plateau (vs 0.95 @9 turns) |
 | rule switch (12+12) | `multiturn_rule_switch.yaml` | **STICK = 0.000** @acc 0.795 — old rule dropped *actively* (recency override: s1 still in the bank, never used) |
-| joint retain-then-drop (24+16) | `multiturn_rule_joint.yaml` | in progress |
+| joint retain-then-drop (24+16) | `multiturn_rule_joint.yaml` | **0.747/0.746 pre/post, STICK 0.02** @1200 — maintenance through eviction THEN clean replacement; beats horizon's maintenance (0.74 vs 0.48); rehearsal uses a covert code, off the presentation manifold (`analysis/joint_inspect.py`) |
+| Muon retest, constant LR | `multiturn_rule_muon.yaml` | no collapse (the historical peak-then-collapse was the pad_mask/warmup/distill bugs) and ~2× faster early (0.74@600), but the top end is **unstable**: band 0.83–0.95, touches 0.945 without holding |
+| Muon + cosine decay | `multiturn_rule_muon_cos.yaml` | **0.99 @1000** (probes 850–1000: 0.951/0.984/0.971/0.990) — stable, above the AdamW baseline, ~1.75× faster |
+| + early anneal [150,350] | `multiturn_rule_muon_cos_early.yaml` | **0.974 @800–900** stable — another ~150 steps saved; the gain shows up *post*-anneal (consolidation runs at high LR), the lift-off itself tracks model maturity, not the teacher schedule; **new default recipe** (~2× vs AdamW) |
+| write noise σ=0.1 | `multiturn_rule_k2_inter_noise.yaml` | train 0.995 / held **0.000** — noise *reinforces* snapping (a midpoint falls in a neighbour's cloud, where supervision says "behave like the neighbour") |
+| code mixup (midpoint supervision) | `..._mixup.yaml` / `_mixup2(w).yaml` | v1 (8 d=1 midpoints): memorized as extra codes; v2/v2w (62 symmetric pairs): stalls installation when injected pre-maturity — held 0.000 throughout |
+| ⚠ short format disqualified | `..._short.yaml` (control) | fast-iter format (`turns_per_conv 4` = 1 query/rule/conv) caps train at **~0.48 regardless of intervention** — three cells (SN, [0,2], bare control) produced the same curve; only long-format verdicts count |
+| read placement | `..._sn_late.yaml` / `_read02L.yaml` | block-3-only read **kills the bootstrap** (gradient-starved, abl_gap 0.002); blocks **[0,2]** install fully (**0.987**, ~300 steps slower than 4 blocks) — but held **0.000**: halved composition doesn't interpolate |
+| spectral norm on the read hypernet | `..._snonly.yaml` / `_sn02L.yaml` | SN blocks the final consolidation step (~0.53 vs 0.99, 8 flat probes) even at 2 reads — the 0.55→0.99 installation step is a *sharpening* (32 neighbouring rules need razor code boundaries); **imposed smoothness is incompatible with what installation requires** |
+| mixup post-installation | `..._read02L_mix.yaml` | mixup injected at step 1200 on a fully installed [0,2] base (0.995): train holds (0.997), mixup CE absorbed (0.99→0.3–0.6), held **0.000** — absorbed by *memorizing* the 62 midpoints, not by interpolating, even under ideal conditions |
+| single read at block 0 | `..._read0L.yaml` | installs **0.987** (fastest bootstrap of the campaign) / held **0.000** — snapping is not caused by read *composition*; the block-3-only death was position + confounds |
+| mem_dim 8 (capacity squeeze) | `..._dim8L.yaml` | installs **0.990** (faster than dim 32!) / held **0.000** — the lookup survives an 8-dim code; dimensional capacity is not the lock alone |
+| **rule diversity: affine family** | `..._affineL.yaml` | 448 trained rules `y=(a·x+s)%32` (~620 params/rule vs ~5,900 at 25 rules — Raventós-style diversity squeeze). v1 (anneal [150,350]) starved: the teacher kick needs rule-count-proportional time. v2 (anneal [1000,1500], 4000 steps): grokking-style crack out of the ln(32) plateau at ~600, then **first non-zero held of the program** — 8+ consecutive probes above chance (0.047–0.091 vs 0.031), tracking rule_acc; **run in progress** |
 
 **Headline:** memory *policy* — retention (rehearsal past eviction) AND replacement (dropping
 a superseded rule) — is task-adaptive and **emerges end-to-end**; no gate/LRU/allocation
 mechanism was needed. The write generalizes (circular code manifold, held shifts placed
 correctly ON-manifold); the **read** is the generalization blocker and the rehearsal-precision
 bottleneck. Mechanistic evidence and per-script details: [`analysis/`](analysis/README.md).
+
+**Read-generalization campaign (closed, negative):** neither data pressure (noise, mixup
+in four variants including post-installation) nor structural smoothness (spectral norm at
+4 and 2 read points) moves `rule_HELD` off 0.000. The two arms fail for dual reasons —
+installation *requires* sharp decision boundaries between neighbouring codes (SN forbids
+them ⇒ consolidation blocked at ~0.53), while midpoint supervision is *absorbed by
+memorization* rather than interpolation once the read is sharp. On this task the transport
+mechanism is a **closed-repertoire recognizer**: it generalizes perfectly to new
+conversations of trained rules, but discrimination-grade sharpness and on-manifold
+interpolation are locally incompatible for the current read. Open exits: FiLM-style
+affine reads, larger code spacing, or embracing the recognition framing.
 
 ---
 

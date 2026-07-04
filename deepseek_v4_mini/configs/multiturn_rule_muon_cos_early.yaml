@@ -59,8 +59,8 @@ mem_write_diversity: 0.0     # off during teacher-forced bootstrap (matches the 
 # toward it, then annealing β→0, breaks it: rule transport 0.03→~0.97 in the proof.
 mem_write_gate: false              # ungated write (gate attenuates the code; off = cleaner)
 mem_teacher_forcing: true          # multiturn_rule-only teacher-forced bootstrap
-mem_teacher_anneal_start: 300      # β=1 (full teacher) until step 300
-mem_teacher_anneal_end: 500        # β linear→0 by 500; teacher gone after
+mem_teacher_anneal_start: 150     # EARLY ANNEAL test: Muon is above chance by ~250 under the [300,500] window
+mem_teacher_anneal_end: 350       # frees high-LR budget for post-anneal consolidation (cosine decays late)
 mem_teacher_distill_weight: 2.0    # MSE(w0, teacher[s]) weight, scaled by β
 
 # ── Training (stable recipe: halved LR) ──────────────────────────────────────────
@@ -68,8 +68,8 @@ training:
   device: auto
   seed: 42
   lr: 3e-4                      # scratchpad recipe (all-AdamW diagnostic)
-  use_muon: false               # DIAGNOSTIC: all-AdamW, matches the scratchpad proof exactly
-  lr_schedule: constant         # scratchpad used constant LR (no cosine decay)
+  use_muon: true                # RETEST: Muon post-fixes (pad_mask, warmup, distill/accum)
+  lr_schedule: cosine            # CONFIRMATION RUN: decay to 10% floor — tests the LR-noise-floor hypothesis (constant plateaued 0.83-0.87)
   teacher_lr: 3e-4              # teacher AdamW LR (matches the scratchpad proof)
   muon_lr: 0.00075              # halved: 1.5e-3 eroded the bank-usage solution post-anneal (peak-then-collapse)
   weight_decay: 0.1
@@ -87,10 +87,10 @@ training:
   mem_probe_every: 100
   log_every: 50
   save_every: 100
-  save_dir: checkpoints/multiturn_rule
-  run_name: dsv4mini_multiturn_rule
+  save_dir: checkpoints/multiturn_rule_muon_cos_early
+  run_name: dsv4mini_multiturn_rule_muon_cos_early
   tensorboard: false
-  metrics_file: runs/dsv4mini_multiturn_rule/metrics.jsonl
+  metrics_file: runs/dsv4mini_multiturn_rule_muon_cos_early/metrics.jsonl
 
 # ── Data ─────────────────────────────────────────────────────────────────────────
 data:

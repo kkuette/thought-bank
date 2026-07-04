@@ -43,14 +43,16 @@ top_k_experts: 1
 d_ff: 256
 
 # ── Fast-weight thought bank ──────────────────────────────────────────────────────
-mem_dim: 32                  # thought-vector / fast-weight code size
-max_mem: 16                  # FIFO cap
+mem_dim: 64                  # write ENLARGED to fit 512 rules on the (a,s) torus; read hypernet grows too (~278k) but the ratio drops to ~620 params/rule vs ~5900 at 25 rules — memorization must outprice the law
+max_mem: 16                  # FIFO cap (long format)
 mem_seed_slots: 4            # random-uniform[0,1] slots seeding a fresh bank
 mem_read_rank: 16            # bottleneck rank of each per-slot fast-weight layer
 mem_read_dropout: 0.0        # dropout inside the fast-weight MLP layers
 
 balance_loss_weight: 1.0e-3
 mem_write_diversity: 0.0     # off during teacher-forced bootstrap (matches the proof)
+mem_code_mixup_p: 0.0         # OFF: decouple — mixup stalls train installation (~0.5 band) with or without SN
+mem_code_mixup_start: 500
 
 # ── Write gate + teacher-forced bootstrap ─────────────────────────────────────
 # The read applies any fixed code (read_isolation_emb) and the write can encode s,
@@ -59,8 +61,8 @@ mem_write_diversity: 0.0     # off during teacher-forced bootstrap (matches the 
 # toward it, then annealing β→0, breaks it: rule transport 0.03→~0.97 in the proof.
 mem_write_gate: false              # ungated write (gate attenuates the code; off = cleaner)
 mem_teacher_forcing: true          # multiturn_rule-only teacher-forced bootstrap
-mem_teacher_anneal_start: 300      # β=1 (full teacher) until step 300
-mem_teacher_anneal_end: 500        # β linear→0 by 500; teacher gone after
+mem_teacher_anneal_start: 1000    # 512 rules: the 150-step kick starved (distill flat 2.0->1.7, CE stuck at ln32, bank collapsed) — the teacher needs ~rule-count-proportional time to organize and the read to learn the 512-way decode
+mem_teacher_anneal_end: 1500
 mem_teacher_distill_weight: 2.0    # MSE(w0, teacher[s]) weight, scaled by β
 
 # ── Training (stable recipe: halved LR) ──────────────────────────────────────────
@@ -68,12 +70,12 @@ training:
   device: auto
   seed: 42
   lr: 3e-4                      # scratchpad recipe (all-AdamW diagnostic)
-  use_muon: false               # DIAGNOSTIC: all-AdamW, matches the scratchpad proof exactly
-  lr_schedule: constant         # scratchpad used constant LR (no cosine decay)
+  use_muon: true                # validated recipe (K=1: 0.974@800)
+  lr_schedule: cosine           # validated recipe
   teacher_lr: 3e-4              # teacher AdamW LR (matches the scratchpad proof)
   muon_lr: 0.00075              # halved: 1.5e-3 eroded the bank-usage solution post-anneal (peak-then-collapse)
   weight_decay: 0.1
-  steps: 1500
+  steps: 4000                   # 1000 steps of beta=1 + anneal + installation headroom
   warmup_steps: 0               # scratchpad has none; warmup desynced the anneal from model maturity
   grad_clip: 1.0
   precision: bf16
@@ -82,20 +84,27 @@ training:
   # The window flushes at min(mem_bptt_window, grad_accum), so BOTH must be >= 9
   # for the turn-0 write (which encodes the rule) to receive gradient from every
   # answer turn. One optimiser step = one full conversation (batch_size lanes).
-  mem_bptt_window: 9
-  grad_accum: 9
+  mem_bptt_window: 10          # K(2) presentation turns + 8 answer turns
+  grad_accum: 10
   mem_probe_every: 100
   log_every: 50
-  save_every: 100
-  save_dir: checkpoints/multiturn_rule
-  run_name: dsv4mini_multiturn_rule
+  save_every: 100            # checkpoint trail: geometry at the held BUMP vs collapsed end
+  save_dir: checkpoints/multiturn_rule_k2_inter_affineL
+  run_name: dsv4mini_multiturn_rule_k2_inter_affineL
   tensorboard: false
-  metrics_file: runs/dsv4mini_multiturn_rule/metrics.jsonl
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_affineL/metrics.jsonl
 
 # ── Data ─────────────────────────────────────────────────────────────────────────
 data:
   task: multiturn_rule
   n_symbols: 32               # alphabet size (chance accuracy = 1/32)
   n_examples: 6               # example pairs shown at turn 0
-  turns_per_conv: 8           # answer turns (unseen queries); n_examples+turns <= n_symbols
+  turns_per_conv: 8           # answer turns, cycling over contexts (4 queries per rule)
+  n_contexts: 2               # TWO rules per conversation, each behind a key token
+  rule_family: affine          # y = (a·x + s) mod 32, a coprime — 511 rules (16 units × 32 shifts, identity excluded): the task-DIVERSITY squeeze (Raventos et al. 2023 threshold)
+  heldout_rule_mod: 8          # held pairs (a_idx + s) % 8 == 0 -> 63 held, grid-interleaved on the torus (trained neighbours at d=1 in BOTH axes)
   batch_size: 64
+
+# STRUCTURAL smoothness (arm 3): cap the read Lipschitz constant wrt the code
+mem_read_spectral_norm: false  # read at blocks [0,2], no SN, LONG format (short-format read02 verdict quarantined)
+mem_read_layers: [0]  # SINGLE read at block 0 (max downstream influence): clean single-read test — the block-3-only death had 3 confounds (SN + short format + worst position); if this installs but held stays 0.000, snapping does not come from read composition

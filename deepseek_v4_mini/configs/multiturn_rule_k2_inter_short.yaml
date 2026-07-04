@@ -44,13 +44,15 @@ d_ff: 256
 
 # ── Fast-weight thought bank ──────────────────────────────────────────────────────
 mem_dim: 32                  # thought-vector / fast-weight code size
-max_mem: 16                  # FIFO cap
+max_mem: 8                   # fast-iter: FIFO cap halved (no eviction pressure in this task anyway)
 mem_seed_slots: 4            # random-uniform[0,1] slots seeding a fresh bank
 mem_read_rank: 16            # bottleneck rank of each per-slot fast-weight layer
 mem_read_dropout: 0.0        # dropout inside the fast-weight MLP layers
 
 balance_loss_weight: 1.0e-3
 mem_write_diversity: 0.0     # off during teacher-forced bootstrap (matches the proof)
+mem_code_mixup_p: 0.0         # OFF: decouple — mixup stalls train installation (~0.5 band) with or without SN
+mem_code_mixup_start: 500
 
 # ── Write gate + teacher-forced bootstrap ─────────────────────────────────────
 # The read applies any fixed code (read_isolation_emb) and the write can encode s,
@@ -59,8 +61,8 @@ mem_write_diversity: 0.0     # off during teacher-forced bootstrap (matches the 
 # toward it, then annealing β→0, breaks it: rule transport 0.03→~0.97 in the proof.
 mem_write_gate: false              # ungated write (gate attenuates the code; off = cleaner)
 mem_teacher_forcing: true          # multiturn_rule-only teacher-forced bootstrap
-mem_teacher_anneal_start: 300      # β=1 (full teacher) until step 300
-mem_teacher_anneal_end: 500        # β linear→0 by 500; teacher gone after
+mem_teacher_anneal_start: 150     # validated early-anneal window
+mem_teacher_anneal_end: 350
 mem_teacher_distill_weight: 2.0    # MSE(w0, teacher[s]) weight, scaled by β
 
 # ── Training (stable recipe: halved LR) ──────────────────────────────────────────
@@ -68,12 +70,12 @@ training:
   device: auto
   seed: 42
   lr: 3e-4                      # scratchpad recipe (all-AdamW diagnostic)
-  use_muon: false               # DIAGNOSTIC: all-AdamW, matches the scratchpad proof exactly
-  lr_schedule: constant         # scratchpad used constant LR (no cosine decay)
+  use_muon: true                # validated recipe (K=1: 0.974@800)
+  lr_schedule: cosine           # validated recipe
   teacher_lr: 3e-4              # teacher AdamW LR (matches the scratchpad proof)
   muon_lr: 0.00075              # halved: 1.5e-3 eroded the bank-usage solution post-anneal (peak-then-collapse)
   weight_decay: 0.1
-  steps: 1500
+  steps: 2000                   # K=2 is harder: routing must be learned on top of transport
   warmup_steps: 0               # scratchpad has none; warmup desynced the anneal from model maturity
   grad_clip: 1.0
   precision: bf16
@@ -82,20 +84,26 @@ training:
   # The window flushes at min(mem_bptt_window, grad_accum), so BOTH must be >= 9
   # for the turn-0 write (which encodes the rule) to receive gradient from every
   # answer turn. One optimiser step = one full conversation (batch_size lanes).
-  mem_bptt_window: 9
-  grad_accum: 9
+  mem_bptt_window: 6           # K(2) presentations + 4 answer turns
+  grad_accum: 6
   mem_probe_every: 100
   log_every: 50
-  save_every: 100
-  save_dir: checkpoints/multiturn_rule
-  run_name: dsv4mini_multiturn_rule
+  save_every: 100            # checkpoint trail: geometry at the held BUMP vs collapsed end
+  save_dir: checkpoints/multiturn_rule_k2_inter_short
+  run_name: dsv4mini_multiturn_rule_k2_inter_short
   tensorboard: false
-  metrics_file: runs/dsv4mini_multiturn_rule/metrics.jsonl
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_short/metrics.jsonl
 
 # ── Data ─────────────────────────────────────────────────────────────────────────
 data:
   task: multiturn_rule
   n_symbols: 32               # alphabet size (chance accuracy = 1/32)
   n_examples: 6               # example pairs shown at turn 0
-  turns_per_conv: 8           # answer turns (unseen queries); n_examples+turns <= n_symbols
+  turns_per_conv: 4           # fast-iter: 2 queries per rule
+  n_contexts: 2               # TWO rules per conversation, each behind a key token
+  heldout_shifts: [4, 8, 12, 16, 20, 24, 28]   # INTERLEAVED holdout: every held s has trained neighbors at d=1 -> tests READ interpolation on the manifold
   batch_size: 64
+
+# STRUCTURAL smoothness (arm 3): cap the read Lipschitz constant wrt the code
+mem_read_spectral_norm: false  # OFF: SN control cell capped train at ~0.5 (slope ceiling) with held 0.000 — placement is tested alone vs the 0.99/0.000 reference
+mem_read_layers: []           # ALL blocks — this cell isolates the SHORT format (turns_per_conv 4) itself: SN-only, read02 and SN+mixup all capped ~0.5 on it while the 0.99/0.000 reference ran the long format
