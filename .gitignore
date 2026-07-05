@@ -40,13 +40,11 @@ env/
 
 # Data and Cache
 data/cache/
-diffusion_thought_tensor/data/cache/
 *.pt
 *.pth
 *.bin
 
 # Logs and Outputs
-diffusion_thought_tensor/outputs/
 *.log
 *.jsonl
 

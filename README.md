@@ -1,4 +1,4 @@
-# Diffusion Thought Tensor
+# Thought Bank
 
 Research repo exploring **persistent thought memory** for language models. The
 active line of work is **`deepseek_v4_mini`**: a small reproduction of the
@@ -15,9 +15,9 @@ The driving questions, in the order they were answered:
 3. *Does the memory POLICY (retain / forget) have to be engineered?* → **no — it
    emerges end-to-end** ([current findings](#-findings-fast-weight-memory-current)).
 
-> **Legacy:** the earlier diffusion / 3D-thought-tensor prototype lives under
-> [`diffusion_thought_tensor/`](diffusion_thought_tensor/) and [`docs/old/`](docs/old/).
-> It is no longer the focus and is kept only for reference.
+> **History:** the project started as a diffusion / 3D-thought-tensor prototype
+> (hence the repo's former name). That line was abandoned for the autoregressive
+> fast-weight bank; the old code was removed and remains available in git history.
 
 ---
 
@@ -236,7 +236,6 @@ deepseek_v4_mini/        ← active project (fast-weight thought bank)
   configs/               ← tiny, small, code, code_persist, synth_recall, gist,
                            multiturn_rule family (k2, heldout, horizon, switch, joint)
 thought_lm_minimal/      ← minimal thought-LM baseline
-diffusion_thought_tensor/, docs/old/   ← legacy diffusion prototype (reference only)
 checkpoints/, runs/      ← training outputs
 ```
 
