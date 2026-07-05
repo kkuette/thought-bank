@@ -603,12 +603,21 @@ def _rule_space(d: dict):
             units = [u for u in range(1, S) if math.gcd(u, S) == 1]
         n_rules = len(units) * S
         mod     = int(d.get("heldout_rule_mod", 8))
+        # Per-unit s subsampling (capacity-matched multi-family cells): keep
+        # s ≡ -a_i (mod stride) so the mod-held pattern (a_i+s)%mod==0 stays
+        # inside the kept set (mod must be a multiple of stride).
+        stride = int(d.get("affine_s_stride", 1))
+        s_off  = int(d.get("affine_s_stride_offset", 0))   # probe-side: match the
+        if stride > 1:                                     # parity a unit had in a
+            assert mod % stride == 0, "heldout_rule_mod must be a multiple of affine_s_stride"  # larger unit list
         train_pool, held_pool = [], []
         for rid in range(n_rules):
             a_i, s = divmod(rid, S)
             if units[a_i] == 1 and s == 0:
                 continue                              # identity: trivially solvable
-            if mod and (a_i + s) % mod == 0:
+            if stride > 1 and s % stride != (s_off - a_i) % stride:
+                continue
+            if mod and (int(d.get("heldout_rule_off", 0)) + a_i + s) % mod == 0:
                 held_pool.append(rid)
             else:
                 train_pool.append(rid)
@@ -636,7 +645,12 @@ def _fourier_codes(d: dict, dim: int) -> torch.Tensor:
     """
     S   = int(d.get("n_symbols", 32))
     fam = str(d.get("rule_family", "shift"))
-    units = [u for u in range(1, S) if math.gcd(u, S) == 1] if fam == "affine" else [1]
+    if fam == "affine":
+        _cu = d.get("affine_units")          # honor the same unit subset as _rule_space
+        units = ([int(u) for u in _cu] if _cu
+                 else [u for u in range(1, S) if math.gcd(u, S) == 1])
+    else:
+        units = [1]
     U, n_rules = len(units), len(units) * S if fam == "affine" else S
 
     kmax = int(d.get("_fourier_kmax", 0))     # injected by the caller (model cfg)
