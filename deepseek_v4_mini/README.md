@@ -284,25 +284,33 @@ K=1 reference, ~2× faster than the AdamW baseline (see the optimizer rows below
 
 **Headline:** memory *policy* — retention (rehearsal past eviction) AND replacement (dropping
 a superseded rule) — is task-adaptive and **emerges end-to-end**; no gate/LRU/allocation
-mechanism was needed. The write generalizes (circular code manifold, held shifts placed
-correctly ON-manifold); the **read** is the generalization blocker and the rehearsal-precision
-bottleneck. Mechanistic evidence and per-script details: [`analysis/`](analysis/README.md).
+mechanism was needed. *(2026-07-04 framing, measured on the memorizing regime: "the read is
+the generalization blocker" is superseded — see the diversity/capacity arc in the table
+above. The read applies never-trained rules at 0.69 once diversity unlocks the law and
+capacity stops binding; the memory-policy findings themselves await re-measurement on a
+generalizing model.)* Mechanistic evidence and per-script details: [`analysis/`](analysis/README.md).
 
-**Read-generalization campaign (closed, negative):** neither data pressure (noise, mixup
-in four variants including post-installation) nor structural smoothness (spectral norm at
-4 and 2 read points) moves `rule_HELD` off 0.000. The two arms fail for dual reasons —
-installation *requires* sharp decision boundaries between neighbouring codes (SN forbids
-them ⇒ consolidation blocked at ~0.53), while midpoint supervision is *absorbed by
-memorization* rather than interpolation once the read is sharp. On this task the transport
-mechanism is a **closed-repertoire recognizer**: it generalizes perfectly to new
-conversations of trained rules, but discrimination-grade sharpness and on-manifold
-interpolation are locally incompatible for the current read. Open exits: FiLM-style
-affine reads, larger code spacing, or embracing the recognition framing.
-The `s32_ft` control later added a third negative arm: an explicitly **interpolable
-teacher manifold** (fixed Fourier codes, write aligned at cos≈0.9) leaves held at
-0.000 too — the code geometry was never the lock. The only lever that has ever moved
-`rule_HELD` is **rule diversity** (affineL, 448 rules: held ≈ rule_acc ≈ 0.13) —
-density of rules forces interpolation where smoothness of codes cannot.
+**Read-generalization campaign (closed 2026-07-04; historical — see resolution below):**
+neither data pressure (noise, mixup in four variants including post-installation) nor
+structural smoothness (spectral norm at 4 and 2 read points) moves `rule_HELD` off 0.000.
+The two arms fail for dual reasons — installation *requires* sharp decision boundaries
+between neighbouring codes (SN forbids them ⇒ consolidation blocked at ~0.53), while
+midpoint supervision is *absorbed by memorization* rather than interpolation once the read
+is sharp. On this low-diversity task (25-448 rules) the transport mechanism is a
+**closed-repertoire recognizer**. The `s32_ft` control later added a third negative arm:
+an explicitly **interpolable teacher manifold** (fixed Fourier codes, write aligned at
+cos≈0.9) leaves held at 0.000 too — the code geometry was never the lock.
+
+**Resolution (2026-07-05):** the campaign's one positive lever — **rule diversity** —
+scaled into the full answer. Diversity flips the regime (dsv4h: first held ≈ rule_acc at
+224 rules; threshold bracketed in (25, 112]); past the flip, what caps the score is
+**capacity**, in two separable bottlenecks: *application depth* (read graft dsv4l:
+64→103× chance at fixed S) and *representation load* (dsv4m at S=128: train solves at
+0.979, held 0.688 = 88× chance). Of the old "open exits", code spacing is invalidated by
+the post-anneal code drift (the model discards the Fourier geometry and compresses into
+an anisotropic cone — spacing was never what it needed), FiLM reads were never required,
+and the recognition framing is dead (held 0.69 on never-trained rules). The remaining
+open question is the top-end train/held gap (0.98 vs 0.69).
 
 ---
 
