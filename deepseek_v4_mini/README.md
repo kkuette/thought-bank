@@ -276,29 +276,41 @@ K=1 reference, ~2× faster than the AdamW baseline (see the optimizer rows below
 | ✔ control: old task + old teacher, current stack | `..._s32_ctrl.yaml` | S=32/25 shifts, learned-emb teacher + MSE + anneal [150,350], under the full dsv4 stack (SwiGLU, RMS-match, WSD, balance 1e-4, adam_eps): **0.935 @700 and rising** (ref. 0.974@800) — **no regression**; every S=256 negative belongs to the task or the teacher, not the code |
 | ✔ control: old task + NEW teacher | `..._s32_ft.yaml` | ONE variable vs s32_ctrl: Fourier k≤8 + cosine distill. Installs identically (**0.807 @710** ↗, distill 0.09 = cos(w,teacher)≈0.9 at S=32 vs plafond cos≈0.1 at S=256) — **teacher innocented**; the S=256 wall is the task's scale. Bonus negative: held **0.000–0.005 (below chance)** — an explicitly *interpolable* teacher manifold, with the write aligned to it, still snaps: code geometry was never the read-generalization lock |
 | **🎯 mastery-gated curriculum** | `..._s256L_dsv4h.yaml` | pool held at 16 rules until CE EMA < 5.0, then DOUBLES (min 150 steps/stage); anneal at pool full + 300. Stages **accelerate**: 16→32 @392, →64 @657 (265), →128 @898 (241), →224 @1048 (dwell floor); distill cosine 0.79→**0.011** (cos≈0.99 entering the anneal [1348,1848]). Post-β=0: **rule_acc 0.18–0.25 (50× chance, ablation at chance) with rule_HELD 0.16–0.27 TRACKING** — never-trained rules applied as well as trained ones: **the program's first held ≈ rule_acc**, the law learned rather than the repertoire. Consolidation at full LR plateaus in a noisy band (CE 1.9↔2.8, spike+recovery @2200) — LR-bound; cut @~2400 to hand the GPU to dsv4i |
-| **early crutch exit + anneal-anchored decay** | `..._s256L_dsv4i.yaml` | ONE protocol vs dsv4h: anneal fires at the **mastery of 64 rules** while the curriculum keeps doubling — the remaining 160 rules must install **teacher-free** (TBPTT gradient on an organized circuit); plus EMA-gated full-pool fallback and WSD decay re-anchored to anneal end (+800). If it matches dsv4h, the teacher kick is *per-circuit* (bootstrap once, extend forever); if late rules never install, the kick is *per-rule*; **run in progress** |
+| **early crutch exit + anneal-anchored decay** | `..._s256L_dsv4i.yaml` | ONE protocol vs dsv4h: anneal fires at the **mastery of 64 rules** while the curriculum keeps doubling — the remaining 160 rules must install **teacher-free** (TBPTT gradient on an organized circuit); plus EMA-gated full-pool fallback and WSD decay re-anchored to anneal end (+800). Verdict: trajectory identical to dsv4h through 898 (same seed = controlled comparison), anneal pulled [898,1398], **pool full @1048 in 150 steps (dwell floor) under β≈0.7**; post-β=0 installation 0.083→0.28 with held tracking throughout; decay from 2198 tolerated (no erosion). Final band @2400: **rule_acc 0.22–0.28 / held 0.21–0.29** (last probe 0.271/**0.281**, ablation 0.000) — **≥ dsv4h ~1600 steps earlier**. CAVEAT (user): no rule is fully teacher-free (the late 96 saw the β tail), so this validates the **cost claim only** (teacher time need not scale with rule count), not "never-taught rules install" — that is dsv4j's blind arm. Cut @2400 for dsv4j |
+| **teacher-blind control × 4-block read** | `..._s256L_dsv4j.yaml` | protocol = dsv4i + two orthogonal questions: (1) **32 TRAIN rules excluded from blend+distill from step 0** (`teacher_blind_shifts` [4,12,…,252], probe arm `rule_BLIND`) — blind ≈ taught ⇒ the kick is per-circuit (the STRONG kill-the-crutch claim); blind at chance ⇒ per-rule; (2) read on **all 4 blocks** vs dsv4i's [0] — capacity-of-application test for the ~0.25 plateau. Registered prediction (user, pre-test): 0.25 = 1/4 = one read out of four blocks — if true the ceiling should shatter, not creep. Verdict: **KILLED @905 — stage 16 never mastered** (CE pinned at/above the ln 256 chance floor 5.52–5.62 for 900 steps, distill *rising* 0.68→0.84, no doubling; dsv4i mastered @392). First structural falsification of the diversity regime: **four injection points feeding an unorganized code poison the trunk during bootstrap** — same lesson as the teacher, organize first, extend after. Blind arm unread (never got past β=1) |
+| **read graft on organized circuit** | `..._s256L_dsv4l.yaml` | warm-restart **dsv4i@2400** (rule 0.27/held 0.28) with reads enabled on all 4 blocks; checkpoint pre-patched: `fw_o` of blocks 1–3 **zeroed** so the new reads are an exact no-op at step 0 (the read is a residual delta `h + fw_o(y−y0)`) and gradient grows them from zero — LoRA-B-style graft. Teacher OFF, full pool, fresh optimizer, 1500 steps, decay @800. Sanity at launch: **CE 1.85 @step 1** = dsv4i's final level, circuit intact. 3rd point of the blocks-proportional curve. Verdict: **THE GRAFT WORKS AND THE 0.25 CEILING FALLS** — no restart shock (CE 1.85 = dsv4i's final, then monotonic ↓ to 1.59), probes climb steadily 0.30→0.32→0.35→0.36→**rule_acc 0.404 / held up to 0.383** (program records, held above train at several probes: the graft extends the LAW, not the repertoire). Cut @800 (user cutover to dsv4m) — **still rising, decay never ran**; checkpoints to step_800 preserved for a resume. Depth-of-application WAS a binding ceiling; organize-first-extend-after is now the program's twice-validated recipe (teacher for the write, graft for the read) |
+| **diversity/capacity probe S=128** | `..._s128_dsv4m.yaml` | ONE variable vs dsv4i: n_symbols 256→128 (112 train / 15 held, Fourier codes 2× spaced, ce_thresh rescaled 5.0→4.3 to keep the 0.55-nat margin under ln 128). No graft, no blind — the S question stays clean. SECOND variable added at relaunch@121 (user): anneal_len 500→300. Interim (run in progress, ~step 2950/4000): **the ceiling was capacity — the task train-solves**: paliers 259/437/592, anneal [592,892], then post-β=0 climb 0.065→0.46→0.81→**0.979 train / 0.688 held @2800** (125×/88× chance — both program records; dsv4i band was 64-72×), CE 0.16, ablation ≈0. Held tracked train through ~0.6 then the gap REOPENED at the top (0.98 vs 0.69) — watch: top-end sharpening vs held's own ceiling. Diversity threshold: held massively alive at 112 rules ⇒ threshold ≤112, bracketed in (25,112]. **Post-anneal code drift** (write_code_probe step 1200 vs 2600, informational distill 0.22→0.59 while acc climbed): the write LEAVES the Fourier circle (circular ridge decode 1.0→9.2 symbols ≈ chance) and compresses into an anisotropic cone (inter-cos 0.19→0.85, intra 0.997, **1-NN ident 0.978**) — teacher = scaffolding, dismantled once β=0; distill↑ at β=0 is HEALTH (exploration), the same signal at β=1 was dsv4j's pathology. Probe lesson: circular-ridge probes measure the TEACHER's geometry — use 1-NN after any anneal |
+| **family transfer, teacher-free** | `..._s128aff_dsv4n.yaml` | PREPARED (awaiting dsv4m's final.pt): warm-restart the dsv4m weights and train a NEW family y=(a·x+s) mod 128, a∈{3,5} (`affine_units` knob; 256 rules, 32 held grid-interleaved on the (a,s) torus) with **no teacher at all** — same vocab, same key tokens, only the law changes. Baseline: affine from scratch WITH teacher = 0.13 (affineL v2). Installs ≫0.13 ⇒ the bootstrap transfers across families (teacher = one-time cost per MODEL — the headline claim); stalls at the CE floor ⇒ the kick is per-family. Capacity question (user): after the run, re-probe the SHIFT family offline on the final ckpt — catastrophic forgetting at family scale. First live use of `wsd_decay_on_plateau` (ReduceLROnPlateau twin: decay fires when the post-anneal CE EMA stalls ≥300 steps, replacing the +800 clock — the protocol's last clock becomes mastery-gated) |
 
 **Headline:** memory *policy* — retention (rehearsal past eviction) AND replacement (dropping
 a superseded rule) — is task-adaptive and **emerges end-to-end**; no gate/LRU/allocation
-mechanism was needed. The write generalizes (circular code manifold, held shifts placed
-correctly ON-manifold); the **read** is the generalization blocker and the rehearsal-precision
-bottleneck. Mechanistic evidence and per-script details: [`analysis/`](analysis/README.md).
+mechanism was needed. *(2026-07-04 framing, measured on the memorizing regime: "the read is
+the generalization blocker" is superseded — see the diversity/capacity arc in the table
+above. The read applies never-trained rules at 0.69 once diversity unlocks the law and
+capacity stops binding; the memory-policy findings themselves await re-measurement on a
+generalizing model.)* Mechanistic evidence and per-script details: [`analysis/`](analysis/README.md).
 
-**Read-generalization campaign (closed, negative):** neither data pressure (noise, mixup
-in four variants including post-installation) nor structural smoothness (spectral norm at
-4 and 2 read points) moves `rule_HELD` off 0.000. The two arms fail for dual reasons —
-installation *requires* sharp decision boundaries between neighbouring codes (SN forbids
-them ⇒ consolidation blocked at ~0.53), while midpoint supervision is *absorbed by
-memorization* rather than interpolation once the read is sharp. On this task the transport
-mechanism is a **closed-repertoire recognizer**: it generalizes perfectly to new
-conversations of trained rules, but discrimination-grade sharpness and on-manifold
-interpolation are locally incompatible for the current read. Open exits: FiLM-style
-affine reads, larger code spacing, or embracing the recognition framing.
-The `s32_ft` control later added a third negative arm: an explicitly **interpolable
-teacher manifold** (fixed Fourier codes, write aligned at cos≈0.9) leaves held at
-0.000 too — the code geometry was never the lock. The only lever that has ever moved
-`rule_HELD` is **rule diversity** (affineL, 448 rules: held ≈ rule_acc ≈ 0.13) —
-density of rules forces interpolation where smoothness of codes cannot.
+**Read-generalization campaign (closed 2026-07-04; historical — see resolution below):**
+neither data pressure (noise, mixup in four variants including post-installation) nor
+structural smoothness (spectral norm at 4 and 2 read points) moves `rule_HELD` off 0.000.
+The two arms fail for dual reasons — installation *requires* sharp decision boundaries
+between neighbouring codes (SN forbids them ⇒ consolidation blocked at ~0.53), while
+midpoint supervision is *absorbed by memorization* rather than interpolation once the read
+is sharp. On this low-diversity task (25-448 rules) the transport mechanism is a
+**closed-repertoire recognizer**. The `s32_ft` control later added a third negative arm:
+an explicitly **interpolable teacher manifold** (fixed Fourier codes, write aligned at
+cos≈0.9) leaves held at 0.000 too — the code geometry was never the lock.
+
+**Resolution (2026-07-05):** the campaign's one positive lever — **rule diversity** —
+scaled into the full answer. Diversity flips the regime (dsv4h: first held ≈ rule_acc at
+224 rules; threshold bracketed in (25, 112]); past the flip, what caps the score is
+**capacity**, in two separable bottlenecks: *application depth* (read graft dsv4l:
+64→103× chance at fixed S) and *representation load* (dsv4m at S=128: train solves at
+0.979, held 0.688 = 88× chance). Of the old "open exits", code spacing is invalidated by
+the post-anneal code drift (the model discards the Fourier geometry and compresses into
+an anisotropic cone — spacing was never what it needed), FiLM reads were never required,
+and the recognition framing is dead (held 0.69 on never-trained rules). The remaining
+open question is the top-end train/held gap (0.98 vs 0.69).
 
 ---
 

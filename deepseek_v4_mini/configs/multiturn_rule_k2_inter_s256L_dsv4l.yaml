@@ -1,0 +1,129 @@
+# dsv4l — READ GRAFT: warm-restart dsv4i@2400, bank added to ALL 4 blocks.
+#
+# dsv4j (4-block read FROM SCRATCH) stalled at stage 16 with CE ABOVE the chance
+# floor: four injection points feeding an unorganized code poison the trunk
+# during bootstrap. Same lesson as the teacher: ORGANIZE FIRST, EXTEND AFTER.
+# Here the organized dsv4i circuit (rule_acc 0.27/held 0.28 @2400, single read
+# at block 0) is resumed with reads enabled on all 4 blocks; the checkpoint is
+# pre-patched (fw_o of blocks 1-3 zeroed) so the new reads are an EXACT no-op
+# at step 0 — the read is a residual delta h + fw_o(y-y0) — and gradient grows
+# them from zero (LoRA-B-style zero-init graft). Teacher OFF, full 224-rule
+# pool, fresh optimizer, decay at 800.
+#
+# Read (3rd point of the blocks-proportional curve, prediction registered):
+#   rule_acc/held rise above the ~0.25-0.28 plateau -> depth-of-application was
+#   the ceiling; flat -> ceiling is elsewhere (format/bank); collapse -> the
+#   graft destabilizes an organized circuit even from zero.
+#
+vocab_size: 264
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+n_hc: 2
+sinkhorn_iters: 20
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+mem_dim: 32
+max_mem: 16
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+balance_loss_weight: 0.0001
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+mem_code_mixup_start: 500
+mem_read_swiglu: true
+mem_write_gate: false
+mem_teacher_forcing: false
+mem_teacher_fourier: true
+mem_teacher_fourier_kmax: 8
+mem_teacher_distill_cosine: true
+mem_teacher_anneal_start: 2600
+mem_teacher_anneal_end: 3100
+mem_teacher_anneal_len: 500
+mem_teacher_distill_weight: 2.0
+training:
+  device: auto
+  seed: 42
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: wsd
+  wsd_decay_start: 800
+  wsd_decay_at_anneal_end: false
+  wsd_decay_offset: 800
+  teacher_lr: 3e-4
+  muon_lr: 0.00375
+  weight_decay: 0.1
+  muon_rms_match: true
+  adam_eps: 1.0e-20
+  steps: 1500
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 10
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_s256L_dsv4l
+  run_name: dsv4mini_multiturn_rule_k2_inter_s256L_dsv4l
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s256L_dsv4l/metrics.jsonl
+  init_from: checkpoints/dsv4i_step2400_readgraft.pt
+data:
+  task: multiturn_rule
+  n_symbols: 256
+  n_examples: 6
+  turns_per_conv: 8
+  n_contexts: 2
+  heldout_shifts:
+  - 8
+  - 16
+  - 24
+  - 32
+  - 40
+  - 48
+  - 56
+  - 64
+  - 72
+  - 80
+  - 88
+  - 96
+  - 104
+  - 112
+  - 120
+  - 128
+  - 136
+  - 144
+  - 152
+  - 160
+  - 168
+  - 176
+  - 184
+  - 192
+  - 200
+  - 208
+  - 216
+  - 224
+  - 232
+  - 240
+  - 248
+  batch_size: 64
+mem_read_spectral_norm: false
+mem_read_layers:
+- 0
+- 1
+- 2
+- 3

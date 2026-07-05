@@ -595,7 +595,12 @@ def _rule_space(d: dict):
     S   = int(d.get("n_symbols", 32))
     fam = str(d.get("rule_family", "shift"))
     if fam == "affine":
-        units   = [u for u in range(1, S) if math.gcd(u, S) == 1]
+        _cu = d.get("affine_units")          # optional unit subset (family-transfer
+        if _cu:                              # cells: keep the rule count tractable
+            units = [int(u) for u in _cu]
+            assert all(math.gcd(u, S) == 1 for u in units), "affine_units must be coprime to S"
+        else:
+            units = [u for u in range(1, S) if math.gcd(u, S) == 1]
         n_rules = len(units) * S
         mod     = int(d.get("heldout_rule_mod", 8))
         train_pool, held_pool = [], []
@@ -1685,6 +1690,13 @@ def synthetic_rule_probe(
         _, acc_held, _, _ = run(zero_content=False, ablate=False,
                                 convs=_make_convs(held_pool))
         out["rule_acc_held"] = acc_held
+    blind_pool = sorted(int(v) for v in (d.get("teacher_blind_shifts") or []))
+    if blind_pool:
+        # intra-run control: TRAIN rules the teacher never touched (no blend,
+        # no distill) — installs like the taught ones ⇔ the kick is per-circuit
+        _, acc_blind, _, _ = run(zero_content=False, ablate=False,
+                                 convs=_make_convs(blind_pool))
+        out["rule_acc_blind"] = acc_blind
 
     if was_training:
         model.train()
@@ -1808,6 +1820,17 @@ def main() -> None:
     # The configured wsd_decay_start stays as the fallback if no trigger fires.
     wsd_decay_at_anneal_end = bool(train_cfg.get("wsd_decay_at_anneal_end", False))
     wsd_decay_offset        = int(train_cfg.get("wsd_decay_offset", 0))
+    # ReduceLROnPlateau-style trigger (the last clock in the protocol becomes
+    # mastery-gated, like the curriculum and the anneal): once β=0, hold peak LR
+    # while the post-anneal installation still improves the CE EMA; when the EMA
+    # stalls for `patience` steps, pull the decay to NOW. Patience must survive
+    # a pre-crack stall — late staircases look like plateaus right before they
+    # crack. Combines with the anneal-end re-anchor: whichever fires first.
+    wsd_decay_on_plateau = bool(train_cfg.get("wsd_decay_on_plateau", False))
+    wsd_plateau_delta    = float(train_cfg.get("wsd_plateau_delta", 0.05))
+    wsd_plateau_patience = int(train_cfg.get("wsd_plateau_patience", 300))
+    pl_ema = pl_best = None
+    pl_best_step = 0
 
     def _lr_fn(step: int) -> float:
         if step < warmup_steps:
@@ -1919,6 +1942,21 @@ def main() -> None:
         else:
             teacher_lr  = float(train_cfg.get("teacher_lr", 3e-4))
             teacher_opt = optim.AdamW(teacher_emb.parameters(), lr=teacher_lr, weight_decay=wd)
+    # Teacher-blind control rules: trained normally (CE, curriculum) but NEVER
+    # touched by the blend or the distill — the intra-run arm of the
+    # kill-the-crutch test. If they install like their taught neighbours, the
+    # teacher kick is per-circuit (one bootstrap organizes the read for every
+    # rule); if they stay at chance, the kick is per-rule.
+    tf_blind_lut = None
+    if tf_on:
+        _blind = sorted(int(v) for v in (data_cfg.get("teacher_blind_shifts") or []))
+        if _blind:
+            _held_b = set(int(v) for v in (data_cfg.get("heldout_shifts") or []))
+            assert not (_held_b & set(_blind)), "teacher_blind_shifts must be TRAIN rules"
+            tf_blind_lut = torch.zeros(S_rule, dtype=torch.bool, device=device)
+            tf_blind_lut[torch.tensor(_blind, device=device)] = True
+            tqdm.write(f"Teacher-blind rules: {len(_blind)} train rules excluded from "
+                       f"blend+distill (intra-run per-circuit control)")
     # Code-space mixup: EMA dictionary of the presentation code the read actually
     # consumes (post teacher-blend), one slot per shift. Midpoints of trained
     # neighbours are injected with the middle rule's labels (see config).
@@ -2043,13 +2081,22 @@ def main() -> None:
                 beta   = _beta_at(step)
                 w0     = mem_bank[:, -1]
                 t_s    = teacher_emb(rule_s).to(mem_bank.dtype)
+                taught = None if tf_blind_lut is None else ~tf_blind_lut[rule_s]
                 if bool(getattr(model_cfg, "mem_teacher_distill_cosine", False)):
                     # direction-only distill: shrinking ‖w0‖ pays nothing
-                    distill = (1.0 - F.cosine_similarity(
-                        w0.float(), t_s.detach().float(), dim=1)).mean()
+                    per = 1.0 - F.cosine_similarity(
+                        w0.float(), t_s.detach().float(), dim=1)
                 else:
-                    distill = F.mse_loss(w0.float(), t_s.detach().float())
-                code   = (beta * t_s + (1.0 - beta) * w0).unsqueeze(1)
+                    per = ((w0.float() - t_s.detach().float()) ** 2).mean(dim=1)
+                if taught is None:
+                    distill = per.mean()
+                else:
+                    # blind lanes: no distill pull, no blend — pure TBPTT gradient
+                    distill = (per * taught).sum() / taught.sum().clamp_min(1)
+                code   = beta * t_s + (1.0 - beta) * w0
+                if taught is not None:
+                    code = torch.where(taught.unsqueeze(1), code, w0)
+                code   = code.unsqueeze(1)
                 mem_bank = torch.cat([mem_bank[:, :-1], code], dim=1)
                 if mix_ema is not None:
                     # Track the code the read consumes at presentation (post-blend),
@@ -2183,6 +2230,17 @@ def main() -> None:
                             wsd_decay_start = tf_a1 + wsd_decay_offset
                             tqdm.write(f"[lr] WSD decay re-anchored to anneal end: "
                                        f"start @ {wsd_decay_start}")
+        if (wsd_decay_on_plateau and lr_schedule == "wsd"
+                and step < wsd_decay_start and ((not tf_on) or step >= tf_a1)):
+            ce_now = float(logs["ce"])
+            pl_ema = ce_now if pl_ema is None else 0.98 * pl_ema + 0.02 * ce_now
+            if pl_best is None or pl_best - pl_ema >= wsd_plateau_delta:
+                pl_best, pl_best_step = pl_ema, step
+            elif step - pl_best_step >= wsd_plateau_patience:
+                wsd_decay_start = step
+                tqdm.write(f"[lr] CE EMA plateau ({pl_ema:.3f}; no −{wsd_plateau_delta} "
+                           f"in {wsd_plateau_patience} steps since best "
+                           f"{pl_best:.3f}@{pl_best_step}): WSD decay starts NOW @ {step}")
         if tf_on and tf_trigger == "ce_below" and not tf_fired and step < tf_a0:
             ce_now = float(logs["ce"])
             tf_ce_ema = ce_now if tf_ce_ema is None else 0.98 * tf_ce_ema + 0.02 * ce_now
@@ -2226,6 +2284,8 @@ def main() -> None:
                        if "rule_acc" in mp else "")
                 acc += (f"  rule_HELD={mp['rule_acc_held']:.3f}"
                         if "rule_acc_held" in mp else "")
+                acc += (f"  rule_BLIND={mp['rule_acc_blind']:.3f}"
+                        if "rule_acc_blind" in mp else "")
                 acc += (f"  rule_LATE={mp['rule_acc_late']:.3f}"
                         if "rule_acc_late" in mp else "")
                 acc += (f"  pre/post={mp['rule_acc_pre']:.3f}/{mp['rule_acc_post']:.3f}"
