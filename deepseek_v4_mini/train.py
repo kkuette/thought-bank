@@ -595,7 +595,12 @@ def _rule_space(d: dict):
     S   = int(d.get("n_symbols", 32))
     fam = str(d.get("rule_family", "shift"))
     if fam == "affine":
-        units   = [u for u in range(1, S) if math.gcd(u, S) == 1]
+        _cu = d.get("affine_units")          # optional unit subset (family-transfer
+        if _cu:                              # cells: keep the rule count tractable
+            units = [int(u) for u in _cu]
+            assert all(math.gcd(u, S) == 1 for u in units), "affine_units must be coprime to S"
+        else:
+            units = [u for u in range(1, S) if math.gcd(u, S) == 1]
         n_rules = len(units) * S
         mod     = int(d.get("heldout_rule_mod", 8))
         train_pool, held_pool = [], []
@@ -1815,6 +1820,17 @@ def main() -> None:
     # The configured wsd_decay_start stays as the fallback if no trigger fires.
     wsd_decay_at_anneal_end = bool(train_cfg.get("wsd_decay_at_anneal_end", False))
     wsd_decay_offset        = int(train_cfg.get("wsd_decay_offset", 0))
+    # ReduceLROnPlateau-style trigger (the last clock in the protocol becomes
+    # mastery-gated, like the curriculum and the anneal): once β=0, hold peak LR
+    # while the post-anneal installation still improves the CE EMA; when the EMA
+    # stalls for `patience` steps, pull the decay to NOW. Patience must survive
+    # a pre-crack stall — late staircases look like plateaus right before they
+    # crack. Combines with the anneal-end re-anchor: whichever fires first.
+    wsd_decay_on_plateau = bool(train_cfg.get("wsd_decay_on_plateau", False))
+    wsd_plateau_delta    = float(train_cfg.get("wsd_plateau_delta", 0.05))
+    wsd_plateau_patience = int(train_cfg.get("wsd_plateau_patience", 300))
+    pl_ema = pl_best = None
+    pl_best_step = 0
 
     def _lr_fn(step: int) -> float:
         if step < warmup_steps:
@@ -2214,6 +2230,17 @@ def main() -> None:
                             wsd_decay_start = tf_a1 + wsd_decay_offset
                             tqdm.write(f"[lr] WSD decay re-anchored to anneal end: "
                                        f"start @ {wsd_decay_start}")
+        if (wsd_decay_on_plateau and lr_schedule == "wsd"
+                and step < wsd_decay_start and ((not tf_on) or step >= tf_a1)):
+            ce_now = float(logs["ce"])
+            pl_ema = ce_now if pl_ema is None else 0.98 * pl_ema + 0.02 * ce_now
+            if pl_best is None or pl_best - pl_ema >= wsd_plateau_delta:
+                pl_best, pl_best_step = pl_ema, step
+            elif step - pl_best_step >= wsd_plateau_patience:
+                wsd_decay_start = step
+                tqdm.write(f"[lr] CE EMA plateau ({pl_ema:.3f}; no −{wsd_plateau_delta} "
+                           f"in {wsd_plateau_patience} steps since best "
+                           f"{pl_best:.3f}@{pl_best_step}): WSD decay starts NOW @ {step}")
         if tf_on and tf_trigger == "ce_below" and not tf_fired and step < tf_a0:
             ce_now = float(logs["ce"])
             tf_ce_ema = ce_now if tf_ce_ema is None else 0.98 * tf_ce_ema + 0.02 * ce_now

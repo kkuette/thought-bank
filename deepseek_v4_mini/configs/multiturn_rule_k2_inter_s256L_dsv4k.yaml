@@ -1,0 +1,161 @@
+# dsv4k — TEACHER-BLIND CONTROL × [0,2] READ (fallback for dsv4j; protocol = dsv4i).
+#
+# Two questions, each with its own control:
+#
+# 1. KILL THE CRUTCH, the STRONG claim (intra-run control). dsv4i's early anneal
+#    did NOT validate "a never-taught rule installs by TBPTT alone": the full
+#    pool landed at step 1048 under β≈0.7, so even the late rules got a teacher
+#    tail (user's objection). Here 32 TRAIN rules (teacher_blind_shifts, every
+#    8th offset by 4 — never colliding with the held grid) are excluded from the
+#    blend AND the distill from step 0. They train on CE like any other rule.
+#    Verdict = rule_BLIND at the probes: blind ≈ taught → the kick is
+#    per-circuit (bootstrap once, extend forever); blind at chance → per-rule.
+#
+# 2. CEILING (inter-run variable vs dsv4i): read on ALL 4 blocks instead of
+#    block 0 only. Structure was ⊥ generalization in the memorizing regime, but
+#    in the diversity regime this is a CAPACITY-of-application hypothesis for
+#    the ~0.25 plateau: the rule re-modulates the computation at every depth.
+#    Read: rule_acc AND held rise together vs dsv4i → the read was the
+#    bottleneck; unchanged → ceiling is elsewhere (format/bank/LR).
+#
+# Continual-learning benchmark: learn a NOVEL rule at turn 0, APPLY it later.
+#
+# Each conversation draws a fresh shift rule y = (x + s) mod S (random per conv, so
+# absent from the frozen weights). Turn 0 shows m example pairs; later turns query
+# UNSEEN symbols that must be answered by APPLYING the inferred rule.
+#
+#   turn 0 : [x0, y0, x1, y1, ...]   in-window ICL (loss on applied x-pos j>=1)
+#   turn t : [x_q] -> (x_q + s) mod S   x_q UNSEEN; window holds only x_q
+#
+# Unseen queries are the discriminator: a lookup memory can't answer them, only a
+# forward that inferred+applies the rule can. The rule must cross the turn boundary
+# through the fast-weight bank. rule_acc (accuracy on unseen queries) is the verdict:
+# ->1 if the bank carries an APPLICABLE rule, ->1/S (chance) if not.
+#
+# Read = fast weights: each bank slot parametrises a low-rank MLP layer (A_i [r,d],
+# B_i [d,r]); the token stream is passed through the stack of them (slot -> linear ->
+# GELU -> dropout -> next slot). The bank is seeded with random-uniform[0,1] slots.
+#
+# python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule.yaml
+
+# ── Model ────────────────────────────────────────────────────────────────────────
+vocab_size: 264              # >= 3 + n_symbols(256) + K(2) keys
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+
+n_hc: 2
+sinkhorn_iters: 20
+
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+
+# ── Fast-weight thought bank ──────────────────────────────────────────────────────
+mem_dim: 32                  # thought-vector / fast-weight code size
+max_mem: 16                  # FIFO cap (long format)
+mem_seed_slots: 4            # random-uniform[0,1] slots seeding a fresh bank
+mem_read_rank: 16            # bottleneck rank of each per-slot fast-weight layer
+mem_read_dropout: 0.0        # dropout inside the fast-weight MLP layers
+
+balance_loss_weight: 1.0e-4    # DSv4 weight (was 1e-3): the balance term weighed ~0.16 vs CE moves of ~0.7 — auxiliary pressure eased for consolidation
+mem_write_diversity: 0.0     # off during teacher-forced bootstrap (matches the proof)
+mem_code_mixup_p: 0.0         # OFF: decouple — mixup stalls train installation (~0.5 band) with or without SN
+mem_code_mixup_start: 500
+
+# ── Write gate + teacher-forced bootstrap ─────────────────────────────────────
+# The read applies any fixed code (read_isolation_emb) and the write can encode s,
+# but joint training sticks at the "ignore-bank" fixed point. Teacher-forcing the
+# bank (clean emb[s] code correlated with the rule id) + distilling the written slot
+# toward it, then annealing β→0, breaks it: rule transport 0.03→~0.97 in the proof.
+mem_read_swiglu: true          # gated read (half-FiLM): silu(A_g·y)⊙(A_v·y), clamped ±8 (DSv4 SwiGLU clamping)
+mem_write_gate: false              # ungated write (gate attenuates the code; off = cleaner)
+mem_teacher_forcing: true
+mem_teacher_fourier: true      # FIXED Fourier codes (anti-collapse pressure via distill)
+mem_teacher_fourier_kmax: 8    # LOW FREQUENCIES only, cycled to fill mem_dim: full spectrum (k≤16) asks the write head for high-freq trig of s and never engaged (dsv4f); k≤8 keeps the circle geometry + interpolation with a smooth, cheap s→code map
+mem_teacher_distill_cosine: true   # dsv4f loophole fix: MSE vs zero-mean fixed targets is minimized by shrinking ‖w0‖→0 (dsv4f@1000: RMS(w) 0.674, cos(w,target) −0.004, distill 1.46 = the constant-writer value exactly). Cosine pays only for alignment.
+mem_teacher_anneal_start: 2600    # fallback ONLY (pool stalled below full): late window so a stall verdict is readable before any anneal confound
+mem_teacher_anneal_end: 3100
+# no ce_below trigger: at stage 16 the CE gate would anneal the teacher away with a
+# near-empty pool; the anneal is pulled by the CURRICULUM instead (pool full + 300)
+mem_teacher_anneal_len: 500
+mem_teacher_distill_weight: 2.0    # (1−cos)(w0, teacher[s]) weight, scaled by β
+
+# ── Training (stable recipe: halved LR) ──────────────────────────────────────────
+training:
+  device: auto
+  seed: 42
+  lr: 3e-4                      # scratchpad recipe (all-AdamW diagnostic)
+  use_muon: true                # validated recipe (K=1: 0.974@800)
+  lr_schedule: wsd             # DSv4: hold peak through search+installation, decay only at the end
+  wsd_decay_start: 3000        # FALLBACK only — re-anchored to anneal end + offset when the trigger fires
+  wsd_decay_at_anneal_end: true
+  wsd_decay_offset: 800        # teacher-free installation of the late stages runs at full LR;
+                               # dsv4h precedent: ~800 steps of post-anneal consolidation before decay
+  teacher_lr: 3e-4              # teacher AdamW LR (matches the scratchpad proof)
+  muon_lr: 0.00375              # RMS-match ON: effective update RMS = 0.2*lr = 7.5e-4 on EVERY matrix — same validated effective LR on the backbone, ~8x boost on the fw hypernets (previously RMS ~0.1 there)
+  weight_decay: 0.1
+  muon_rms_match: true          # DSv4/Kimi update-RMS convention (see muon_lr)
+  adam_eps: 1.0e-20             # DSv4 AdamW epsilon
+  steps: 4000                   # stage sequence of unknown length + anneal + consolidation
+  warmup_steps: 0               # scratchpad has none; warmup desynced the anneal from model maturity
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  # Full-conversation TBPTT: 1 establish turn + 8 answer turns = 9 turn-slots.
+  # The window flushes at min(mem_bptt_window, grad_accum), so BOTH must be >= 9
+  # for the turn-0 write (which encodes the rule) to receive gradient from every
+  # answer turn. One optimiser step = one full conversation (batch_size lanes).
+  mem_bptt_window: 10          # K(2) presentation turns + 8 answer turns
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100            # checkpoint trail: geometry at the held BUMP vs collapsed end
+  save_dir: checkpoints/multiturn_rule_k2_inter_s256L_dsv4k
+  run_name: dsv4mini_multiturn_rule_k2_inter_s256L_dsv4k
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s256L_dsv4k/metrics.jsonl
+
+# ── Data ─────────────────────────────────────────────────────────────────────────
+data:
+  task: multiturn_rule
+  n_symbols: 256              # DIVERSITY pivot: 255 shift rules (~10x the 25-rule repertoire, ~610 hypernet params/rule) with NO modular multiplication — each rule still inferable from one pair; the affine wall was computational (CE frozen at ln32), not informational
+  n_examples: 6               # example pairs shown at turn 0
+  turns_per_conv: 8           # answer turns, cycling over contexts (4 queries per rule)
+  n_contexts: 2               # TWO rules per conversation, each behind a key token
+  heldout_shifts: [8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248]   # every 8th: 31 held / 224 trained, trained neighbours at d=1
+  # Intra-run kill-the-crutch control: TRAIN rules the teacher never touches
+  # (no blend, no distill, from step 0) — every 8th offset by 4, max distance
+  # from the held grid, taught neighbours at d=1. Probe arm: rule_BLIND.
+  teacher_blind_shifts: [4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 204, 212, 220, 228, 236, 244, 252]
+  batch_size: 64
+  # Mastery-gated diversity curriculum: hold 16 rules until the train-CE EMA proves
+  # exploitation (CE < 5.0 = 0.55 nats under the ln 256 chance floor), then DOUBLE
+  # (16→32→64→128→224), min 150 steps per stage. Pool full → anneal pulled in
+  # (curriculum_pool_full_n / curriculum_anneal_margin, see train.py mastery block).
+  curriculum_rules_start: 16
+  curriculum_mode: mastery
+  curriculum_ce_thresh: 5.0
+  curriculum_dwell_min: 150
+  curriculum_pool_full_n: 224   # 255 shifts − 31 held
+  curriculum_anneal_at_n: 64    # EARLY EXIT: anneal fires at the mastery of 64 rules
+                                # (the 64->128 doubling); stages keep going teacher-free
+  # no curriculum_anneal_margin: EMA-gated full-pool coupling stays as fallback
+
+# STRUCTURAL smoothness (arm 3): cap the read Lipschitz constant wrt the code
+mem_read_spectral_norm: false  # no SN, LONG format
+mem_read_layers: [0, 2]  # the GRADED structural step (fallback cell if dsv4j stalls at
+                         # stage 16): the only multi-read layout validated to install
+                         # (read02L 0.99@1100, old regime). Under the blocks-proportional
+                         # ceiling hypothesis this predicts ~0.5 — a discriminating midpoint
