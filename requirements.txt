@@ -15,8 +15,3 @@ tensorboard>=2.15.0          # torch.utils.tensorboard backend (imported by trai
 numpy>=1.24.0
 pyyaml>=6.0
 tqdm>=4.66.0
-
-# ── Legacy diffusion prototype (diffusion_thought_tensor/) — not maintained ──
-# The earlier prototype additionally needed: diffusers, pytorch-lightning,
-# x-transformers, hydra-core, omegaconf, wandb, trl, scikit-learn, scipy,
-# matplotlib, seaborn, plotly. Install those manually only if running that code.
