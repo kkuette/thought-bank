@@ -1,0 +1,98 @@
+# dsv4n2 — FAMILY TRANSFER take 2: FULL POOL from step 0 (user diagnosis).
+#
+# dsv4n (killed @~850) reproduced the ignore-bank fixed point WITHOUT teacher:
+# in-window CE fine (4.28 < ln128), transport dead (gap 0, held 0.000) — and
+# the shift circuit was dismantled within 100 steps (forgetting probe). Root
+# cause (user): the 16-rule curriculum stage is the SCHOOL OF MEMORIZATION —
+# on an already-organized model, 16 affine rules solve in-window without the
+# bank, so full-LR gradient learns "ignore the bank", destroys the fw circuit,
+# and by the time diversity arrives the fixed point is re-installed. The
+# curriculum is a bootstrap remedy and a warm-restart poison.
+# Fix: 224 affine rules from step 0 — diversity pressure makes the bank the
+# only path to low loss from the first gradient. Plateau patience 500.
+#
+vocab_size: 136
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+n_hc: 2
+sinkhorn_iters: 20
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+mem_dim: 32
+max_mem: 16
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+balance_loss_weight: 0.0001
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+mem_code_mixup_start: 500
+mem_read_swiglu: true
+mem_write_gate: false
+mem_teacher_forcing: false
+mem_teacher_fourier: true
+mem_teacher_fourier_kmax: 8
+mem_teacher_distill_cosine: true
+mem_teacher_anneal_start: 2600
+mem_teacher_anneal_end: 3100
+mem_teacher_anneal_len: 300
+mem_teacher_distill_weight: 2.0
+training:
+  device: auto
+  seed: 42
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: wsd
+  wsd_decay_start: 2000
+  wsd_decay_at_anneal_end: false
+  wsd_decay_offset: 800
+  teacher_lr: 3e-4
+  muon_lr: 0.00375
+  weight_decay: 0.1
+  muon_rms_match: true
+  adam_eps: 1.0e-20
+  steps: 2500
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 10
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_s128aff_dsv4n2
+  run_name: dsv4mini_multiturn_rule_k2_inter_s128aff_dsv4n2
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s128aff_dsv4n2/metrics.jsonl
+  init_from: checkpoints/multiturn_rule_k2_inter_s128_dsv4m/final.pt
+  wsd_decay_on_plateau: true
+  wsd_plateau_delta: 0.05
+  wsd_plateau_patience: 500
+data:
+  task: multiturn_rule
+  n_symbols: 128
+  n_examples: 6
+  turns_per_conv: 8
+  n_contexts: 2
+  batch_size: 64
+  rule_family: affine
+  affine_units:
+  - 3
+  - 5
+  heldout_rule_mod: 8
+mem_read_spectral_norm: false
+mem_read_layers:
+- 0
