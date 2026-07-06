@@ -1,0 +1,113 @@
+# dsv4v — STRUCTURE-RANDOMIZED cell (re-audit arc, gate OFF base).
+#
+# ONE variable vs dsv4s: the conversation STRUCTURE distribution. Each
+# conversation draws its turn count from turns_range [8,32], its KEY count
+# from n_contexts_range [2,5] (ceiling = mem_dim/6, user margin; key tokens
+# are a random subset of the 5 available so every token sees every role),
+# and re-presents a random key with a fresh rule every 4-12 query turns
+# (switch_phase_min/max) — period, position and switch COUNT all vary.
+# One distribution = every test at once: routing K2..K5, concurrent capacity,
+# retention THROUGH eviction (5 keys + 32 turns > 16 slots), replacement.
+# Motivation (user, 2026-07-05): the horizon probe showed an exact FIFO cliff
+# at turn 16 in both gate arms, and the zero-shot switch probe on dsv4m gave
+# STICK=1.0 (total perseveration, dirty-bank write unreadable) — memory
+# POLICY is a trained behaviour, so it must be TRAINED into the distribution
+# (vision random-crop twin).
+#
+# Mechanics: variable segment count per conversation -> the optimiser steps
+# at conversation end (generator publishes n_seg via cfg["_conv"]); grad_accum
+# is a fallback denominator only. mem_bptt_window 44 >= max segments
+# (5 presentations + 32 turns + 7 switches) = full-conversation TBPTT.
+# In-run probes keep the fixed K=2 8-turn no-switch format (comparable to
+# dsv4s: post-beta=0 conversion 0.46@1200, held tracking). Switch/retention
+# policy is measured by offline probes on checkpoints (switch_probe_k2).
+vocab_size: 136
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+n_hc: 2
+sinkhorn_iters: 20
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+mem_dim: 32
+max_mem: 16
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+balance_loss_weight: 0.0001
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+mem_code_mixup_start: 500
+mem_read_swiglu: true
+mem_write_gate: false
+mem_teacher_forcing: true
+mem_teacher_fourier: true
+mem_teacher_fourier_kmax: 8
+mem_teacher_distill_cosine: true
+mem_teacher_anneal_start: 2600
+mem_teacher_anneal_end: 3100
+mem_teacher_anneal_len: 300
+mem_teacher_distill_weight: 2.0
+training:
+  device: auto
+  seed: 42
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: wsd
+  wsd_decay_start: 3000
+  wsd_decay_at_anneal_end: true
+  wsd_decay_offset: 800
+  teacher_lr: 3e-4
+  muon_lr: 0.00375
+  weight_decay: 0.1
+  muon_rms_match: true
+  adam_eps: 1.0e-20
+  steps: 4000
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 44
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_s128_dsv4v
+  run_name: dsv4mini_multiturn_rule_k2_inter_s128_dsv4v
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s128_dsv4v/metrics.jsonl
+data:
+  task: multiturn_rule
+  n_symbols: 128
+  n_examples: 6
+  turns_per_conv: 8      # probe-side format (probes stay fixed 8-turn, no switch)
+  turns_range: [8, 32]
+  switch_phase_min: 4
+  switch_phase_max: 12
+  n_contexts: 2          # probe-side K (probes stay fixed K=2)
+  n_contexts_range: [2, 5]
+  rule_family: affine
+  affine_units:
+  - 1
+  heldout_rule_mod: 8
+  batch_size: 64
+  curriculum_rules_start: 16
+  curriculum_mode: mastery
+  curriculum_ce_thresh: 4.3
+  curriculum_dwell_min: 150
+  curriculum_pool_full_n: 112
+  curriculum_anneal_at_n: 64
+mem_read_spectral_norm: false
+mem_read_layers:
+- 0

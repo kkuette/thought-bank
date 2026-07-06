@@ -708,14 +708,43 @@ def _build_synthetic_rule(cfg_dict: dict):
     # mid-conversation (bank carried, no reset) and query s2 for the remaining
     # turns. Tests retention POLICY: the model must drop s1, not just retain.
     sw     = int(d.get("switch_at", 0))
+    # Structure randomization (free structural augmentation): per-conversation
+    # turn count drawn from turns_range, plus PERIODIC mid-conversation
+    # switches — a random key is RE-presented with a fresh rule every
+    # switch_phase_min..max query turns (bank carried, no reset). The fixed
+    # format (8 turns, no switch) lets a FIFO cliff install as a BEHAVIOUR
+    # (horizon probe: exact cliff at turn 16 in both gate arms); randomizing
+    # horizon and switch position makes rehearsal/forgetting the only viable
+    # policy (vision random-crop twin). All B lanes share one structure per
+    # conversation (turn alignment); rules/examples stay per-lane. Segment
+    # count varies per conversation: it is published in
+    # cfg_dict["_conv"]["n_seg"] and the training loop steps the optimiser at
+    # conversation end instead of a fixed grad_accum.
+    t_rng  = d.get("turns_range")
+    t_lo, t_hi = (int(t_rng[0]), int(t_rng[1])) if t_rng else (turns, turns)
+    ph_lo  = int(d.get("switch_phase_min", 0))   # 0 = no mid-conversation switches
+    ph_hi  = int(d.get("switch_phase_max", ph_lo))
+    sw_max = int(d.get("switch_max", 0))         # 0 = unlimited switches per conv
+    # n_contexts_range: per-conversation KEY-COUNT draw K_c in [lo, hi] — the
+    # concurrent-rule axis of the augmentation (routing K2..Kn, capacity,
+    # retention through eviction, all in one distribution). Ceiling heuristic
+    # (user): K_hi = mem_dim / x with x unknown; margin x=6 -> 32/6 = 5. The
+    # K_c key tokens are a random SUBSET of the K_hi available ones, so every
+    # key token sees every role (key-identity twin of the position invariance).
+    k_rng  = d.get("n_contexts_range")
+    k_lo, k_hi = (int(k_rng[0]), int(k_rng[1])) if k_rng else (K, K)
+    if t_rng or ph_lo or k_rng:
+        assert not sw, "structure knobs replace the legacy switch_at"
+        assert t_lo >= 2 and t_hi >= t_lo and (not ph_lo or ph_hi >= ph_lo >= 1)
+        assert k_hi >= k_lo >= 1
     SYM_OFF = 3
     KEY_OFF = SYM_OFF + S                        # key tokens live above the symbols
     # each phase draws its own perm, so the unseen-query budget is per phase
-    max_phase = max(sw, turns - sw) if sw else turns
+    max_phase = max(sw, turns - sw) if sw else t_hi
     assert m + max_phase <= S, "need m examples + distinct unseen queries within S symbols"
     assert train_pool, "empty training shift pool"
-    if K > 1:
-        assert int(cfg_dict.get("vocab_size", 0)) >= KEY_OFF + K, \
+    if max(K, k_hi) > 1:
+        assert int(cfg_dict.get("vocab_size", 0)) >= KEY_OFF + max(K, k_hi), \
             "vocab_size must cover SYM_OFF + n_symbols + n_contexts key tokens"
     if sw:
         assert K == 1, "switch_at requires n_contexts=1 (keyless conversations)"
@@ -739,7 +768,7 @@ def _build_synthetic_rule(cfg_dict: dict):
 
     class RuleDS:
         def __iter__(self):
-            off = 1 if K > 1 else 0              # key token prefix width
+            off = 1 if max(K, k_hi) > 1 else 0   # key token prefix width
             pool_t = torch.tensor(train_pool, dtype=torch.long)
             g = torch.Generator().manual_seed(1234)
             pool_shuf = pool_t[torch.randperm(len(pool_t), generator=g)]
@@ -802,21 +831,36 @@ def _build_synthetic_rule(cfg_dict: dict):
                     for t in range(turns - sw):
                         yield _query(s2, uns[1], t)
             while True:
-                cp     = _cur_pool()
-                s      = cp[torch.randint(0, len(cp), (bs, K))]
+                cp      = _cur_pool()
+                turns_c = (int(torch.randint(t_lo, t_hi + 1, (1,))) if t_hi > t_lo
+                           else t_lo)
+                K_c     = (int(torch.randint(k_lo, k_hi + 1, (1,))) if k_hi > k_lo
+                           else k_lo)
+                # key tokens: random subset of the k_hi available ones (see knob doc)
+                key_tok = (torch.randperm(k_hi)[:K_c].tolist() if k_rng
+                           else list(range(K_c)))
+                sw_at = []          # query-turn indices with a re-presentation before them
+                if ph_lo:
+                    nxt = int(torch.randint(ph_lo, ph_hi + 1, (1,)))
+                    while nxt <= turns_c - 1 and (not sw_max or len(sw_at) < sw_max):
+                        sw_at.append(nxt)            # ≥1 query after the last switch
+                        nxt += int(torch.randint(ph_lo, ph_hi + 1, (1,)))
+                cfg_dict["_conv"] = {"n_seg": K_c + turns_c + len(sw_at), "k": K_c}
+                s      = cp[torch.randint(0, len(cp), (bs, K_c))]
                 ex     = [[] for _ in range(bs)]  # per lane, per context: shown inputs
                 unseen = [[] for _ in range(bs)]  # per lane, per context: query pool
                 for b in range(bs):
-                    for k in range(K):
+                    for k in range(K_c):
                         perm = torch.randperm(S).tolist()
                         ex[b].append(perm[:m]); unseen[b].append(perm[m:])
-                for k in range(K):
+
+                def _present_key(k: int, reset: bool):
                     L = off + 2 * m
                     X = torch.zeros((bs, L), dtype=torch.long)
                     Y = torch.zeros((bs, L), dtype=torch.long)
                     Msk = torch.zeros((bs, L), dtype=torch.bool)
                     if off:
-                        X[:, 0] = KEY_OFF + k
+                        X[:, 0] = KEY_OFF + key_tok[k]
                     for b in range(bs):
                         for j, xi in enumerate(ex[b][k]):
                             yi = _apply(int(s[b, k]), xi)
@@ -824,20 +868,42 @@ def _build_synthetic_rule(cfg_dict: dict):
                             X[b, off + 2 * j + 1] = SYM_OFF + yi
                             Y[b, off + 2 * j] = SYM_OFF + yi
                             Msk[b, off + 2 * j] = (j >= 1)   # j=0 unlearnable (shift unknown yet)
-                    yield X, Y, Msk, torch.full((bs,), k == 0, dtype=torch.bool), s[:, k].clone()
-                for t in range(turns):
-                    k = t % K
+                    return (X, Y, Msk, torch.full((bs,), reset, dtype=torch.bool),
+                            s[:, k].clone())
+
+                for k in range(K_c):
+                    yield _present_key(k, reset=(k == 0))
+                q_cnt = [0] * K_c   # per-key queries since its last presentation
+                sw_i  = 0
+                for t in range(turns_c):
+                    while sw_i < len(sw_at) and sw_at[sw_i] == t:
+                        # switch: re-present ONE key with a fresh rule (bank
+                        # carried, no reset — the old rule must be DROPPED)
+                        k_sw  = int(torch.randint(0, K_c, (1,)))
+                        new_s = cp[torch.randint(0, len(cp), (bs,))]
+                        while bool((new_s == s[:, k_sw]).any()):
+                            clash = new_s == s[:, k_sw]
+                            new_s[clash] = cp[torch.randint(0, len(cp), (int(clash.sum()),))]
+                        s[:, k_sw] = new_s
+                        for b in range(bs):
+                            perm = torch.randperm(S).tolist()
+                            ex[b][k_sw] = perm[:m]; unseen[b][k_sw] = perm[m:]
+                        q_cnt[k_sw] = 0
+                        yield _present_key(k_sw, reset=False)
+                        sw_i += 1
+                    k = t % K_c
                     xq = torch.zeros((bs, off + 1), dtype=torch.long)
                     yq = torch.zeros((bs, off + 1), dtype=torch.long)
                     msk = torch.zeros((bs, off + 1), dtype=torch.bool)
                     if off:
-                        xq[:, 0] = KEY_OFF + k
+                        xq[:, 0] = KEY_OFF + key_tok[k]
                     msk[:, off] = True
                     for b in range(bs):
                         pool = unseen[b][k]
-                        q = pool[(t // K) % len(pool)]
+                        q = pool[q_cnt[k] % len(pool)]
                         xq[b, off] = SYM_OFF + q
                         yq[b, off] = SYM_OFF + _apply(int(s[b, k]), q)
+                    q_cnt[k] += 1
                     yield xq, yq, msk, torch.zeros(bs, dtype=torch.bool), torch.full((bs,), -1, dtype=torch.long)
 
     return RuleDS()
@@ -2047,6 +2113,20 @@ def main() -> None:
                                     # rules must install teacher-free (write generalization)
     cur_ce_ema: Optional[float] = None
     cur_stage_from = 0                                # step at which the current stage began
+    # Structure-randomized cells (turns_range / switch_phase_*): conversations
+    # have VARIABLE segment counts — the generator publishes each one's length
+    # in raw["_conv"] and the optimiser steps at conversation end; grad_accum
+    # only serves as the loss denominator fallback outside this mode.
+    struct_rand = bool(data_cfg.get("turns_range") or data_cfg.get("switch_phase_min")
+                       or data_cfg.get("n_contexts_range"))
+    conv_len    = grad_accum   # current conversation's segment count
+    micro_conv  = 0            # segments seen inside the current conversation
+    conv_k      = 0            # current conversation's establish-presentation count
+    redund_sw   = None         # min redundancy over SWITCH writes since last log line:
+                               # the step-line redund samples the conversation's LAST
+                               # segment (a rehearsal copy, ~0.99 by construction);
+                               # switch re-presentations write novel content (~0.3)
+                               # and would otherwise never appear in the logs
 
     for batch in dl:
         if "_curriculum" in raw:
@@ -2076,6 +2156,10 @@ def main() -> None:
                     init_mem = None
                 else:
                     init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
+            if struct_rand and bool(reset.all()):
+                conv_len, micro_conv = int(raw["_conv"]["n_seg"]), 0
+                conv_k = int(raw["_conv"].get("k", 0))
+            accum = conv_len if struct_rand else grad_accum
             # pad_mask gates which positions the WRITE head can pool. For
             # multiturn_rule, lmask is a LOSS mask (turn 0 supervises only the
             # applied-x positions) but every token is real — the write must see
@@ -2138,16 +2222,24 @@ def main() -> None:
                                                mem_bank[:, -1])
                         mem_bank = torch.cat([mem_bank[:, :-1], new_slot.unsqueeze(1)], dim=1)
                 # distill is a PER-CONVERSATION loss but rides on the turn-0 micro,
-                # which the window divides by grad_accum — pre-multiply so its
-                # effective weight is the configured tf_dw (matches the proof).
-                loss = loss + (beta * tf_dw * grad_accum) * distill
+                # which the window divides by the accum denominator — pre-multiply
+                # so its effective weight is the configured tf_dw (matches the proof).
+                loss = loss + (beta * tf_dw * accum) * distill
                 tf_distill_last = float(distill.detach())
+            if (struct_rand and rule_s is not None and bool((rule_s >= 0).all())
+                    and micro_conv >= conv_k and "write_redund" in logs):
+                # this presentation is PAST the establish block = a switch write
+                redund_sw = (logs["write_redund"] if redund_sw is None
+                             else min(redund_sw, logs["write_redund"]))
             persist_mem = mem_bank                         # keep graph within the window
-            seg_loss = scaler.scale(loss / grad_accum)
+            seg_loss = scaler.scale(loss / accum)
             window_loss = seg_loss if window_loss is None else window_loss + seg_loss
             micro += 1
-            at_step = (micro % grad_accum == 0)
-            if micro % mem_bptt_window == 0 or at_step:     # flush window (TBPTT truncation)
+            micro_conv += 1
+            at_step = ((micro_conv == conv_len) if struct_rand
+                       else (micro % grad_accum == 0))
+            if (micro_conv if struct_rand else micro) % mem_bptt_window == 0 or at_step:
+                # flush window (TBPTT truncation)
                 window_loss.backward()
                 window_loss   = None
                 persist_mem   = persist_mem.detach()
@@ -2348,6 +2440,9 @@ def main() -> None:
             if tf_on:
                 logs["tf_distill"] = tf_distill_last
                 logs["tf_beta"]    = _beta_at(step)
+            if redund_sw is not None:
+                logs["write_redund_sw"] = redund_sw
+                redund_sw = None                 # min over the next log window
             tqdm.write(
                 f"step={step:>6}  ce={logs['ce']:.4f}  ppl={logs['ppl']:.2f}"
                 f"  balance={logs['balance']:.4f}"
@@ -2356,6 +2451,7 @@ def main() -> None:
                 + (f"  α={logs['write_alpha']:.3f}" if "write_alpha" in logs else "")
                 + (f"  wpen={logs['write_pen']:.3f}" if "write_pen" in logs else "")
                 + (f"  redund={logs['write_redund']:.3f}" if "write_redund" in logs else "")
+                + (f"  redund_sw={logs['write_redund_sw']:.3f}" if "write_redund_sw" in logs else "")
                 + (f"  erank={logs['mem_eff_rank']:.2f}" if "mem_eff_rank" in logs else "")
                 + (f"  gap={logs['mem_ablation_gap']:+.3f}" if "mem_ablation_gap" in logs else "")
                 + (f"  distill={logs['tf_distill']:.3f}(β={logs['tf_beta']:.2f})" if "tf_distill" in logs else "")

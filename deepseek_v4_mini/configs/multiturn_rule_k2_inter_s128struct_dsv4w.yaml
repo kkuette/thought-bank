@@ -1,0 +1,102 @@
+# dsv4w — SOFTENED structure-randomized FALLBACK (user decision 2026-07-05).
+#
+# Fires ONLY if dsv4v misses the user criterion: first curriculum doubling
+# (16->32) by ~step 1000 => "problem too hard for this model" at full
+# randomization. Softened distribution, same machinery:
+#   K = 2 FIXED (n_contexts_range removed), turns_range [8,16],
+#   switch_max 2 (new knob: cap on switches/conv), phases still [4,12].
+#   max_mem 16 -> 8: SHORT bank — up to 20 writes/conv > 8 slots, so the
+#   retention-through-eviction pressure survives the softening.
+# mem_bptt_window 20 = 2 presentations + 16 turns + 2 switches.
+vocab_size: 136
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+n_hc: 2
+sinkhorn_iters: 20
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+mem_dim: 32
+max_mem: 8
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+balance_loss_weight: 0.0001
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+mem_code_mixup_start: 500
+mem_read_swiglu: true
+mem_write_gate: false
+mem_teacher_forcing: true
+mem_teacher_fourier: true
+mem_teacher_fourier_kmax: 8
+mem_teacher_distill_cosine: true
+mem_teacher_anneal_start: 2600
+mem_teacher_anneal_end: 3100
+mem_teacher_anneal_len: 300
+mem_teacher_distill_weight: 2.0
+training:
+  device: auto
+  seed: 42
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: wsd
+  wsd_decay_start: 3000
+  wsd_decay_at_anneal_end: true
+  wsd_decay_offset: 800
+  teacher_lr: 3e-4
+  muon_lr: 0.00375
+  weight_decay: 0.1
+  muon_rms_match: true
+  adam_eps: 1.0e-20
+  steps: 4000
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 20
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_s128_dsv4w
+  run_name: dsv4mini_multiturn_rule_k2_inter_s128_dsv4w
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s128_dsv4w/metrics.jsonl
+data:
+  task: multiturn_rule
+  n_symbols: 128
+  n_examples: 6
+  turns_per_conv: 8
+  turns_range:
+  - 8
+  - 16
+  switch_phase_min: 4
+  switch_phase_max: 12
+  n_contexts: 2
+  rule_family: affine
+  affine_units:
+  - 1
+  heldout_rule_mod: 8
+  batch_size: 64
+  curriculum_rules_start: 16
+  curriculum_mode: mastery
+  curriculum_ce_thresh: 4.3
+  curriculum_dwell_min: 150
+  curriculum_pool_full_n: 112
+  curriculum_anneal_at_n: 64
+  switch_max: 2
+mem_read_spectral_norm: false
+mem_read_layers:
+- 0
