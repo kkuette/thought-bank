@@ -9,13 +9,51 @@ memory the model reads as *weights* (a per-slot low-rank MLP applied to the toke
 stream) and writes to itself, targeting **continual learning at inference without
 a backward pass**.
 
+## 📄 Paper
+
+**A Trained Fast-Weight Memory: Continual Rule Binding at Inference
+Without Backward** — [PDF](paper/paper.pdf) ·
+[DOI 10.5281/zenodo.21222901](https://doi.org/10.5281/zenodo.21222901)
+
+Three claims, all on a 3.08M-parameter DeepSeek-style trunk with an
+8-slot bank, two seeds:
+
+1. **A functional, generalizing memory**: a single 13-token presentation
+   installs a *never-trained* rule binding at **0.79–1.00** accuracy on
+   unseen queries (chance 0.008), retained past physical slot eviction,
+   replaced mid-conversation in one forward pass (old-rule persistence
+   0.000).
+2. **The only functional adaptation pathway**: on the same conversations,
+   test-time training fits its adaptation examples (0.99) and transfers
+   **exactly nothing**, at **138×** the cost per update and −62%
+   catastrophic interference on a concurrent rule (bank: −14%, by
+   eviction); in-window ICL is at chance.
+3. **Memory policy is a trained behaviour, not an architectural
+   property**: the identical architecture trained on fixed-structure
+   conversations perseverates totally on a rule switch, zero-shot
+   (old-rule persistence 1.000, unreadable dirty-bank writes);
+   randomizing conversation *structure* at training time installs the
+   full policy.
+
+Reproduce Tables 2–4 and Figures 3–5 from a fresh clone:
+```bash
+bash repro/run_all.sh               # 3 training runs (~5 h each, one RTX 3090) + probes + figures
+bash repro/run_all.sh --skip-train  # probes + figures on existing checkpoints
+```
+
 The driving questions, in the order they were answered:
 1. *Is an external memory bank useful at all, and when?* → only when persistent,
    and judged by `content_gap` ([historical findings](#-findings-historical-memory-as-data-era)).
-2. *Can a rule cross turn boundaries as a fast weight?* → yes: 0.948 (K=1) / 0.99
-   (K=2 keyed), after a teacher-forced bootstrap breaks the ignore-bank fixed point.
-3. *Does the memory POLICY (retain / forget) have to be engineered?* → **no — it
-   emerges end-to-end** ([current findings](#-findings-fast-weight-memory-current)).
+2. *Can a rule cross turn boundaries as a fast weight?* → yes — after a
+   teacher-forced bootstrap breaks the ignore-bank fixed point (§5 of the paper).
+3. *Does it generalize to never-trained rules?* → **yes, given rule diversity**:
+   held 0.79–1.00 at 112 training rules; ≤25 rules → exactly 0.000 (the read
+   memorizes; the transition sits in (25, 112]).
+4. *Does the memory POLICY (retain / overwrite / write-on-dirty) come with the
+   architecture?* → **no — it is a trained behaviour**: zero-shot on a
+   fixed-structure model, STICK = 1.000 (total perseveration); trained with
+   randomized structure, STICK = 0.000 at every switch position
+   ([current findings](#-findings-fast-weight-memory-current)).
 
 > **History:** the project started as a diffusion / 3D-thought-tensor prototype
 > (hence the repo's former name). That line was abandoned for the autoregressive
@@ -25,19 +63,7 @@ The driving questions, in the order they were answered:
 
 ## 🧠 Core idea
 
-```
-        thought bank  [B, M, mem_dim]           (fast-weight codes, FIFO)
-                 │  read as WEIGHTS at every block:
-                 │  each slot → hypernet → low-rank MLP layer, applied
-                 ▼  sequentially to the token stream (GELU between slots)
-        text stream   [B, T, d_model]           (predicts the next token)
-                 │
-                 ▼
-        write (once per turn)  m = norm(thought_head(pool(H_text)))
-                 →  append to bank  →  FIFO-evict oldest past max_mem
-                 │
-        bank carried to the next turn / segment
-```
+![The Thought Bank architecture](paper/figures/fig1_architecture.png)
 
 - **Text stream** does next-token prediction (CSA/HCA attention + MoE, mHC residuals).
 - **The bank is read as fast weights, not attended data**: each slot is expanded
@@ -76,10 +102,13 @@ python -m deepseek_v4_mini.train deepseek_v4_mini/configs/code_persist.yaml  # c
 python -m deepseek_v4_mini.train deepseek_v4_mini/configs/synth_recall.yaml  # addressable recall
 python -m deepseek_v4_mini.train deepseek_v4_mini/configs/gist.yaml          # latent-context gist
 
-# continual-rule benchmark (fast-weight transport; the active line of work)
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule.yaml         # K=1 reference
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_horizon.yaml # rehearsal emergence
-python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_switch.yaml  # forgetting test
+# the paper's cells (keyed fresh-rule benchmark, S=128)
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128_dsv4m.yaml        # fixed structure (zero-shot arm)
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w.yaml  # policy cell, seed 42
+python -m deepseek_v4_mini.train deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml  # replication, seed 43
+
+# or everything at once (training + probes + figures):
+bash repro/run_all.sh
 ```
 > Scripts importing the package need `PYTHONPATH=<repo-root>`.
 
@@ -118,27 +147,36 @@ Offline analysis: [`deepseek_v4_mini/eval_memory.py`](deepseek_v4_mini/eval_memo
 
 ## 📊 Findings — fast-weight memory (current)
 
-Benchmark: `multiturn_rule` — each conversation draws a fresh shift rule
-`y=(x+s)%32`, shows it once, then queries **unseen** symbols on later turns; the
-rule can only cross turn boundaries through the bank. Chance 0.031, ICL ceiling ≈0.49.
+Benchmark: keyed fresh-rule conversations (`multiturn_rule_k2_inter_s128*`) —
+each conversation binds K=2 key tokens to fresh shift rules `y=(x+s)%128`
+(112 training offsets / 15 held out, never trained), presents each rule once
+(13 tokens), then queries **unseen** symbols on later turns; the rule can only
+cross turn boundaries through the bank. Chance 0.008; bank ablation is an
+exact control and sits at chance everywhere.
 
 | Question | Verdict |
 |---|---|
-| Can a rule be transported as a fast weight? | **0.948** (K=1) — after a teacher-forced bootstrap breaks the "ignore-bank" fixed point (distillation is the active ingredient; the model then invents its own codes) |
-| Can several rules be routed by key? | **0.99** (K=2) — the old K=2 wall was the fixed point, not addressing |
-| Does it generalize to unseen rules? | **No** — 0.97 train / 0.011 held-out; interleaved holdout = 0.000 exact (snapping). The write builds a correct circular code manifold (held codes placed ON-manifold); the **read** only decodes trained points → recognition within a meta-learned family, not open induction |
-| Does FIFO eviction kill long-horizon memory? | **No cliff** — the model learns to re-encode the rule in its query-turn writes (noisy partial copies, redundancy across slots). Rehearsal **emerges** from TBPTT pressure alone; cost: ~0.48 plateau at 24-turn maintenance (vs 0.95 @9 turns) |
-| Does learned rehearsal prevent forgetting (squatting)? | **No** — mid-conversation rule switch: STICK = 0.000 at acc 0.795 (zero answers with the old rule), pre/post 0.80/0.79. Forgetting is *active*: the old code is still in the bank yet never used (recency override) |
-| Can it retain through eviction AND then replace? | **Yes** (joint, 24+16 turns) — 0.747/0.746 pre/post, STICK 0.02, no per-turn cliff. Maintenance *beats* the horizon model (0.74 vs 0.48): retain-then-replace pressure improves the retention code. Rehearsal happens in a **covert code** — no canonical rule identity, anti-correlated with the presentation write — keeping the maintenance traffic off the presentation manifold so a new rule can override cleanly |
+| Can a fresh rule be installed at inference, forward-only? | **Yes** — one 13-token presentation → 0.95–1.00 (train) on unseen queries |
+| Does it generalize to never-trained rules? | **Yes** — held 0.79–1.00 across two seeds, *given diversity*: at ≤25 training rules held is exactly 0.000 (the read memorizes); at 112 rules held tracks train. Transition in (25, 112] |
+| How does it compare to test-time training? | TTT on the same conversations fits its 12 adaptation pairs (0.99) and transfers **nothing** (chance on unseen queries, all LRs × 1–50 steps); in-window ICL also at chance. The bank is the **only** functional adaptation pathway, at 1/138th the cost per update |
+| Can a rule be replaced mid-conversation? | **Yes** — one forward on the dirty bank: 0.95 train / 0.78 held post-switch, old-rule persistence (STICK) 0.000 at every switch position 2–14; the untouched key loses −14% (eviction pressure) where sequential TTT loses −62% (catastrophic interference) |
+| Does FIFO eviction kill retention? | **No cliff** (structure-randomized model) — storage is a redundant superposition: the 8 slots carry near-copies of one superposed vector (bank eff. rank ~1.1–1.5/8, ablation gap +4.6 nats), the key-conditioned read disambiguates; evicting a slot removes a copy, not the content |
+| Is the memory policy architectural? | **No — it is trained.** The same architecture at matched held competence, trained on *fixed* structure, perseverates totally zero-shot (STICK 1.000; its write head cannot produce a readable code on a non-empty bank, 1-NN 0.05). Randomizing conversation structure (lengths 8–16, ≤2 switches at random positions) installs the full policy |
+| What is out of reach? | A never-trained rule *family* (subtraction on the same circle) defeats bank, TTT and ICL equally — the boundary is the meta-training envelope, not the mechanism. And replacement *selectivity* bifurcates across seeds (selective update vs flush-and-rewrite), decided at bootstrap |
 
-**Headline: memory policy — retention AND replacement — is task-adaptive and
-emerges end-to-end.** No write gate, LRU, or allocation mechanism was needed;
-FIFO + learned write content suffice, even under joint retain-then-replace
-pressure. Mechanistic evidence:
-[`deepseek_v4_mini/analysis/`](deepseek_v4_mini/analysis/README.md). Open fronts:
-maintenance precision (consolidation), read generalization (code-space
-augmentation). Optimizer: Muon + cosine is the validated default
-(0.99@1000 on the K=1 reference, ~1.75× faster than the AdamW baseline).
+**Headline: the bank is a functional, generalizing, forward-only memory — and
+what it *does* (keep, overwrite, write-on-dirty, survive eviction) is decided
+by the training distribution, not by the architecture.** Training it requires
+breaking an ignore-the-bank fixed point (teacher-forced Fourier bootstrap +
+mastery-gated curriculum + rule diversity; §5 and App. E of the
+[paper](paper/paper.pdf)). Mechanistic evidence and probe scripts:
+[`deepseek_v4_mini/analysis/`](deepseek_v4_mini/analysis/README.md).
+
+> Earlier findings on the ≤25-rule *memorizing* regime (K=1 0.948, K=2 keyed
+> 0.99, emergent rehearsal, switch STICK=0 on a switch-trained model) were
+> re-audited on the generalizing regime; the ones that survive are folded into
+> the table above, the historical arc is in the
+> [package README](deepseek_v4_mini/README.md).
 
 ---
 
@@ -213,7 +251,9 @@ slot count identical:
 | `configs/code_persist.yaml` | codeparrot (Python) | bank **persists** across steps |
 | `configs/synth_recall.yaml` | synthetic | addressable key→value recall test |
 | `configs/gist.yaml` | synthetic | latent-context (gist) test |
-| `configs/multiturn_rule*.yaml` | synthetic | continual-rule benchmark family (K=1/K=2, held-out, horizon, switch, joint) — see the [package README](deepseek_v4_mini/README.md) |
+| `configs/multiturn_rule_k2_inter_s128_dsv4m.yaml` | synthetic | **paper**: fixed-structure cell (Table 3, zero-shot policy arm) |
+| `configs/multiturn_rule_k2_inter_s128struct_dsv4w*.yaml` | synthetic | **paper**: policy cells, seeds 42/43 (Tables 2/4, Figs 3–5) |
+| `configs/multiturn_rule*.yaml` (others) | synthetic | historical continual-rule family (K=1/K=2, held-out, horizon, switch, joint) — see the [package README](deepseek_v4_mini/README.md) |
 
 Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/README.md)):
 
@@ -231,6 +271,8 @@ Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/R
 ## 📁 Repository layout
 
 ```
+paper/                   ← the paper (paper.pdf, draft.md, figures/)
+repro/                   ← end-to-end reproduction of the paper (run_all.sh)
 deepseek_v4_mini/        ← active project (fast-weight thought bank)
   model.py  memory.py  attention.py  moe.py  mhc.py  config.py  train.py
   eval_memory.py         ← offline PPL with/without the bank
