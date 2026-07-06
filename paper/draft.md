@@ -1,6 +1,12 @@
 # A Trained Fast-Weight Memory: Continual Rule Binding at Inference Without Backward
 
-*Draft v0.1 — 2026-07-06. Markdown master; LaTeX port after prose freeze.*
+**Tony Denion**¹ · **Claude Fable (Anthropic)**²
+¹ Independent researcher — awakeproduction@hotmail.fr
+² AI co-author; experimental campaign and drafting conducted with Claude
+Fable 5 via Claude Code
+
+*Draft v0.2 — 2026-07-06. Markdown master (figures, appendices and
+references in); LaTeX port after prose freeze.*
 
 ## Abstract
 
@@ -83,9 +89,10 @@ full policy: persistence 0.000 at every switch position, clean dirty-bank
 writes, no retention cliff (§8). The architecture supplies a substrate;
 the training distribution decides what the memory *does*, the way
 augmentation decides a vision model's invariances. Anyone equipping a
-model with a memory mechanism should expect the same: an inference-time
-behaviour the training distribution never exercised should be presumed
-absent until probed.
+model with a memory mechanism should expect the same: if a behaviour —
+overwriting a stale entry, keeping a neighbour intact, recalling after a
+delay — never occurred in the training conversations, assume the deployed
+model cannot do it until a probe shows otherwise.
 
 Third, we show the training problem is itself non-trivial and give a
 working recipe. Joint training of write, storage and read collapses into
@@ -110,9 +117,9 @@ flush-and-rewrite attractor (§9); we report both.
 another's weights goes back to Schmidhuber (1992) and was revived for
 attention-era models by Ba et al. (2016). Schlag et al. (2021) showed
 linear attention *is* a fast-weight programmer, and the modern recurrent
-line (DeltaNet-style delta rules, Titans and successors) trains
-token-granular write rules inside the sequence mixer, at scale, for
-language modelling perplexity. Our bank differs in granularity and in
+line — DeltaNet-style delta rules (Yang et al., 2024), Titans and
+successors (Behrouz et al., 2025) — trains token-granular write rules
+inside the sequence mixer, at scale, for language modelling perplexity. Our bank differs in granularity and in
 question: one write per *segment*, read as a low-rank MLP over a
 persistent multi-slot state, and evaluated not by perplexity but by an
 isolable behavioural claim — can a fresh binding be installed, retained,
@@ -120,9 +127,10 @@ and replaced at inference, with the bank as the only route? The
 memory-as-weights reading (slot → generated layer) also separates us from
 memory-augmented models that attend to stored vectors as data.
 
-**Memory-augmented networks.** NTM and DNC trained differentiable
-read/write policies end-to-end and are the closest ancestors of our
-trained-policy claim; modern Hopfield layers store patterns for
+**Memory-augmented networks.** The NTM (Graves et al., 2014) and DNC
+(Graves et al., 2016) trained differentiable read/write policies
+end-to-end and are the closest ancestors of our trained-policy claim;
+modern Hopfield layers (Ramsauer et al., 2021) store patterns for
 associative retrieval. Our contribution to this line is the *dissociation*:
 identical architecture, competence matched, and the policy (retention
 horizon, overwrite discipline, dirty-bank writes) swings from absent to
@@ -131,9 +139,9 @@ plus the zero-shot diagnosis of what an untrained policy looks like
 (total perseveration, unreadable dirty-bank writes).
 
 **Test-time training and adaptation.** TTT as an architectural principle
-(Sun et al., 2024) compiles the gradient update *into* the layer; TTT as a
-practice fine-tunes a clone on test-instance data, recently with striking
-results on ARC. Our TTT arm is the practice form, taken seriously as the
+(Sun et al., 2024) compiles the gradient update *into* the layer; TTT as
+a practice fine-tunes a clone on test-instance data (Sun et al., 2020),
+recently with striking results on ARC (Akyürek et al., 2024). Our TTT arm is the practice form, taken seriously as the
 natural baseline for inference-time binding, with a convergence
 diagnostic that separates optimization failure from basin failure: it
 fits its adaptation set perfectly and transfers nothing, and under
@@ -141,37 +149,64 @@ sequential updates it exhibits classic catastrophic interference
 (McCloskey & Cohen, 1989) — which our forward-only write structurally
 avoids, degrading instead by eviction, a capacity knob.
 
+**Concurrent work (2026).** Two adjacent lines have moved fast while this
+work was underway. Hypernetworks that map a context to a LoRA adapter in
+a single forward pass — Doc-to-LoRA (Charakorn et al., 2026), SHINE
+(Liu et al., 2026) — are, at LLM scale, the same mechanism as our read
+head: forward-only installation of context as weights. They are
+*per-prompt*, however: one context, one disposable adapter. None
+maintains a persistent multi-slot state across sequential writes, so the
+questions this paper is about — replacement mid-conversation, collateral
+interference, what an untrained write policy does to a dirty bank — do
+not arise in their setting. On the memory side, fast-weight stores
+updated at inference by chunk-level gradient descent (FwPKM; Zhao &
+Jones, 2026) and trained controllers that allocate test-time gradient
+steps (Mei et al., 2026) keep the backward pass we remove; their "write
+policy" is a budget over gradient updates, whereas ours is a forward
+behaviour installed by the training distribution and absent without it
+(§8).
+
 **Base architecture.** The trunk miniaturizes the DeepSeek line of
-efficient transformers — latent-compressed attention (MLA) and native
-sparse attention, fine-grained mixture-of-experts with shared experts
-(DeepSeekMoE), as consolidated in DeepSeek-V3/V4 — plus hyper-connection
-residual streams. These choices are load-bearing for realism (the bank is
+efficient transformers — latent-compressed attention (MLA; DeepSeek-AI,
+2024a) and native sparse attention (Yuan et al., 2025), fine-grained
+mixture-of-experts with shared experts (DeepSeekMoE; Dai et al., 2024),
+as consolidated in DeepSeek-V3 (DeepSeek-AI, 2024b) and DeepSeek-V4
+(DeepSeek-AI, 2026) —
+plus hyper-connection residual streams (Zhu et al., 2024). These choices are load-bearing for realism (the bank is
 grafted onto a production-style stack, not a bespoke toy), not for the
 claims.
 
 **Meta-learning and its envelope.** Our setting is meta-learning in the
-MAML/in-context sense: training installs a family; inference binds its
-parameters. The out-of-family boundary we measure (subtraction defeats
-every arm) is the small-model, controlled version of the
-counterfactual-task literature on LLMs, where out-of-distribution variants
-of trained competences degrade sharply but remain above chance because a
-web-scale envelope contains composition primitives our 3M-parameter
-envelope lacks. The diversity threshold of §5 likewise mirrors the known
-transition from memorization to in-context generalization as task
-diversity grows, and our bootstrap plateaus have the grokking phenomenology
+MAML/in-context sense (Finn et al., 2017): training installs a family;
+inference binds its parameters. The out-of-family boundary we measure
+(subtraction defeats every arm) is the small-model, controlled version of
+the counterfactual-task literature on LLMs (Wu et al., 2024), where
+out-of-distribution variants of trained competences degrade sharply but
+remain above chance because a web-scale envelope contains composition
+primitives our 3M-parameter envelope lacks. The diversity threshold of §5
+likewise mirrors the known transition from memorization to in-context
+generalization as task diversity grows (Chan et al., 2022; Raventós et
+al., 2023), and our bootstrap plateaus have the grokking phenomenology
 (Power et al., 2022) — we treat these classical twins as diagnostic tools
 throughout.
 
-*(Citations to be completed at LaTeX port; names and years above are the
-anchor set.)*
 
 ## 3. Architecture: the Thought Bank
 
 The model is a 4-block decoder-only transformer (d_model 128, 3.08M
 parameters) augmented with a *thought bank*: a FIFO buffer of M=8 slots of
-dimension 32, carried across segments of a conversation as persistent state.
+dimension 32, carried across segments of a conversation as persistent
+state (Fig. 1).
 
-**Trunk.** The trunk is a miniature of the DeepSeek-V4 stack: compressed
+![Figure 1](figures/fig1_architecture.png)
+*Figure 1 — The Thought Bank. A pooling write head appends one 32-d
+vector per segment to an 8-slot FIFO bank; a hypernetwork expands each
+slot into a low-rank MLP applied sequentially to the residual stream at
+block 0. The bank is the only state crossing segment boundaries — no
+backward pass, no optimizer, no weight copy at inference.*
+
+**Trunk.** The trunk is a miniature of the DeepSeek-V4 stack
+(DeepSeek-AI, 2026): compressed
 sparse attention (a two-tier local/compressed scheme in the spirit of
 DeepSeek's sparse attention, with latent-compressed queries), a
 fine-grained DeepSeekMoE feed-forward with a shared expert, and
@@ -186,7 +221,7 @@ trunk-agnostic. Three components interact with the bank.
 hidden states and projects them to a single 32-dimensional vector, which is
 appended to the bank; when the bank exceeds M slots the oldest is evicted.
 One segment, one write — the write head has no per-token addressing and no
-learned gate in the main recipe (§App. C audits the gate: it accelerates the
+learned gate in the main recipe (App. C audits the gate: it accelerates the
 bootstrap by ~30% but slows post-bootstrap consolidation 4–6×; all headline
 results use gate OFF).
 
@@ -222,8 +257,9 @@ We want the smallest task where *inference-time* memory is both necessary
 and measurable: information presented once, used many turns later, never
 resolvable from the current window.
 
-**Task.** A conversation binds K=2 key tokens to rules drawn from the
-family y = (x + s) mod 128, one fresh offset s per key per conversation.
+**Task (Fig. 2).** A conversation binds K=2 key tokens to rules drawn
+from the family y = (x + s) mod 128, one fresh offset s per key per
+conversation.
 It opens with one *presentation segment* per key — [key_k, x_0, y_0, …,
 x_5, y_5], 13 tokens, six example pairs — followed by 8–16 *query turns*
 [key_k, x_q] with x_q drawn from the symbols *not* shown in the
@@ -251,13 +287,31 @@ must survive eviction. The optimizer steps once per conversation. §8 shows
 that this distribution, and nothing architectural, is what installs the
 memory policy.
 
+![Figure 2](figures/fig2_task.png)
+*Figure 2 — One conversation of the keyed fresh-rule benchmark. Each
+segment is processed in its own window; presentations and queries all
+write to the carried bank, queries read from it. A switch re-presents a
+key with a new rule on the dirty bank. Bank ablation is an exact control
+and sits at chance (0.008) in every experiment.*
+
 ## 5. Training the memory: breaking the ignore-bank fixed point
 
 Joint training of write, storage and read fails from scratch: the read
 initially extracts nothing, so the loss gradient prefers routing around the
 bank; the write head then receives no useful signal, and the system settles
 into an *ignore-the-bank* fixed point (CE at the ln 128 floor for the
-unresolvable queries, bank ablation gap ≈ 0). The failure is not in the
+unresolvable queries, bank ablation gap ≈ 0). Figure 3 shows the full
+training dynamics of the recipe that breaks it (both seeds; App. A walks
+through the curves).
+
+![Figure 3](figures/fig3_training_dynamics.png)
+*Figure 3 — Training dynamics of the policy cell, seeds 42 and 43. Top:
+cross-entropy (log scale) with curriculum doublings (purple, seed 42) and
+the β-anneal window (orange). Bottom: rule accuracy on unseen queries
+(train vs held) with the write-distillation loss (grey, right axis). All
+behavioural competence is acquired after β=0; the post-anneal rise of the
+distillation loss is the code drift of App. B. Seed 43's higher final CE
+is the visible cost of its flush-and-rewrite attractor (§9).* The failure is not in the
 read itself: given any *fixed* consistent code for s injected into the
 bank — one-hot, random frozen, learned embedding — the read learns to apply
 it almost perfectly in isolation. The wall is credit assignment through the
@@ -314,7 +368,7 @@ in training. Chance is 0.008. The policy-trained cell was run twice
 | train rules, unseen queries | 0.951–0.987 | ~1.000 |
 | **held rules (never trained)** | **0.792–0.828** | **0.997–1.000** |
 | replacement: post-switch accuracy (train / held target) | 0.953 / 0.777 | 0.91–1.00 |
-| old-rule persistence after switch (STICK), positions 2–14 | 0.000 | 0.008–0.012 |
+| old-rule persistence after switch (STICK), positions 2–14 | 0.000 | 0.000–0.051 |
 | dirty-bank write identifiability (1-NN vs clean-code dictionary) | 0.90 | 0.95 |
 | bank ablated | 0.008 (chance) | chance |
 
@@ -329,19 +383,36 @@ conversation with a switch at turn 8, the first rule's code is physically
 evicted from all 8 slots (1-NN identification drops to ~0), yet post-switch
 accuracy is 0.924. Retention outlives the slot that carried it.
 
-**Mechanism: redundant superposition.** Probes on the trained model show
-the 8 slots converge to nearly the same vector: the *bank's* effective rank
-is 1.08 out of 8. This is not representational collapse — the ablation gap
-is +4.6 nats, and across rules the write codes span an effective rank of
-14 of 32 dimensions (mean inter-rule cosine 0.17). The bank stores the
-conversation's bindings as one superposed vector, *copied* into every slot;
-the key-conditioned read disambiguates at application time. The redundancy
-is what buys eviction robustness: evicting any slot removes a copy, not the
-content. Two practical corollaries: (a) low bank rank alone is not a
-pathology signal — it must be read jointly with the ablation gap; (b) a
-switch write is genuinely novel content (its redundancy with the resident
-bank is 0.32, vs ~0.99 for steady-state rehearsal writes), and the bank
-re-converges to the new superposition within one turn.
+**Mechanism: redundant superposition (Fig. 4).** Probes on both trained
+seeds show the 8 slots converge to nearly the same vector: the *bank's*
+effective rank at the end of a conversation is 1.13 / 1.48 out of 8
+(seeds 42 / 43), with every slot-pair cosine above 0.9 (the residual
+structure is a parity checkerboard — the two keys' rehearsal streams
+alternate). This is not representational collapse — the ablation gap is
++4.6 nats, and across rules the clean write codes span an effective rank
+of 7.3 / 12.4 of 32 dimensions once the shared mean direction is removed
+(near-zero mean inter-rule cosine after centring; 1-NN identifiability
+0.90–0.95). The bank stores the conversation's bindings as one superposed
+vector, *copied* into every slot; the key-conditioned read disambiguates
+at application time. The redundancy is what buys eviction robustness:
+evicting any slot removes a copy, not the content. Two practical
+corollaries: (a) low bank rank alone is not a pathology signal — it must
+be read jointly with the ablation gap; (b) a switch write is genuinely
+novel content — its redundancy with the resident bank drops to +0.50
+(seed 42) or −0.10 (seed 43), vs ~1.0 for steady-state rehearsal writes —
+and the bank re-converges to the new superposition within one turn
+(redundancy back to ≥0.95 at the next write). The seed gap in that dip is
+not noise; it is the §9 bifurcation, visible at the write itself.
+
+![Figure 4](figures/fig4_superposition.png)
+*Figure 4 — The superposition mechanism. (A) End-of-conversation
+slot-slot cosines: all 8 slots ≥ 0.9, effective rank ~1; the parity
+checkerboard is the two keys' alternating rehearsal streams. (B) PCA of
+clean write codes over all 127 rules: the code space stays
+high-dimensional and rule-separable (held rules ★ on-manifold). (C)
+Redundancy of every write with the resident bank across a switch
+conversation: rehearsal writes are near-copies, the switch write is novel
+content — and its depth separates the two §9 attractors.*
 
 **Replacement.** Mid-conversation, re-presenting a key with a new rule —
 one 13-token forward on the dirty bank — installs the new binding at
@@ -423,7 +494,16 @@ overwriting the function.
 Everything in §6 could be read as a property of the architecture. It is
 not. We ran the identical switch probe, zero-shot, on a checkpoint of the
 *same architecture* trained to the same held-rule competence (0.85) but on
-*fixed* structure — 8 turns, no mid-conversation switches:
+*fixed* structure — 8 turns, no mid-conversation switches (Fig. 5):
+
+![Figure 5](figures/fig5_policy_trained.png)
+*Figure 5 — Memory policy is a trained behaviour. (A) Key-0 accuracy
+around a switch at turn 8: the fixed-structure model keeps answering the
+old rule on every post-switch query (red dashed at 1.0 — until its
+trained 8-turn horizon evicts the code at the last turn); both
+policy-trained seeds install the new rule in one forward pass. (B) The
+same, swept over switch positions 2–14, measured on the first post-switch
+query.*
 
 | | fixed-structure training (zero-shot switch) | structure-randomized training |
 |---|---|---|
@@ -456,11 +536,11 @@ absent from the training distribution was absent from the behaviour —
 down to the write head being unable to produce a readable code on a bank
 state it had never written on. We believe this is the observation most
 likely to transfer beyond our toy: a memory mechanism does not come with
-its policy included, and each inference-time behaviour one wants
-(retention horizons, overwrite discipline — or usages we did not test,
-such as interleaved ingestion and later recall of multiple contexts)
-should be presumed to need matching pressure in the training
-distribution until probed.
+its policy included. Each inference-time behaviour one wants — retention
+horizons, overwrite discipline, or usages we did not test, such as
+interleaved ingestion and later recall of multiple contexts — should be
+assumed to require matching pressure in the training distribution, until
+a probe shows the model has it for free.
 
 ## 9. Findings and boundaries
 
@@ -471,8 +551,15 @@ stream: 0.863 on the non-switched key post-switch) while seed 43 flushes
 the whole bank and rewrites only the switched binding (0.011 — chance) —
 despite being the stronger model on every other axis (held 0.997–1.000).
 The non-switched key accounts for 17% of query tokens, so seed 43 pays
-chance-level loss on 17% of its queries for the entire run without
-escaping the basin: final CEs are indistinguishable. Two attractors of the
+chance-level loss on those queries for the entire run — at matched step
+and learning rate (steps 2500–3000) its training CE band is ≈3.4 vs ≈0.5
+for seed 42, and a further 1000 steps of LR decay only brings it to ≈2.5
+(App. A) — and the gradient still never crosses into the selective
+basin. The attractor is
+visible at the write itself: the switch write's redundancy with the
+resident bank is +0.50 for seed 42 (it preserves the resident
+superposition) but −0.10 for seed 43 (it displaces it; Fig. 4C). Two
+attractors of the
 update policy — *selective component update* vs *flush-and-rewrite* — are
 decided during the bootstrap and gradient does not cross between them.
 Selective replacement plausibly requires a copy-forward circuit (the write
@@ -497,7 +584,9 @@ at chance. Every piece of an iterative computation through the bank
 exists; the *behaviour* of chaining is absent, exactly as replacement was
 absent before §8. We conjecture it is trainable by the same method
 (structure pressure), which would make the bank a latent scratchpad — a
-fast-weight analogue of chain-of-thought — and leave it to future work.
+fast-weight analogue of chain-of-thought (Wei et al., 2022), adjacent in
+spirit to reasoning in continuous latent space (Hao et al., 2024) — and
+leave it to future work.
 
 ## 10. Limitations
 
@@ -525,23 +614,264 @@ fast-weight analogue of chain-of-thought — and leave it to future work.
 
 Code, configurations, and analysis probes are available at
 github.com/kkuette/thought-bank. The policy cell trains in ≈5 h on a
-single RTX 3090; every probe and both TTT arms run on CPU. Seeds 42/43;
-data generators are deterministic given the config; checkpoints saved
-every 100 steps. An end-to-end script reproducing Tables 2–4 and Figure 5
-from a fresh clone is provided (repro/).
+single RTX 3090; every probe and both TTT arms run on a single GPU or,
+more slowly, on CPU (evaluation data is generated on the CPU RNG in
+either case). Seeds 42/43; data generators are deterministic given the
+config; checkpoints saved every 100 steps. An end-to-end script
+reproducing Tables 2–4 and Figures 3–5 from a fresh clone is provided
+(repro/).
 
-## Appendices (planned)
+## Authorship note
 
-- **A. Training dynamics** — full curves for the policy cell (CE, distill,
-  curriculum milestones, anneal window, WSD decay), seed 42 vs 43.
-- **B. Post-anneal code drift** — the write leaves the Fourier circle;
-  ridge probes die, 1-NN identification survives; why distillation
-  non-convergence is health, not failure.
-- **C. Write-gate audit** — gate ON accelerates curriculum milestones
-  ~30% but slows post-anneal consolidation 4–6×; off-circle code map with
-  rule collisions; why the headline recipe is gate OFF.
-- **D. Read depth** — grafting fast-weight reads onto all 4 blocks
-  (LoRA-B-style zero-init) on the larger S=256 variant.
-- **E. Negative results** — full-randomization bootstrap failure (dsv4v);
-  fixed-schedule curricula; β-blend without distill; outer-product read;
-  two-family training attempts.
+This work is an extended human–AI collaboration: the experimental
+campaign, analysis, and drafting were conducted jointly by the human
+author and Claude Fable 5 (Anthropic), used via Claude Code, and we
+credit the model as co-author accordingly. Research direction, design
+decisions, validation of every claim, and responsibility for errors
+remain with the human author. Because arXiv and most venues currently do
+not accept AI systems as formal authors, this work exists in two
+versions: the present one (the repository master, with the model
+credited as co-author) and a submission version whose byline reduces to
+the human author, with this note standing as the disclosure. The two are
+otherwise identical.
+
+## References
+
+- Akyürek, E., Damani, M., Qiu, L., Guo, H., Kim, Y., Andreas, J. (2024).
+  The Surprising Effectiveness of Test-Time Training for Abstract
+  Reasoning. arXiv:2411.07279.
+- Ba, J., Hinton, G., Mnih, V., Leibo, J. Z., Ionescu, C. (2016). Using
+  Fast Weights to Attend to the Recent Past. NeurIPS 29.
+- Behrouz, A., Zhong, P., Mirrokni, V. (2025). Titans: Learning to
+  Memorize at Test Time. arXiv:2501.00663.
+- Chan, S. C. Y., Santoro, A., Lampinen, A. K., Wang, J. X., Singh, A.,
+  Richemond, P. H., McClelland, J., Hill, F. (2022). Data Distributional
+  Properties Drive Emergent In-Context Learning in Transformers.
+  NeurIPS 35.
+- Charakorn, R., Cetin, E., Uesaka, S., Lange, R. T. (2026).
+  Doc-to-LoRA: Learning to Instantly Internalize Contexts.
+  arXiv:2602.15902.
+- Dai, D., Deng, C., Zhao, C., et al. (2024). DeepSeekMoE: Towards
+  Ultimate Expert Specialization in Mixture-of-Experts Language Models.
+  arXiv:2401.06066.
+- DeepSeek-AI (2024a). DeepSeek-V2: A Strong, Economical, and Efficient
+  Mixture-of-Experts Language Model. arXiv:2405.04434.
+- DeepSeek-AI (2024b). DeepSeek-V3 Technical Report. arXiv:2412.19437.
+- DeepSeek-AI (2026). DeepSeek-V4: Towards Highly Efficient
+  Million-Token Context Intelligence. arXiv:2606.19348.
+- Finn, C., Abbeel, P., Levine, S. (2017). Model-Agnostic Meta-Learning
+  for Fast Adaptation of Deep Networks. ICML.
+- Graves, A., Wayne, G., Danihelka, I. (2014). Neural Turing Machines.
+  arXiv:1410.5401.
+- Graves, A., Wayne, G., Reynolds, M., et al. (2016). Hybrid computing
+  using a neural network with dynamic external memory. Nature 538,
+  471–476.
+- Hao, S., Sukhbaatar, S., Su, D., Li, X., Hu, Z., Weston, J., Tian, Y.
+  (2024). Training Large Language Models to Reason in a Continuous
+  Latent Space. arXiv:2412.06769.
+- Liu, Y., Wang, X., Mao, Y., Gelbery, Y., Maron, H., Zhang, M. (2026).
+  SHINE: A Scalable In-Context Hypernetwork for Mapping Context to LoRA
+  in a Single Pass. arXiv:2602.06358.
+- McCloskey, M., Cohen, N. J. (1989). Catastrophic Interference in
+  Connectionist Networks: The Sequential Learning Problem. Psychology of
+  Learning and Motivation, 24, 109–165.
+- Mei, L., Liu, S., Wang, Y., et al. (2026). Gated Differentiable
+  Working Memory for Long-Context Language Modeling. arXiv:2601.12906.
+- Power, A., Burda, Y., Edwards, H., Babuschkin, I., Misra, V. (2022).
+  Grokking: Generalization Beyond Overfitting on Small Algorithmic
+  Datasets. arXiv:2201.02177.
+- Ramsauer, H., Schäfl, B., Lehner, J., et al. (2021). Hopfield Networks
+  is All You Need. ICLR.
+- Raventós, A., Paul, M., Chen, F., Ganguli, S. (2023). Pretraining task
+  diversity and the emergence of non-Bayesian in-context learning for
+  regression. NeurIPS 36.
+- Schlag, I., Irie, K., Schmidhuber, J. (2021). Linear Transformers are
+  Secretly Fast Weight Programmers. ICML.
+- Schmidhuber, J. (1992). Learning to Control Fast-Weight Memories: An
+  Alternative to Dynamic Recurrent Networks. Neural Computation 4(1),
+  131–139.
+- Sun, Y., Wang, X., Liu, Z., Miller, J., Efros, A. A., Hardt, M. (2020).
+  Test-Time Training with Self-Supervision for Generalization under
+  Distribution Shifts. ICML.
+- Sun, Y., Li, X., Dalal, K., et al. (2024). Learning to (Learn at Test
+  Time): RNNs with Expressive Hidden States. arXiv:2407.04620.
+- Wei, J., Wang, X., Schuurmans, D., et al. (2022). Chain-of-Thought
+  Prompting Elicits Reasoning in Large Language Models. NeurIPS 35.
+- Wu, Z., Qiu, L., Ross, A., Akyürek, E., Chen, B., Wang, B., Kim, N.,
+  Andreas, J., Kim, Y. (2024). Reasoning or Reciting? Exploring the
+  Capabilities and Limitations of Language Models Through Counterfactual
+  Tasks. NAACL.
+- Yang, S., Wang, B., Zhang, Y., Shen, Y., Kim, Y. (2024). Parallelizing
+  Linear Transformers with the Delta Rule over Sequence Length.
+  NeurIPS 37.
+- Yuan, J., Gao, H., Dai, D., et al. (2025). Native Sparse Attention:
+  Hardware-Aligned and Natively Trainable Sparse Attention.
+  arXiv:2502.11089.
+- Zhao, T., Jones, L. (2026). Fast-weight Product Key Memory.
+  arXiv:2601.00671.
+- Zhu, D., Huang, H., Huang, Z., Zeng, Y., Mao, Y., Wu, B., Min, Q.,
+  Zhou, X. (2024). Hyper-Connections. arXiv:2409.19606.
+
+## Appendix A. Training dynamics of the policy cell
+
+Figure 3 shows the full trajectories of both seeds (identical config and
+data stream; metrics logged every 50 steps, behavioural probes every 100).
+The shape is stereotyped. For ~500 steps the CE sits at the ln 128 floor
+while the write distillation falls: under β=1 the read is learning to
+apply the teacher code, and nothing behavioural has happened yet. The
+mastery-gated curriculum then doubles the pool (seed 42: 16→32 at step
+553, →64 at 814, →112 at 1004; seed 43's anneal fires ~10% later), the
+anneal fires on the 64-rule mastery (β: 1→0 over ~300 steps, shaded), and
+*all* of the
+behavioural competence — train, held, and the switch policy — is acquired
+after β=0, by TBPTT alone. Held accuracy tracks train accuracy throughout
+the climb in both seeds; there is no memorize-then-generalize phase at
+this diversity (contrast the ≤25-rule regime of §5).
+
+Two curves are worth reading against §9. First, the distillation loss
+*rises* after the anneal (0.03 → 0.76 / 0.30) while accuracy climbs — the
+post-anneal code drift of App. B, a health signal at β=0. Second, the two
+seeds' CE bands differ by construction of their attractors: seed 43
+answers at chance on the non-switched key's queries (~17% of query
+tokens) in every switch conversation. The runs have different lengths
+(seed 42 was stopped at 3000 steps, seed 43 ran to 4000), so the honest
+comparison is at matched step and learning rate: over steps 2500–3000,
+seed 43's CE band is ≈3.4 against seed 42's ≈0.5, and seed 43's extra
+1000 steps of LR decay (to 3e-5) only bring it to ≈2.5. A visible,
+persistent loss penalty is being paid, and gradient descent still does
+not cross between replacement policies.
+
+## Appendix B. Post-anneal code drift: the teacher is scaffolding
+
+The bootstrap teacher is a Fourier code — harmonics of s on Z_128 — and
+one might expect the trained write head to keep it. It does not, and the
+departure is worth documenting because it changes how such systems should
+be probed. Measured on the fresh-rule cell (the §7 checkpoint; anneal
+window [592, 892]) early and late in the post-anneal consolidation
+(steps 1200 → 2600), while rule accuracy climbed 0.46 → 0.80+:
+
+| probe on write codes | early consolidation | consolidated |
+|---|---|---|
+| within-rule cosine (reproducibility) | 0.971 | 0.997 |
+| between-rule cosine | 0.19 | 0.85 |
+| ridge decode of (cos, sin)(2πs/S), median error | 1.0 sym | 9.2 sym (≈chance) |
+| 1-NN identification vs empirical dictionary | 0.62 | 0.98 |
+
+The write leaves the interpolable Fourier circle and compresses into an
+*anisotropic cone*: one dominant shared direction plus small,
+ultra-reproducible per-rule residuals (the geometry of LM embedding
+tables, not of a positional code). Three consequences. (i) The rising
+distillation loss at β=0 is *health* — the write exploring its own code
+while accuracy follows; the same signal under β=1 is a pathology (the
+write fighting the gradient). The β value, not the distill value, carries
+the diagnosis. (ii) Generalization survives the departure: held rules are
+still written and read correctly after the circle is gone, so the
+teacher's geometry was never the load-bearing part — consistency was.
+(iii) *Probes age with the teacher.* A ridge decoder built on the teacher's
+geometry reports the write as dead while behaviour is at 0.98; after any
+anneal, geometry-agnostic probes (1-NN against an empirical code
+dictionary) must replace geometry-committed ones before concluding a
+write "encodes nothing". All identification numbers in this paper are
+1-NN for this reason.
+
+## Appendix C. Write-gate audit
+
+The write head can be gated: m_new = α · p ⊙ m, with α = σ(w_d·h) a scalar
+write/skip decision and p a per-dimension sigmoid. The headline recipe
+runs both OFF. A single-variable cell (identical recipe, gate ON) shows
+why, in three phases. (1) During the bootstrap the gate is genuinely
+selective (α ≈ 0.23–0.46) and *accelerates* the curriculum ~21–35%
+(milestones 167/317/467 vs 259/437/592): it suppresses the noisy
+near-zero writes of an unorganized write head, and write redundancy stays
+at 0.38–0.64 where the ungated cell sits at 0.99. (2) The same α costs
+the consolidation: writes scaled by α ≈ 0.25 leave the RMS-normalized
+code sphere prematurely, the off-circle drift of App. B starts early and
+lands badly — 1-NN code identification 0.24 vs 0.58 at matched steps,
+with genuine rule collisions — and post-anneal conversion runs 4–6×
+slower. (3) The model then repairs itself: α saturates to 1.0 (the gate
+self-neutralizes) and accuracy jumps 0.107 → 0.276 in the following
+steps. Saturation, often read as gate failure, is here the *repair*. The
+per-dimension gate p remains active after α's demise and keeps
+redundancy at 0.50 and bank effective rank at 4.6 (vs 0.99 and ~3.4
+ungated) — a
+per-dimension skimming role that survives, and the one component we would
+keep as a candidate for tasks where bank capacity binds. Net: the scalar
+decision α buys an earlier bootstrap and pays for it twice at
+consolidation; all headline results are gate OFF.
+
+## Appendix D. Read depth: organize first, then extend
+
+The headline model reads at block 0 only. On the harder S=256 variant of
+the task (fresh rules, same family), single-block application caps at
+~0.25 — and the cap is the read's *application depth*, shown by a
+two-cell contrast. Training reads on all 4 blocks *from scratch* never
+bootstraps: the CE never leaves the ln 256 floor for 900 steps and the
+distillation loss rises under β=1 — four injection points for a
+not-yet-organized code poison the trunk during the very phase that is
+supposed to organize it. *Grafting* the same 4-block read onto an
+already-organized single-read checkpoint (new blocks' output projections
+zero-initialized, LoRA-style, so the graft is a no-op at step 0) takes
+with no restart shock and climbs to 0.404 train / 0.383 held (103×
+chance, held ≥ train on several probes) and was still rising when the
+cell was cut. The recipe generalizes the paper's central training lesson:
+the loop must be organized before it is extended — the teacher plays this
+role for the write, the graft plays it for the read. At S=128 the
+single-block read suffices (§6) and no graft is used.
+
+## Appendix E. Negative results
+
+We list the failures that shaped the recipe; each was run to a diagnostic,
+not merely to a bad number.
+
+**Full structure randomization.** Randomizing structure *and* scale
+jointly — K drawn from 2–5 keys, 8–32 turns, unconstrained switches —
+never bootstraps at 3M parameters: CE stays at the ln 128 floor and the
+distillation loss rises, the signature of the ignore-bank fixed point
+re-forming (§5). The policy cell's randomization (K=2, 8–16 turns, ≤2
+switches) is as far as this model size crosses.
+
+**Fixed-schedule curricula.** A linear pool ramp starting at step 0
+destroys the mastery phase (the 16-rule regime lasts <50 steps): CE stays
+at floor and the write's variance is presentation noise, never rule
+identity. An anneal window placed by step count rather than mastery
+starves the loop the other way. Milestones must be earned, not scheduled.
+
+**Teacher loss form.** Distilling with MSE toward zero-mean targets is
+minimized by ‖w‖ → 0 — a degenerate write that satisfies the loss and
+carries nothing. The cosine form removes the loophole. Separately,
+β-blending without any distillation leaves the write at chance
+indefinitely: the read learns to use the teacher code (0.996 in
+isolation) but nothing ever pulls the write toward producing it. The pair
+(blend + cosine distill) is the minimal working combination (§5).
+
+**Outer-product read.** The classical fast-weight read (sum of slot
+outer-products applied to the query) is rank-limited to a fixed output
+direction per slot and cannot express an input-conditioned mapping; it
+never exceeded chance on rule application in any configuration. This
+failure motivated the hypernetwork read of §3.
+
+**Second family, all routes.** Every attempt to make one model carry two
+rule families (addition and affine y = ax+s) failed at this scale, each
+route with its own signature: *sequential* fine-tuning forgets the first
+family catastrophically within 100 steps regardless of curriculum pacing,
+and the ignore-bank fixed point re-forms on the new one; *mixed* training
+at full LR destroys the organized circuit in ~200 steps (the LR, not the
+mixture, is the destroyer — at LR/10 the anchor family is perfectly
+protected and even reaches its best-ever consolidation, 1.000/0.949);
+but at the protective LR the new family never installs (the trunk takes
+the bank-free path), and prolonged mixed training then erodes the anchor's
+*held* accuracy (0.949 → 0.449) while its train accuracy stays at 1.000 —
+memorization pressure degrading interpolation. A selective teacher kick
+on the organized model (teacher on the new family only, blind on the
+anchor) protects the anchor perfectly and still fails to install: the
+drifted write cone (App. B) does not stretch toward a second code
+geometry at low LR, and distillation never converges. A capacity-matched
+from-scratch mix (56+56 rules) installs neither family — 56 rules per
+family is below the diversity threshold of §5. And the multiplicative
+family alone (y = 3x+s), with the exact headline recipe, bootstraps its
+curriculum on schedule but never *decides*: the ablation gap opens (+0.2)
+yet post-anneal accuracy stays at chance, with no consolidation climb.
+None of these is a wall we claim fundamental; all are walls at 3M
+parameters and one GPU, and the decomposition (LR-fragility vs diversity
+threshold vs code-geometry rigidity) is what a scale-up should test
+first.

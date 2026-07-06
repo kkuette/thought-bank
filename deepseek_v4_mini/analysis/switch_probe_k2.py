@@ -21,8 +21,9 @@ Arms:
 
 Usage: PYTHONPATH=. python deepseek_v4_mini/analysis/switch_probe_k2.py [ckpt]
        [--cfg <yaml>] [--sweep]   (--sweep: switch-position invariance sweep)
+       [--dump <out.json>]        (per-turn accuracy + old-rule-match arrays)
 """
-import sys, torch, torch.nn.functional as F
+import json, sys, torch, torch.nn.functional as F
 
 WT = "."
 sys.path.insert(0, WT)
@@ -31,6 +32,7 @@ from deepseek_v4_mini.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space
 
 torch.manual_seed(0)
+DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CKPT = (sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else
         "checkpoints/multiturn_rule_k2_inter_s128_dsv4m/final.pt")
 CFG  = "deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128_dsv4m.yaml"
@@ -45,8 +47,8 @@ raw = yaml.safe_load(open(CFG))
 cfg = ThoughtBankConfig.from_yaml(CFG)
 model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")
-model.load_state_dict(sd["model"]); model.eval()
-print(f"loaded {CKPT.split('/')[-2]}/{CKPT.split('/')[-1]} (step {sd['step']})")
+model.load_state_dict(sd["model"]); model.eval(); model.to(DEV)
+print(f"loaded {CKPT.split('/')[-2]}/{CKPT.split('/')[-1]} (step {sd['step']}) | device {DEV.type}")
 
 _units, _n, TRAIN, HELD, _apply = _rule_space(raw["data"])
 TRAIN_T, HELD_T = torch.tensor(TRAIN), torch.tensor(HELD)
@@ -90,9 +92,9 @@ def clean_codes(rids):
             for j, xi in enumerate(perm):
                 X[r, 1 + 2 * j] = SYM_OFF + xi
                 X[r, 2 + 2 * j] = SYM_OFF + _apply(int(rid), xi)
-        out = model(X, init_mem=None, compute_logits=False)
-        codes[i0:i0 + len(chunk)] = out["mem_bank"][:, -1]
-    return F.normalize(codes, dim=1)
+        out = model(X.to(DEV), init_mem=None, compute_logits=False)
+        codes[i0:i0 + len(chunk)] = out["mem_bank"][:, -1].cpu()
+    return F.normalize(codes, dim=1).to(DEV)
 
 ALL_RIDS = TRAIN + HELD
 DICT = clean_codes(ALL_RIDS)                       # [R, D] unit-norm
@@ -102,7 +104,7 @@ def nn_ident(bank, target_rid):
     """Fraction of lanes whose bank contains >=1 slot 1-NN-matching target_rid."""
     sl = F.normalize(bank.float(), dim=2)          # [N, slots, D]
     sim = torch.einsum("nsd,rd->nsr", sl, DICT)    # [N, slots, R]
-    nn = sim.argmax(-1)                            # [N, slots]
+    nn = sim.argmax(-1).cpu()                      # [N, slots]
     hit = torch.zeros(bank.size(0), dtype=torch.bool)
     for b in range(bank.size(0)):
         hit[b] = bool((nn[b] == RID_IDX[int(target_rid[b])]).any())
@@ -119,10 +121,10 @@ def run(turns, sw, s2_pool, s1_pool=None):
         ex[k], un[k] = fresh_pools()
     mem = None
     for k in range(K):
-        out = model(present_seg(s[:, k], k, ex[k]), init_mem=mem, compute_logits=False)
+        out = model(present_seg(s[:, k], k, ex[k]).to(DEV), init_mem=mem, compute_logits=False)
         mem = out["mem_bank"]
     s1 = s[:, 0].clone()
-    acc = {0: [], 1: []}; stick_n = stick_hit = 0
+    acc = {0: [], 1: []}; old_acc = {0: [], 1: []}; stick_n = stick_hit = 0
     ident_s1_pre = ident_s1_post = ident_s2_post = None
     q_cnt = [0] * K
     for t in range(turns):
@@ -131,7 +133,7 @@ def run(turns, sw, s2_pool, s1_pool=None):
             s[:, 0] = draw(s2_pool, N, avoid=s[:, 0])      # switch key0 -> s2
             ex[0], un[0] = fresh_pools()
             q_cnt[0] = 0
-            out = model(present_seg(s[:, 0], 0, ex[0]), init_mem=mem, compute_logits=False)
+            out = model(present_seg(s[:, 0], 0, ex[0]).to(DEV), init_mem=mem, compute_logits=False)
             mem = out["mem_bank"]
         k = t % K
         xq = torch.zeros(N, 2, dtype=torch.long)
@@ -139,18 +141,21 @@ def run(turns, sw, s2_pool, s1_pool=None):
         q = torch.tensor([un[k][b][q_cnt[k] % len(un[k][b])] for b in range(N)])
         q_cnt[k] += 1
         xq[:, 1] = SYM_OFF + q
-        out = model(xq, init_mem=mem, compute_logits=True)
+        out = model(xq.to(DEV), init_mem=mem, compute_logits=True)
         mem = out["mem_bank"]
-        pred = out["logits"][:, -1].argmax(-1)
+        pred = out["logits"][:, -1].argmax(-1).cpu()
         y = SYM_OFF + torch.tensor([_apply(int(s[b, k]), int(q[b])) for b in range(N)])
         acc[k].append(float((pred == y).float().mean()))
+        if k == 0:                                         # per-turn old-rule match
+            y_old = SYM_OFF + torch.tensor([_apply(int(s1[b]), int(q[b])) for b in range(N)])
+            old_acc[0].append(float((pred == y_old).float().mean()))
         if sw and t >= sw and k == 0:                      # STICK: old-rule answers
             y_old = SYM_OFF + torch.tensor([_apply(int(s1[b]), int(q[b])) for b in range(N)])
             stick_n += N; stick_hit += int((pred == y_old).sum())
     if sw:
         ident_s1_post = nn_ident(mem, s1)                  # s1 still in bank at end?
         ident_s2_post = nn_ident(mem, s[:, 0])
-    return acc, (stick_hit / stick_n if stick_n else None), ident_s1_pre, ident_s1_post, ident_s2_post
+    return acc, (stick_hit / stick_n if stick_n else None), ident_s1_pre, ident_s1_post, ident_s2_post, old_acc
 
 def fmt(a): return " ".join(f"{v:.2f}" for v in a)
 
@@ -163,8 +168,9 @@ ARMS = {
 }
 if "--sweep" in sys.argv:   # switch-POSITION invariance: same 16-turn conv, sw moves
     ARMS = {f"sw@{p:<2}   ": (16, p, TRAIN_T, None) for p in (2, 4, 6, 8, 10, 12, 14)}
+dump = {}
 for name, (turns, sw, pool, s1p) in ARMS.items():
-    acc, stick, i1pre, i1post, i2post = run(turns, sw, pool, s1p)
+    acc, stick, i1pre, i1post, i2post, old_acc = run(turns, sw, pool, s1p)
     k0, k1 = acc[0], acc[1]
     line = f"{name} key0[{fmt(k0)}] key1[{fmt(k1)}]"
     if sw:
@@ -174,3 +180,12 @@ for name, (turns, sw, pool, s1p) in ARMS.items():
                  f" STICK={stick:.3f} | key1 avg={sum(k1)/len(k1):.3f}"
                  f" | bank1NN s1: pre-sw {i1pre:.2f} end {i1post:.2f} ; s2 end {i2post:.2f}")
     print(line)
+    dump[name.strip()] = {
+        "turns": turns, "sw": sw, "key0": k0, "key1": k1,
+        "key0_old_rule": old_acc[0], "stick": stick,
+        "ident_s1_pre": i1pre, "ident_s1_end": i1post, "ident_s2_end": i2post,
+    }
+if "--dump" in sys.argv:
+    out = sys.argv[sys.argv.index("--dump") + 1]
+    json.dump({"ckpt": CKPT, "arms": dump}, open(out, "w"), indent=1)
+    print("dumped ->", out)

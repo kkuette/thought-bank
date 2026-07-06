@@ -245,3 +245,8 @@ checkpoints/, runs/      ← training outputs
 - DeepSeek-V4 (architecture base), DeepSeekMoE (Dai et al., 2024)
 - Hyper-Connections (Zhu et al., 2025), Muon optimizer (Jordan et al., 2024)
 - Thought-memory baseline: [`thought_lm_minimal/`](thought_lm_minimal/)
+
+## License
+
+MIT — see [LICENSE](LICENSE). The paper (`paper/`) is distributed under the
+arXiv.org perpetual, non-exclusive license.
