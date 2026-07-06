@@ -1,4 +1,4 @@
-# DeepSeekV4Mini – small config (single RTX 3090, 24 GB)
+# TrunkLM – small config (single RTX 3090, 24 GB)
 # python -m deepseek_v4_mini.train deepseek_v4_mini/configs/small.yaml
 #
 # Vocab note: the DeepSeek-V3 tokenizer has a ~129k vocabulary. With weight-tied

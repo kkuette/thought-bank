@@ -1,4 +1,4 @@
-# DeepSeekV4Mini – tiny config (~8M params, CPU/single-GPU experimentation)
+# TrunkLM – tiny config (~8M params, CPU/single-GPU experimentation)
 # python -m deepseek_v4_mini.train deepseek_v4_mini/configs/tiny.yaml
 
 # ── Model ─────────────────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-# DeepSeekV4Mini – CPU smoke-test, WITH memory bank
+# TrunkLM – CPU smoke-test, WITH memory bank
 vocab_size: 50257
 d_model: 64
 n_layers: 2

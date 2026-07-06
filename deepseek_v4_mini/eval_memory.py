@@ -1,10 +1,10 @@
 """
-Architecture comparison: DeepSeekV4Mini (no bank) vs DualModalDeepSeekV4Mini (with bank).
+Architecture comparison: TrunkLM (no bank) vs ThoughtBankLM (with bank).
 
 Measures per chunk of text:
   - PPL (no_mem)      : DualModal with init_mem=None each chunk (no carry-over)
   - PPL (with_mem)    : DualModal with accumulated memory bank (carry-over)
-  - PPL (no_bank)     : baseline DeepSeekV4Mini (no memory at all)
+  - PPL (no_bank)     : baseline TrunkLM (no memory at all)
   - logit_drift       : ||logits_with_mem - logits_no_mem||  per token
   - bank diagnostics  : size, vector norms, intra-bank cosine similarity
 
@@ -30,8 +30,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from .config import DeepSeekV4MiniConfig
-from .model import DeepSeekV4Mini, DualModalDeepSeekV4Mini
+from .config import ThoughtBankConfig
+from .model import TrunkLM, ThoughtBankLM
 
 
 # ── Synthetic text ────────────────────────────────────────────────────────────
@@ -111,8 +111,8 @@ def _bank_stats(bank: Optional[torch.Tensor]):
 
 @torch.no_grad()
 def evaluate(
-    dual_model: DualModalDeepSeekV4Mini,
-    base_model: Optional[DeepSeekV4Mini],
+    dual_model: ThoughtBankLM,
+    base_model: Optional[TrunkLM],
     tokens: torch.LongTensor,
     seq_len: int,
     device: torch.device,
@@ -123,7 +123,7 @@ def evaluate(
     For each chunk records:
       ppl_with_mem    DualModal with accumulated bank
       ppl_no_mem      DualModal cold-start (no bank)
-      ppl_no_bank     baseline DeepSeekV4Mini (if provided)
+      ppl_no_bank     baseline TrunkLM (if provided)
       logit_drift     mean L2 between with/without memory logits
       bank_size / bank_norm / bank_diversity  memory bank health
       write_gate      mean write-gate probability
@@ -162,7 +162,7 @@ def evaluate(
         # Logit drift: how much does the memory change predictions?
         drift = (out_mem["logits"] - out_cold["logits"]).norm(dim=-1).mean().item()
 
-        # Baseline: DeepSeekV4Mini (no bank at all)
+        # Baseline: TrunkLM (no bank at all)
         ppl_base = None
         if base_model is not None:
             out_base = base_model(x)
@@ -199,14 +199,14 @@ def _mean(xs: list) -> float:
 
 def _print_report(
     records: list[dict],
-    dual_cfg: DeepSeekV4MiniConfig,
+    dual_cfg: ThoughtBankConfig,
     dual_params: int,
     base_params: Optional[int],
 ) -> None:
     has_base = records[0]["ppl_no_bank"] is not None
 
     print("\n" + "=" * 76)
-    print("  Architecture Comparison: DeepSeekV4Mini vs DualModalDeepSeekV4Mini")
+    print("  Architecture Comparison: TrunkLM vs ThoughtBankLM")
     print("=" * 76)
     print(
         f"  DualModal  : {dual_params:,} params  |  max_mem={dual_cfg.max_mem}"
@@ -307,9 +307,9 @@ def _print_report(
 def _parse_args():
     p = argparse.ArgumentParser(description="Compare memory vs no-memory architectures")
     p.add_argument("--cfg_mem",  type=Path, default=None,
-                   help="Config for DualModalDeepSeekV4Mini (with memory bank)")
+                   help="Config for ThoughtBankLM (with memory bank)")
     p.add_argument("--cfg_base", type=Path, default=None,
-                   help="Config for DeepSeekV4Mini baseline (no bank)")
+                   help="Config for TrunkLM baseline (no bank)")
     p.add_argument("--ckpt_mem",  type=Path, default=None,
                    help="Checkpoint for the DualModal model")
     p.add_argument("--ckpt_base", type=Path, default=None,
@@ -333,14 +333,14 @@ def main() -> None:
 
     # ── DualModal (with memory bank) ──────────────────────────────────────────
     if cfg_mem_path and cfg_mem_path.exists():
-        dual_cfg = DeepSeekV4MiniConfig.from_yaml(cfg_mem_path)
+        dual_cfg = ThoughtBankConfig.from_yaml(cfg_mem_path)
         print(f"DualModal config loaded from {cfg_mem_path}")
     else:
-        dual_cfg = DeepSeekV4MiniConfig.tiny()
+        dual_cfg = ThoughtBankConfig.tiny()
         dual_cfg.use_dual_stream = True
         print("DualModal: using tiny config (random weights — mechanism test only)")
 
-    dual_model = DualModalDeepSeekV4Mini(dual_cfg).to(device)
+    dual_model = ThoughtBankLM(dual_cfg).to(device)
 
     if ckpt_mem_path and ckpt_mem_path.exists():
         state = torch.load(ckpt_mem_path, map_location=device)
@@ -350,10 +350,10 @@ def main() -> None:
         print("DualModal: no checkpoint — using random weights")
 
     # ── Baseline (no memory bank) ─────────────────────────────────────────────
-    base_model: Optional[DeepSeekV4Mini] = None
+    base_model: Optional[TrunkLM] = None
     if args.cfg_base and args.cfg_base.exists():
-        base_cfg   = DeepSeekV4MiniConfig.from_yaml(args.cfg_base)
-        base_model = DeepSeekV4Mini(base_cfg).to(device)
+        base_cfg   = ThoughtBankConfig.from_yaml(args.cfg_base)
+        base_model = TrunkLM(base_cfg).to(device)
         if args.ckpt_base and args.ckpt_base.exists():
             state = torch.load(args.ckpt_base, map_location=device)
             base_model.load_state_dict(state["model"])

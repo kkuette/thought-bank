@@ -1,0 +1,110 @@
+# dsv4x — structure-randomized at S=32: POLICY-ONLY fallback (user, 2026-07-05).
+#
+# Fires only if dsv4w (S=128 softened) also stays flat. Capacity hypothesis
+# (user): S=256 never solved (0.25 ceiling), S=128 solved exactly (dsv4m,
+# full 4000 steps), and structure randomization adds load -> S=128 may now
+# saturate the model. S=32 removes the representation load to isolate ONE
+# question: is the memory POLICY (retention/switch/multi-key) trainable at
+# all on this architecture?
+#
+# NOT just policy-only (user insight): random mid-conversation rule switches
+# may PREVENT read memorization — the diversity threshold ((25,112]) was
+# measured on FROZEN structure. mod 4 -> pools 24 train / 7 held = the EXACT
+# historical S=32 interleaved pools (held {4,8,..,28}, held 0.000 across the
+# whole read-gen campaign). ONE variable vs that regime = the structure
+# distribution. held > 0 here = STRUCTURAL diversity substitutes for rule
+# diversity (major); held 0 = the threshold is about rule count per se, cell
+# still answers "is the policy trainable" and S scales back up afterwards.
+# Same structure knobs as dsv4w: K=2, turns [8,16], switch_max 2, max_mem 8.
+# Anneal at FULL-pool mastery (28); ce_thresh rescaled 4.3->2.9 (~0.85*lnS).
+vocab_size: 48
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+n_hc: 2
+sinkhorn_iters: 20
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+mem_dim: 32
+max_mem: 8
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+balance_loss_weight: 0.0001
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+mem_code_mixup_start: 500
+mem_read_swiglu: true
+mem_write_gate: false
+mem_teacher_forcing: true
+mem_teacher_fourier: true
+mem_teacher_fourier_kmax: 8
+mem_teacher_distill_cosine: true
+mem_teacher_anneal_start: 2600
+mem_teacher_anneal_end: 3100
+mem_teacher_anneal_len: 300
+mem_teacher_distill_weight: 2.0
+training:
+  device: auto
+  seed: 42
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: wsd
+  wsd_decay_start: 3000
+  wsd_decay_at_anneal_end: true
+  wsd_decay_offset: 800
+  teacher_lr: 3e-4
+  muon_lr: 0.00375
+  weight_decay: 0.1
+  muon_rms_match: true
+  adam_eps: 1.0e-20
+  steps: 4000
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 20
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_s32_dsv4x
+  run_name: dsv4mini_multiturn_rule_k2_inter_s32_dsv4x
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s32_dsv4x/metrics.jsonl
+data:
+  task: multiturn_rule
+  n_symbols: 32
+  n_examples: 6
+  turns_per_conv: 8
+  turns_range:
+  - 8
+  - 16
+  switch_phase_min: 4
+  switch_phase_max: 12
+  n_contexts: 2
+  rule_family: affine
+  affine_units:
+  - 1
+  heldout_rule_mod: 4
+  batch_size: 64
+  curriculum_rules_start: 16
+  curriculum_mode: mastery
+  curriculum_ce_thresh: 2.9
+  curriculum_dwell_min: 150
+  curriculum_pool_full_n: 24
+  switch_max: 2
+mem_read_spectral_norm: false
+mem_read_layers:
+- 0

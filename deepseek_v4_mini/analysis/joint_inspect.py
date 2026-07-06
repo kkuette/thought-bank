@@ -25,8 +25,8 @@ prove absence of information (a trained linear decoder is the next measure).
 """
 import sys, torch, torch.nn.functional as F
 sys.path.insert(0, ".")
-from deepseek_v4_mini.config import DeepSeekV4MiniConfig
-from deepseek_v4_mini.model import DualModalDeepSeekV4Mini
+from deepseek_v4_mini.config import ThoughtBankConfig
+from deepseek_v4_mini.model import ThoughtBankLM
 
 torch.manual_seed(0)
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/multiturn_rule_joint/step_1200.pt"
@@ -35,8 +35,8 @@ S, m, SYM_OFF = 32, 6, 3
 SW, TURNS = 24, 40          # queries on s1, total query turns
 N = 64
 
-cfg = DeepSeekV4MiniConfig.from_yaml(CFG)
-model = DualModalDeepSeekV4Mini(cfg)
+cfg = ThoughtBankConfig.from_yaml(CFG)
+model = ThoughtBankLM(cfg)
 model.load_state_dict(torch.load(CKPT, map_location="cpu")["model"]); model.eval()
 print(f"loaded {CKPT}")
 

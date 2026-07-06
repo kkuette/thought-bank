@@ -1,10 +1,10 @@
 """
 Two model variants:
 
-DeepSeekV4Mini  (single-stream, legacy)
+TrunkLM  (single-stream, legacy)
   Text stream only. Optional bolt-on thought memory (cross-attention read).
 
-DualModalDeepSeekV4Mini  (fast-weight thought bank, recommended)
+ThoughtBankLM  (fast-weight thought bank, recommended)
   Text stream [B, T, d_model] processed by CSA/HCA blocks with mHC. A rolling
   thought bank [B, M, mem_dim] is READ as FAST WEIGHTS at every text block: each
   slot parametrises a low-rank MLP layer and the text stream is passed through the
@@ -21,14 +21,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import DeepSeekV4MiniConfig
+from .config import ThoughtBankConfig
 from .mhc import ManifoldHyperConnections, RMSNorm
 from .attention import CompressedSparseAttention, HeavilyCompressedAttention
 from .moe import DeepSeekMoE
 from .memory import ThoughtStream
 
 
-# ── Legacy bolt-on thought-memory components (DeepSeekV4Mini only) ────────────
+# ── Legacy bolt-on thought-memory components (TrunkLM only) ────────────
 
 class _MemoryCrossAttention(nn.Module):
     """Read from a thought-vector memory bank via cross-attention."""
@@ -77,11 +77,11 @@ class _ThoughtHead(nn.Module):
 
 # ── Single transformer block (legacy) ─────────────────────────────────────────
 
-class DeepSeekV4Block(nn.Module):
+class TrunkBlock(nn.Module):
     """One transformer block: two mHC-wrapped sub-layers (attention + MoE).
     Even layer_idx → CSA; odd → HCA."""
 
-    def __init__(self, cfg: DeepSeekV4MiniConfig, layer_idx: int) -> None:
+    def __init__(self, cfg: ThoughtBankConfig, layer_idx: int) -> None:
         super().__init__()
         if layer_idx % 2 == 0:
             attn: nn.Module = CompressedSparseAttention(
@@ -129,10 +129,10 @@ class DeepSeekV4Block(nn.Module):
 
 # ── Full model (legacy) ───────────────────────────────────────────────────────
 
-class DeepSeekV4Mini(nn.Module):
+class TrunkLM(nn.Module):
     """Small DeepSeek-V4 reproduction with optional bolt-on thought memory."""
 
-    def __init__(self, cfg: DeepSeekV4MiniConfig) -> None:
+    def __init__(self, cfg: ThoughtBankConfig) -> None:
         super().__init__()
         self.cfg = cfg
 
@@ -140,7 +140,7 @@ class DeepSeekV4Mini(nn.Module):
         self.drop  = nn.Dropout(cfg.dropout)
 
         self.blocks = nn.ModuleList(
-            [DeepSeekV4Block(cfg, i) for i in range(cfg.n_layers)]
+            [TrunkBlock(cfg, i) for i in range(cfg.n_layers)]
         )
 
         self.A_out_net = nn.Linear(cfg.d_model, cfg.n_hc, bias=False)
@@ -211,7 +211,7 @@ class DeepSeekV4Mini(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     @classmethod
-    def from_config(cls, cfg: DeepSeekV4MiniConfig) -> "DeepSeekV4Mini":
+    def from_config(cls, cfg: ThoughtBankConfig) -> "TrunkLM":
         return cls(cfg)
 
 
@@ -243,7 +243,7 @@ class DualModalBlock(nn.Module):
     is a delta added to the token: h + fw_o(y - y0), so a trivial bank ≈ identity.
     """
 
-    def __init__(self, cfg: DeepSeekV4MiniConfig, layer_idx: int) -> None:
+    def __init__(self, cfg: ThoughtBankConfig, layer_idx: int) -> None:
         super().__init__()
         d    = cfg.d_model
         n_hc = cfg.n_hc
@@ -360,7 +360,7 @@ class DualModalBlock(nn.Module):
 
 # ── Fast-weight dual-stream model ─────────────────────────────────────────────
 
-class DualModalDeepSeekV4Mini(nn.Module):
+class ThoughtBankLM(nn.Module):
     """
     Text stream + fast-weight thought bank (single-stream bank).
 
@@ -378,7 +378,7 @@ class DualModalDeepSeekV4Mini(nn.Module):
     next turn for multi-turn / streaming continual learning.
     """
 
-    def __init__(self, cfg: DeepSeekV4MiniConfig) -> None:
+    def __init__(self, cfg: ThoughtBankConfig) -> None:
         super().__init__()
         self.cfg = cfg
 
@@ -454,3 +454,8 @@ class DualModalDeepSeekV4Mini(nn.Module):
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+
+# Legacy aliases (pre-rename scripts)
+DeepSeekV4Mini = TrunkLM
+DualModalDeepSeekV4Mini = ThoughtBankLM

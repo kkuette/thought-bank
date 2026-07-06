@@ -32,8 +32,8 @@ import torch.nn.functional as Fn
 import yaml
 
 from deepseek_v4_mini import train as T
-from deepseek_v4_mini.config import DeepSeekV4MiniConfig
-from deepseek_v4_mini.model import DualModalDeepSeekV4Mini
+from deepseek_v4_mini.config import ThoughtBankConfig
+from deepseek_v4_mini.model import ThoughtBankLM
 
 
 def main() -> None:
@@ -44,9 +44,9 @@ def main() -> None:
     with open(cfg_path) as f:
         raw = yaml.safe_load(f)
     d = raw["data"]
-    model_cfg = DeepSeekV4MiniConfig.from_yaml(cfg_path)
+    model_cfg = ThoughtBankConfig.from_yaml(cfg_path)
     device = torch.device("cpu")
-    model = DualModalDeepSeekV4Mini(model_cfg).to(device)
+    model = ThoughtBankLM(model_cfg).to(device)
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model"])
     model.eval()

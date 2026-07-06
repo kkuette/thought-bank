@@ -19,19 +19,19 @@ Usage: PYTHONPATH=. python deepseek_v4_mini/analysis/canonical_ident.py [ckpt] [
 """
 import sys, yaml, torch, torch.nn.functional as F
 sys.path.insert(0, ".")
-from deepseek_v4_mini.config import DeepSeekV4MiniConfig
-from deepseek_v4_mini.model import DualModalDeepSeekV4Mini
+from deepseek_v4_mini.config import ThoughtBankConfig
+from deepseek_v4_mini.model import ThoughtBankLM
 
 torch.manual_seed(0)
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/multiturn_rule_switch/step_1100.pt"
 CFG  = sys.argv[2] if len(sys.argv) > 2 else "deepseek_v4_mini/configs/multiturn_rule_switch.yaml"
 S, m, SYM_OFF, N = 32, 6, 3, 64
 
-cfg = DeepSeekV4MiniConfig.from_yaml(CFG)
+cfg = ThoughtBankConfig.from_yaml(CFG)
 _d    = yaml.safe_load(open(CFG)).get("data", {})
 SW    = int(_d.get("switch_at", 12))
 TURNS = int(_d.get("turns_per_conv", 24))
-model = DualModalDeepSeekV4Mini(cfg)
+model = ThoughtBankLM(cfg)
 model.load_state_dict(torch.load(CKPT, map_location="cpu")["model"]); model.eval()
 print(f"loaded {CKPT}")
 

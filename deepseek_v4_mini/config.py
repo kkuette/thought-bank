@@ -7,7 +7,7 @@ import yaml
 
 
 @dataclass
-class DeepSeekV4MiniConfig:
+class ThoughtBankConfig:
     # ── Core dimensions ──────────────────────────────────────────────────────
     vocab_size: int = 32000
     d_model: int = 256
@@ -48,10 +48,10 @@ class DeepSeekV4MiniConfig:
     mem_read_dropout: float = 0.0  # dropout inside the fast-weight MLP layers
 
     # ── Model selection ───────────────────────────────────────────────────────
-    # True  → DualModalDeepSeekV4Mini (text stream + fast-weight thought bank).
-    # False → DeepSeekV4Mini (legacy text-only, optional bolt-on memory below).
+    # True  → ThoughtBankLM (text stream + fast-weight thought bank).
+    # False → TrunkLM (legacy text-only, optional bolt-on memory below).
     use_dual_stream: bool = True
-    use_thought_memory: bool = False    # legacy DeepSeekV4Mini bolt-on memory only
+    use_thought_memory: bool = False    # legacy TrunkLM bolt-on memory only
 
     # ── Training ──────────────────────────────────────────────────────────────
     balance_loss_weight: float = 1e-4   # MoE balance loss weight (paper §4.2.2: 0.0001)
@@ -162,7 +162,7 @@ class DeepSeekV4MiniConfig:
 
     # ── Factory helpers ───────────────────────────────────────────────────────
     @classmethod
-    def tiny(cls) -> "DeepSeekV4MiniConfig":
+    def tiny(cls) -> "ThoughtBankConfig":
         """~8M params – fast CPU/single-GPU experimentation."""
         return cls(
             d_model=128, n_layers=4, n_heads=2, d_head=32,
@@ -173,7 +173,7 @@ class DeepSeekV4MiniConfig:
         )
 
     @classmethod
-    def small(cls) -> "DeepSeekV4MiniConfig":
+    def small(cls) -> "ThoughtBankConfig":
         """~50M params – single RTX 3090 training target."""
         return cls(
             d_model=256, n_layers=6, n_heads=4, d_head=64,
@@ -184,8 +184,13 @@ class DeepSeekV4MiniConfig:
         )
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "DeepSeekV4MiniConfig":
+    def from_yaml(cls, path: Path) -> "ThoughtBankConfig":
         with open(path) as f:
             data = yaml.safe_load(f) or {}
         fields = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
         return cls(**fields)
+
+
+# Legacy alias (pre-rename scripts; the project is Thought Bank, the class
+# carried the name of the DeepSeek-V4 architecture it borrows its trunk from)
+DeepSeekV4MiniConfig = ThoughtBankConfig

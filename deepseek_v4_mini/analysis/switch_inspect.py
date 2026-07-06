@@ -21,8 +21,8 @@ bank yet never used. Memory policy is task-adaptive/minimal.
 """
 import sys, torch, torch.nn.functional as F
 sys.path.insert(0, ".")
-from deepseek_v4_mini.config import DeepSeekV4MiniConfig
-from deepseek_v4_mini.model import DualModalDeepSeekV4Mini
+from deepseek_v4_mini.config import ThoughtBankConfig
+from deepseek_v4_mini.model import ThoughtBankLM
 
 torch.manual_seed(0)
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/multiturn_rule_switch/step_1100.pt"
@@ -30,8 +30,8 @@ CFG  = "deepseek_v4_mini/configs/multiturn_rule_switch.yaml"
 S, m, SYM_OFF, SW, TURNS = 32, 6, 3, 12, 24
 N = 96                                   # conversations (batched lanes)
 
-cfg = DeepSeekV4MiniConfig.from_yaml(CFG)
-model = DualModalDeepSeekV4Mini(cfg)
+cfg = ThoughtBankConfig.from_yaml(CFG)
+model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")
 model.load_state_dict(sd["model"]); model.eval()
 print(f"loaded {CKPT} (step {sd['step']})")
