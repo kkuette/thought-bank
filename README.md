@@ -114,15 +114,23 @@ bash repro/run_all.sh
 
 ### Use the model
 ```python
-from deepseek_v4_mini import DualModalDeepSeekV4Mini, DeepSeekV4MiniConfig
+from deepseek_v4_mini import ThoughtBankLM, ThoughtBankConfig
 import torch
 
-cfg   = DeepSeekV4MiniConfig.tiny()
-model = DualModalDeepSeekV4Mini(cfg)
+cfg   = ThoughtBankConfig.tiny()
+model = ThoughtBankLM(cfg)
 ids   = torch.randint(0, cfg.vocab_size, (2, 64))
 
-out  = model(ids)                            # first pass: empty bank
-out2 = model(ids, init_mem=out["mem_bank"])  # carry the bank forward
+out  = model(ids)                            # first segment: fresh (random-seed) bank
+out2 = model(ids, init_mem=out["mem_bank"])  # carry the bank to the next segment
+```
+
+To probe a paper checkpoint instead:
+```python
+cfg   = ThoughtBankConfig.from_yaml("deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w.yaml")
+model = ThoughtBankLM(cfg)
+model.load_state_dict(torch.load("checkpoints/multiturn_rule_k2_inter_s128_dsv4w/step_3000.pt",
+                                 map_location="cpu")["model"])
 ```
 
 ---
