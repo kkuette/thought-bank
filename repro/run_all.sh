@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end reproduction of the paper's Tables 2-4 and Figures 3-5 from a
+# End-to-end reproduction of the paper's Tables 1-4 (PDF numbering) and Figures 3-5 from a
 # fresh clone. Three training runs (GPU, ~5 h each on one RTX 3090), then
 # probes and figures (CPU).
 #
@@ -28,13 +28,13 @@ CFG_S43=$CFG/multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml
 
 # ---------------------------------------------------------------- training
 if [[ "${1:-}" != "--skip-train" ]]; then
-  echo "=== [1/3] fixed-structure cell (dsv4m, seed 42) — Table 3 + Fig 5 zero-shot arm"
+  echo "=== [1/3] fixed-structure cell (dsv4m, seed 42) — Table 2 + Fig 5 zero-shot arm"
   $PY -m deepseek_v4_mini.train $CFG/multiturn_rule_k2_inter_s128_dsv4m.yaml
 
-  echo "=== [2/3] policy cell (dsv4w, seed 42) — Tables 2/4, Figs 3-5"
+  echo "=== [2/3] policy cell (dsv4w, seed 42) — Tables 1/3, Figs 3-5"
   $PY -m deepseek_v4_mini.train $CFG_W
 
-  echo "=== [3/3] policy cell (dsv4w_s43, seed 43) — Tables 2, Figs 3-5"
+  echo "=== [3/3] policy cell (dsv4w_s43, seed 43) — Tables 1/4, Figs 3-5"
   $PY -m deepseek_v4_mini.train $CFG_S43
 fi
 
@@ -43,16 +43,16 @@ for f in $CKPT_M $CKPT_W $CKPT_S43; do
 done
 
 # ------------------------------------------------------------------ probes
-echo "=== Table 3 — bank vs TTT vs ICL vs ablate (held pool + subtraction), dsv4m"
-$PY $AN/ttt_demo.py $CKPT_M          | tee "$OUT/table3_held.txt"
-$PY $AN/ttt_demo.py $CKPT_M --train-pool | tee "$OUT/table3_train.txt"
-$PY $AN/ttt_demo.py $CKPT_M --sub    | tee "$OUT/table3_subtraction.txt"
+echo "=== Table 2 — bank vs TTT vs ICL vs ablate (held pool + subtraction), dsv4m"
+$PY $AN/ttt_demo.py $CKPT_M          | tee "$OUT/table2_held.txt"
+$PY $AN/ttt_demo.py $CKPT_M --train-pool | tee "$OUT/table2_train.txt"
+$PY $AN/ttt_demo.py $CKPT_M --sub    | tee "$OUT/table2_subtraction.txt"
 
-echo "=== Table 4 — replacement under concurrent load, bank vs sequential TTT, dsv4w@3000"
-$PY $AN/ttt_demo_act2.py $CKPT_W         | tee "$OUT/table4_train.txt"
-$PY $AN/ttt_demo_act2.py $CKPT_W --held  | tee "$OUT/table4_held.txt"
+echo "=== Table 3 — replacement under concurrent load, bank vs sequential TTT, dsv4w@3000"
+$PY $AN/ttt_demo_act2.py $CKPT_W         | tee "$OUT/table3_train.txt"
+$PY $AN/ttt_demo_act2.py $CKPT_W --held  | tee "$OUT/table3_held.txt"
 
-echo "=== Table 2 + Fig 5 — switch arms and position sweeps, all three models"
+echo "=== Tables 1+4 + Fig 5 — switch arms and position sweeps, all three models"
 $PY $AN/switch_probe_k2.py $CKPT_M                    | tee "$OUT/switch_arms_dsv4m.txt"
 $PY $AN/switch_probe_k2.py $CKPT_W   --cfg $CFG_W     | tee "$OUT/switch_arms_dsv4w.txt"
 $PY $AN/switch_probe_k2.py $CKPT_S43 --cfg $CFG_S43   | tee "$OUT/switch_arms_s43.txt"

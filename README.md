@@ -35,7 +35,7 @@ Three claims, all on a 3.08M-parameter DeepSeek-style trunk with an
    randomizing conversation *structure* at training time installs the
    full policy.
 
-Reproduce Tables 2–4 and Figures 3–5 from a fresh clone:
+Reproduce Tables 1–4 and Figures 3–5 from a fresh clone:
 ```bash
 bash repro/run_all.sh               # 3 training runs (~5 h each, one RTX 3090) + probes + figures
 bash repro/run_all.sh --skip-train  # probes + figures on existing checkpoints
@@ -259,8 +259,8 @@ slot count identical:
 | `configs/code_persist.yaml` | codeparrot (Python) | bank **persists** across steps |
 | `configs/synth_recall.yaml` | synthetic | addressable key→value recall test |
 | `configs/gist.yaml` | synthetic | latent-context (gist) test |
-| `configs/multiturn_rule_k2_inter_s128_dsv4m.yaml` | synthetic | **paper**: fixed-structure cell (Table 3, zero-shot policy arm) |
-| `configs/multiturn_rule_k2_inter_s128struct_dsv4w*.yaml` | synthetic | **paper**: policy cells, seeds 42/43 (Tables 2/4, Figs 3–5) |
+| `configs/multiturn_rule_k2_inter_s128_dsv4m.yaml` | synthetic | **paper**: fixed-structure cell (Table 2, zero-shot arm of Table 4 / Fig 5) |
+| `configs/multiturn_rule_k2_inter_s128struct_dsv4w*.yaml` | synthetic | **paper**: policy cells, seeds 42/43 (Tables 1/3, Figs 3–5) |
 | `configs/multiturn_rule*.yaml` (others) | synthetic | historical continual-rule family (K=1/K=2, held-out, horizon, switch, joint) — see the [package README](deepseek_v4_mini/README.md) |
 
 Key memory knobs (full list in [`deepseek_v4_mini/README.md`](deepseek_v4_mini/README.md)):
@@ -295,7 +295,7 @@ checkpoints/, runs/      ← training outputs
 
 ## 📚 References
 - DeepSeek-V4 (architecture base), DeepSeekMoE (Dai et al., 2024)
-- Hyper-Connections (Zhu et al., 2025), Muon optimizer (Jordan et al., 2024)
+- Hyper-Connections (Zhu et al., 2024), Muon optimizer (Jordan et al., 2024)
 - Thought-memory baseline: [`thought_lm_minimal/`](thought_lm_minimal/)
 
 ## License

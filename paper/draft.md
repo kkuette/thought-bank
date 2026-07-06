@@ -426,7 +426,7 @@ from writes on an empty bank.
 
 The natural objection to §6 is that gradient-based adaptation would do the
 same, better. We test it on the *same 64 conversations, same checkpoint*,
-four arms (Table 3):
+four arms (Table 2):
 
 - **bank** (ours): presentations written to the bank, forward only.
 - **TTT**: bank ablated; a per-conversation clone of the full model takes
@@ -468,7 +468,7 @@ forward-vs-gradient distinction. (A gate-ON control checkpoint, whose
 write codes live off the Fourier circle entirely, is also at chance on
 subtraction: no code geometry we trained buys family transfer.)
 
-**Replacement under a concurrent load (Table 4).** Act two takes the TTT
+**Replacement under a concurrent load (Table 3).** Act two takes the TTT
 protocol seriously as a *continual* learner. Both arms first install both
 keys' rules (bank: two forwards; TTT: 50 steps to pair-fit 1.000). Then
 key 0's rule is replaced while key 1 must keep serving. Since TTT's query
@@ -598,7 +598,7 @@ leave it to future work.
 - **TTT baseline strength.** Our TTT arm is full-parameter AdamW with an
   LR sweep and a convergence diagnostic. Parameter-efficient TTT (LoRA),
   larger adaptation sets, or regularized updates could shift the margins
-  of Tables 3–4, though the memorize-without-transfer signature suggests
+  of Tables 2–3, though the memorize-without-transfer signature suggests
   the failure is not budget-limited.
 - **Teacher specificity.** The bootstrap teacher is a Fourier code — the
   natural geometry for this family. The recipe's generality beyond
@@ -618,7 +618,7 @@ single RTX 3090; every probe and both TTT arms run on a single GPU or,
 more slowly, on CPU (evaluation data is generated on the CPU RNG in
 either case). Seeds 42/43; data generators are deterministic given the
 config; checkpoints saved every 100 steps. An end-to-end script
-reproducing Tables 2–4 and Figures 3–5 from a fresh clone is provided
+reproducing Tables 1–4 and Figures 3–5 from a fresh clone is provided
 (repro/).
 
 ## Authorship note

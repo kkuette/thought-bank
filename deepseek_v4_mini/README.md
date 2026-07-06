@@ -4,6 +4,12 @@ Small Python reproduction of the [DeepSeek-V4](https://arxiv.org/abs/2606.19348)
 
 Designed for single-GPU experimentation (~6M–32M params).
 
+The results of this line of work are consolidated in the paper
+[*A Trained Fast-Weight Memory: Continual Rule Binding at Inference Without
+Backward*](../paper/paper.pdf) (reproduction: [`repro/`](../repro/)); this
+README documents the architecture, the training machinery, and the full
+experimental arc that led there.
+
 ---
 
 ## The idea: memory as fast weights
@@ -26,9 +32,9 @@ Pass k  (one turn / segment)
 
   input_ids [B,T] ──► embed ──► X [B,T,n_hc,d]
                                    │
-   thought bank [B,M,mem_dim] ─────┤  read as FAST WEIGHTS at every block
-   (seeded random[0,1] on a fresh  │
-    conversation, else carried in) │
+   thought bank [B,M,mem_dim] ─────┤  read as FAST WEIGHTS (blocks set by
+   (seeded random[0,1] on a fresh  │  `mem_read_layers`; default all blocks,
+    conversation, else carried in) │  the paper's cells read at block 0 only)
                                    ▼
   ┌──────────────────── DualModalBlock × n_layers ───────────────────┐
   │  1. mHC( CSA even / HCA odd )          ← text self-attention      │
@@ -46,8 +52,10 @@ Pass k  (one turn / segment)
                    (carry as init_mem for multi-turn continual learning)
 ```
 
-The bank is **shared and static across the blocks of one forward** (all `n_layers` blocks
-read the same bank); the write happens **once, after** the blocks. There is no separate
+The bank is **shared and static across the blocks of one forward** (every reading
+block sees the same bank; which blocks read is set by `mem_read_layers` — the paper's
+cells read at block 0 only, App. D of the paper covers the 4-block graft); the write
+happens **once, after** the blocks. There is no separate
 thought-stream transformer — the text model writes the vectors and reuses them directly.
 
 **Even-indexed layers** use **CSA** (Compressed Sparse Attention); **odd-indexed layers**
@@ -124,6 +132,11 @@ turn 0 :  produce written slot w0 ;  distill = MSE(w0, teacher[s].detach())
 read code = β · teacher[s] + (1-β) · w0        # what the read consumes downstream
 β anneals 1 → 0  over [mem_teacher_anneal_start, mem_teacher_anneal_end]
 ```
+
+> The paper's recipe uses the **cosine** distillation form
+> (`mem_teacher_distill_cosine: true`) with fixed Fourier codes: MSE toward
+> zero-mean targets is minimized by ‖w0‖→0 (the "constant writer" loophole,
+> App. E of the paper), which the cosine form removes.
 
 Early on the read consumes a **clean teacher code** correlated with `s` (the read_isolation
 regime → strong "use me" gradient) while distillation pulls the written slot toward it; then
@@ -240,11 +253,12 @@ For streaming runs, `content_gap` is the memory metric to trust:
 
 ## Experiments & results (`multiturn_rule` campaign)
 
-Recipe for the campaign runs below: all-AdamW `lr 3e-4` **constant** (no warmup),
-teacher-forced bootstrap annealed over steps [300,500], write gate off. Chance = 0.031,
-in-window ICL ceiling ≈ 0.49. **Current default for new runs**: Muon + cosine +
-early anneal [150,350] (`multiturn_rule_muon_cos_early.yaml`) — 0.974@800 on the
-K=1 reference, ~2× faster than the AdamW baseline (see the optimizer rows below).
+Recipe for the early (S=32) campaign rows: all-AdamW `lr 3e-4` **constant** (no
+warmup), teacher-forced bootstrap annealed over steps [300,500], write gate off;
+chance = 0.031, in-window ICL ceiling ≈ 0.49 *for those rows only* — the dsv4
+series below moves to fresh-rule benchmarks at S=256 then S=128 (chance 0.004 /
+0.008; the recipe of each row is in its config). The table is chronological:
+it ends at the paper's cells (dsv4m / dsv4w / s43) and the headline demo.
 
 | Experiment | Config | Result |
 |---|---|---|
@@ -349,11 +363,14 @@ Model knobs (`config.py`):
 | `mem_seed_slots` | Random-uniform[0,1] slots seeding a fresh bank |
 | `mem_read_rank` | Bottleneck rank `r` of each per-slot fast-weight layer |
 | `mem_read_dropout` | Dropout inside the fast-weight MLP layers |
+| `mem_read_layers` | which blocks read the bank (empty = all; the paper's cells use `[0]`) |
+| `mem_read_swiglu` | gated SwiGLU form of the per-slot fast-weight layer (paper cells: on) |
 | `mem_write_gate` | `false` ⇒ ungated write (pure thought); `true` ⇒ `α·p·m` |
 | `mem_write_cost` / `mem_write_diversity` / `mem_write_target(_weight)` | Write-rate / novelty / target-rate regularisers (gate on) |
 | `mem_teacher_forcing` | Enable the teacher-forced bootstrap (`multiturn_rule`) |
 | `mem_teacher_anneal_start` / `_end` | β=1 until start; β linear→0 by end (teacher gone) |
-| `mem_teacher_distill_weight` | Weight on `MSE(w0, teacher[s])`, scaled by β |
+| `mem_teacher_distill_weight` | Weight on the distill loss, scaled by β |
+| `mem_teacher_distill_cosine` | `true` ⇒ (1−cos) distill instead of MSE (paper recipe; closes the ‖w‖→0 loophole) |
 
 Training/data knobs (YAML `training:` / `data:`):
 
@@ -396,6 +413,7 @@ deepseek_v4_mini/
     switch_probe_k2.py   — K=2 switch probe on generalizing ckpts (STICK, bank 1-NN, --sweep)
     ttt_demo.py          — headline act 1: bank vs TTT vs ICL, FLOPs accounting (--sub)
     ttt_demo_act2.py     — headline act 2: replacement at inference + TTT interference
+    superposition_probe.py — bank geometry / rule-code cloud / write redundancy (paper Fig. 4)
   configs/
     tiny.yaml / small.yaml   — TinyStories
     code_persist.yaml        — code, bank persists across sequences
@@ -408,6 +426,7 @@ deepseek_v4_mini/
     multiturn_rule_horizon.yaml      — 24-turn persistence horizon (rehearsal emergence)
     multiturn_rule_switch.yaml       — mid-conversation rule switch (forgetting test)
     multiturn_rule_joint.yaml        — retain-then-drop joint test (24+16)
+    multiturn_rule_k2_inter_s128_dsv4m.yaml          — fresh-rule S=128 cell (paper: TTT baseline + zero-shot policy arm)
     multiturn_rule_k2_inter_s128struct_dsv4v.yaml    — structure randomization, full (killed @600)
     multiturn_rule_k2_inter_s128struct_dsv4w.yaml    — softened: THE POLICY CELL (seed 42)
     multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml — seed-43 replication
@@ -420,6 +439,5 @@ deepseek_v4_mini/
 
 - DeepSeek-V4: [arxiv 2606.19348](https://arxiv.org/abs/2606.19348)
 - Fast weights: Schmidhuber 1992; Ba et al. 2016; Schlag et al. 2021; Test-Time Training (Sun et al. 2024)
-- Hyper-Connections: Zhu et al., 2025 · DeepSeekMoE: Dai et al., 2024 · Muon: Jordan et al., 2024
+- Hyper-Connections: Zhu et al., 2024 · DeepSeekMoE: Dai et al., 2024 · Muon: Jordan et al., 2024
 - Thought memory baseline: [`thought_lm_minimal`](../thought_lm_minimal/)
-```

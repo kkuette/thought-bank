@@ -1,6 +1,9 @@
 # analysis/ — offline mechanistic diagnostics
 
-Post-hoc analyses run on `multiturn_rule` checkpoints (all CPU-friendly).
+Post-hoc analyses run on `multiturn_rule` checkpoints. The paper's probes
+(`switch_probe_k2`, `ttt_demo*`, `superposition_probe`) run on GPU when
+available and on CPU otherwise (evaluation data is generated on the CPU
+RNG either way); the older diagnostics are CPU-only.
 Run from the repo root with `PYTHONPATH=.`; each script takes an optional
 checkpoint path as first argument.
 
@@ -16,10 +19,13 @@ checkpoint path as first argument.
 | `switch_probe_k2.py` | K=2 switch probe on GENERALIZING checkpoints: STICK, per-turn profile, bank-slot 1-NN identity vs an empirical clean-code dictionary; `--sweep` = switch-position invariance | Re-audit of the memorizing-regime switch claim. dsv4m (trained fixed 8-turn, no switch): **STICK=1.0** total perseveration, dirty-bank write unreadable (1-NN 0.05). dsv4w (structure-randomized): **STICK=0.000 at every switch position 2-14**, s2 written clean onto the dirty bank (1-NN 0.90+), s1 actively evacuated — memory policy is a TRAINED behaviour. Seed 43 replicates everything EXCEPT selectivity (untouched key 0.86 vs 0.01 on the same stream): two update-policy attractors, selective vs flush-and-rewrite. |
 | `ttt_demo.py` | HEADLINE act 1 — fresh-rule adaptation: bank (forward-only) vs test-time training (per-conv AdamW on the example pairs) vs in-window ICL, same conversations, FLOPs accounting; `--sub` = out-of-family subtraction arm | On dsv4m: bank **0.992 train / 0.799 held** for 160 MFLOPs; TTT converges on its pairs (fit 0.99) and transfers **zero** at 138× the cost; ICL at chance even on trained rules — the bank is the model's only working adaptation pathway. Subtraction (fresh family): all arms at chance — the boundary is meta-training, not the mechanism. |
 | `ttt_demo_act2.py` | HEADLINE act 2 — rule REPLACEMENT at inference: one-forward bank update vs sequential TTT; interference measured on the untouched key's pair-fit (nonzero baseline) | On dsv4w step_3000: bank replaces at **0.953 train / 0.777 held** for 80 MFLOPs (untouched key 0.98→0.83, eviction pressure not gradient interference); TTT fits the new pairs at 138× the cost, **destroys 62%** of the untouched key's fit, and still answers no query. |
+| `superposition_probe.py` | How does the bank store two concurrent rules? (paper Fig. 4) — end-of-conversation bank geometry, clean rule-code cloud, per-write redundancy across a switch | **Redundant superposition**: the 8 slots converge to near-copies of one vector (bank eff. rank 1.13/1.48 of 8 for seeds 42/43) while the rule-code cloud stays high-rank (7.3/12.4 of 32, centred; 1-NN ident 0.90–0.95) — copies buy eviction robustness, the key-conditioned read disambiguates. A switch write is genuinely novel (redundancy dips to +0.50 s42 / −0.10 s43 vs ~1.0 rehearsal) and the dip separates the two replacement attractors. |
 
-## The experimental campaign these belong to
+## The historical campaign the older diagnostics belong to
 
-Benchmark: `multiturn_rule` — each conversation draws a fresh shift rule
+**(Memorizing-regime arc, S=32 / ≤25 rules — superseded by the paper's
+generalizing regime; kept for the archaeology.)** Benchmark:
+`multiturn_rule` — each conversation draws a fresh shift rule
 `y=(x+s)%32` shown once (6 example pairs), then queried on UNSEEN symbols across
 turns; the rule can only cross turn boundaries through the fast-weight bank.
 Chance = 0.031, in-window ICL ceiling ≈ 0.49. Recipe for all runs: all-AdamW
@@ -39,8 +45,13 @@ Chance = 0.031, in-window ICL ceiling ≈ 0.49. Recipe for all runs: all-AdamW
 | Muon retest (`multiturn_rule_muon.yaml` / `_muon_cos.yaml` / `_muon_cos_early.yaml`) | constant LR: no collapse but unstable band 0.83-0.95; cosine: 0.99 @1000 stable; **+ early anneal [150,350]: 0.974 @800** — default recipe, ~2× faster than the AdamW baseline |
 | read-generalization campaign (`_noise` / `_mixup*` / `_sn*` / `_read02L*` configs) | **closed, negative — held 0.000 across all arms.** Data: noise reinforces snapping; mixup memorized (even injected post-installation on a 0.995 base: train holds, mixup CE absorbed, held 0.000). Structural: block-3-only read kills the bootstrap; blocks [0,2] install 0.987 but don't interpolate; spectral norm blocks the final consolidation (~0.53) at 4 AND 2 reads — installation is a *sharpening* step, imposed smoothness forbids it. Caveat discovered en route: the fast-iter short format (turns_per_conv 4) caps train at ~0.48 regardless of intervention — 3 cells replicated the same curve; only long-format verdicts count |
 
-Bottom line: **memory policy — retention AND replacement — is task-adaptive
-and emerges end-to-end**; no gate/LRU/allocation mechanism was needed, even
-under joint retain-then-replace pressure. Open costs: maintenance precision
-(0.74 plateau → consolidation), read generalization (recognition, not
-induction → code-space augmentation).
+Bottom line of that arc, **as re-audited on the generalizing regime** (the
+paper's verdict): the "policy emerges end-to-end" framing was an artifact —
+the switch model had been *trained on switch conversations*. Zero-shot on a
+fixed-structure generalizing model, STICK = 1.000 (total perseveration,
+unreadable dirty-bank writes); memory policy is a **trained behaviour**,
+installed by the structure distribution (`switch_probe_k2.py` row above).
+What did survive re-audit: no gate/LRU/allocation mechanism is needed
+(FIFO + learned writes suffice), and retention robustness comes from
+redundant superposition (`superposition_probe.py`). The read-generalization
+lock of this arc was resolved by rule *diversity* (threshold in (25, 112]).
