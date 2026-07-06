@@ -163,12 +163,16 @@ Table 2: main numbers, two seeds.
 - Retention: no FIFO cliff; rule survives physical eviction of its slot
   (sw_long: code evicted at t8, accuracy 0.59+ persists; post-decay 0.924).
 - Mechanism (Figure 4): redundant superposition — all 8 slots ≈ same
-  vector (bank eff_rank 1.08/8) while RULE space stays rank 14/32
-  (inter-rule cos 0.17). Not collapse: gap +4.6. Key-conditioned read
-  disambiguates; redundancy buys eviction robustness. Verdict rule:
-  eff_rank must be read jointly with ablation gap.
-- Switch write is genuinely novel content (write redundancy 0.32 vs 0.99
-  rehearsal), bank restabilizes in one turn.
+  vector (bank eff_rank 1.13/1.48 s42/s43) while RULE space stays rank
+  7.3/12.4 of 32 centred (inter-rule cos ~0 after centring; 1-NN
+  0.90-0.95). Not collapse: gap +4.6. Key-conditioned read disambiguates;
+  redundancy buys eviction robustness. Verdict rule: eff_rank must be read
+  jointly with ablation gap. [numbers re-frozen 2026-07-06 from
+  superposition_probe.py on BOTH seeds — the earlier 1.08 / 14/32 / 0.17 /
+  0.32 came from an uncommitted ad-hoc probe]
+- Switch write is genuinely novel content (redundancy +0.50 s42 / -0.10
+  s43 vs ~1.0 rehearsal — the dip gap IS the §9 bifurcation, visible at
+  the write), bank restabilizes in one turn (>=0.95 next write).
 
 ## 7. Results II: head-to-head vs test-time training
 

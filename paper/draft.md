@@ -314,7 +314,7 @@ in training. Chance is 0.008. The policy-trained cell was run twice
 | train rules, unseen queries | 0.951–0.987 | ~1.000 |
 | **held rules (never trained)** | **0.792–0.828** | **0.997–1.000** |
 | replacement: post-switch accuracy (train / held target) | 0.953 / 0.777 | 0.91–1.00 |
-| old-rule persistence after switch (STICK), positions 2–14 | 0.000 | 0.008–0.012 |
+| old-rule persistence after switch (STICK), positions 2–14 | 0.000 | 0.000–0.051 |
 | dirty-bank write identifiability (1-NN vs clean-code dictionary) | 0.90 | 0.95 |
 | bank ablated | 0.008 (chance) | chance |
 
@@ -329,19 +329,26 @@ conversation with a switch at turn 8, the first rule's code is physically
 evicted from all 8 slots (1-NN identification drops to ~0), yet post-switch
 accuracy is 0.924. Retention outlives the slot that carried it.
 
-**Mechanism: redundant superposition.** Probes on the trained model show
-the 8 slots converge to nearly the same vector: the *bank's* effective rank
-is 1.08 out of 8. This is not representational collapse — the ablation gap
-is +4.6 nats, and across rules the write codes span an effective rank of
-14 of 32 dimensions (mean inter-rule cosine 0.17). The bank stores the
-conversation's bindings as one superposed vector, *copied* into every slot;
-the key-conditioned read disambiguates at application time. The redundancy
-is what buys eviction robustness: evicting any slot removes a copy, not the
-content. Two practical corollaries: (a) low bank rank alone is not a
-pathology signal — it must be read jointly with the ablation gap; (b) a
-switch write is genuinely novel content (its redundancy with the resident
-bank is 0.32, vs ~0.99 for steady-state rehearsal writes), and the bank
-re-converges to the new superposition within one turn.
+**Mechanism: redundant superposition (Fig. 4).** Probes on both trained
+seeds show the 8 slots converge to nearly the same vector: the *bank's*
+effective rank at the end of a conversation is 1.13 / 1.48 out of 8
+(seeds 42 / 43), with every slot-pair cosine above 0.9 (the residual
+structure is a parity checkerboard — the two keys' rehearsal streams
+alternate). This is not representational collapse — the ablation gap is
++4.6 nats, and across rules the clean write codes span an effective rank
+of 7.3 / 12.4 of 32 dimensions once the shared mean direction is removed
+(near-zero mean inter-rule cosine after centring; 1-NN identifiability
+0.90–0.95). The bank stores the conversation's bindings as one superposed
+vector, *copied* into every slot; the key-conditioned read disambiguates
+at application time. The redundancy is what buys eviction robustness:
+evicting any slot removes a copy, not the content. Two practical
+corollaries: (a) low bank rank alone is not a pathology signal — it must
+be read jointly with the ablation gap; (b) a switch write is genuinely
+novel content — its redundancy with the resident bank drops to +0.50
+(seed 42) or −0.10 (seed 43), vs ~1.0 for steady-state rehearsal writes —
+and the bank re-converges to the new superposition within one turn
+(redundancy back to ≥0.95 at the next write). The seed gap in that dip is
+not noise; it is the §9 bifurcation, visible at the write itself.
 
 **Replacement.** Mid-conversation, re-presenting a key with a new rule —
 one 13-token forward on the dirty bank — installs the new binding at
@@ -472,7 +479,11 @@ the whole bank and rewrites only the switched binding (0.011 — chance) —
 despite being the stronger model on every other axis (held 0.997–1.000).
 The non-switched key accounts for 17% of query tokens, so seed 43 pays
 chance-level loss on 17% of its queries for the entire run without
-escaping the basin: final CEs are indistinguishable. Two attractors of the
+escaping the basin: final CEs are indistinguishable. The attractor is
+visible at the write itself: the switch write's redundancy with the
+resident bank is +0.50 for seed 42 (it preserves the resident
+superposition) but −0.10 for seed 43 (it displaces it; Fig. 4C). Two
+attractors of the
 update policy — *selective component update* vs *flush-and-rewrite* — are
 decided during the bootstrap and gradient does not cross between them.
 Selective replacement plausibly requires a copy-forward circuit (the write

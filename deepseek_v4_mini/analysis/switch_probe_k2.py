@@ -21,8 +21,9 @@ Arms:
 
 Usage: PYTHONPATH=. python deepseek_v4_mini/analysis/switch_probe_k2.py [ckpt]
        [--cfg <yaml>] [--sweep]   (--sweep: switch-position invariance sweep)
+       [--dump <out.json>]        (per-turn accuracy + old-rule-match arrays)
 """
-import sys, torch, torch.nn.functional as F
+import json, sys, torch, torch.nn.functional as F
 
 WT = "."
 sys.path.insert(0, WT)
@@ -122,7 +123,7 @@ def run(turns, sw, s2_pool, s1_pool=None):
         out = model(present_seg(s[:, k], k, ex[k]), init_mem=mem, compute_logits=False)
         mem = out["mem_bank"]
     s1 = s[:, 0].clone()
-    acc = {0: [], 1: []}; stick_n = stick_hit = 0
+    acc = {0: [], 1: []}; old_acc = {0: [], 1: []}; stick_n = stick_hit = 0
     ident_s1_pre = ident_s1_post = ident_s2_post = None
     q_cnt = [0] * K
     for t in range(turns):
@@ -144,13 +145,16 @@ def run(turns, sw, s2_pool, s1_pool=None):
         pred = out["logits"][:, -1].argmax(-1)
         y = SYM_OFF + torch.tensor([_apply(int(s[b, k]), int(q[b])) for b in range(N)])
         acc[k].append(float((pred == y).float().mean()))
+        if k == 0:                                         # per-turn old-rule match
+            y_old = SYM_OFF + torch.tensor([_apply(int(s1[b]), int(q[b])) for b in range(N)])
+            old_acc[0].append(float((pred == y_old).float().mean()))
         if sw and t >= sw and k == 0:                      # STICK: old-rule answers
             y_old = SYM_OFF + torch.tensor([_apply(int(s1[b]), int(q[b])) for b in range(N)])
             stick_n += N; stick_hit += int((pred == y_old).sum())
     if sw:
         ident_s1_post = nn_ident(mem, s1)                  # s1 still in bank at end?
         ident_s2_post = nn_ident(mem, s[:, 0])
-    return acc, (stick_hit / stick_n if stick_n else None), ident_s1_pre, ident_s1_post, ident_s2_post
+    return acc, (stick_hit / stick_n if stick_n else None), ident_s1_pre, ident_s1_post, ident_s2_post, old_acc
 
 def fmt(a): return " ".join(f"{v:.2f}" for v in a)
 
@@ -163,8 +167,9 @@ ARMS = {
 }
 if "--sweep" in sys.argv:   # switch-POSITION invariance: same 16-turn conv, sw moves
     ARMS = {f"sw@{p:<2}   ": (16, p, TRAIN_T, None) for p in (2, 4, 6, 8, 10, 12, 14)}
+dump = {}
 for name, (turns, sw, pool, s1p) in ARMS.items():
-    acc, stick, i1pre, i1post, i2post = run(turns, sw, pool, s1p)
+    acc, stick, i1pre, i1post, i2post, old_acc = run(turns, sw, pool, s1p)
     k0, k1 = acc[0], acc[1]
     line = f"{name} key0[{fmt(k0)}] key1[{fmt(k1)}]"
     if sw:
@@ -174,3 +179,12 @@ for name, (turns, sw, pool, s1p) in ARMS.items():
                  f" STICK={stick:.3f} | key1 avg={sum(k1)/len(k1):.3f}"
                  f" | bank1NN s1: pre-sw {i1pre:.2f} end {i1post:.2f} ; s2 end {i2post:.2f}")
     print(line)
+    dump[name.strip()] = {
+        "turns": turns, "sw": sw, "key0": k0, "key1": k1,
+        "key0_old_rule": old_acc[0], "stick": stick,
+        "ident_s1_pre": i1pre, "ident_s1_end": i1post, "ident_s2_end": i2post,
+    }
+if "--dump" in sys.argv:
+    out = sys.argv[sys.argv.index("--dump") + 1]
+    json.dump({"ckpt": CKPT, "arms": dump}, open(out, "w"), indent=1)
+    print("dumped ->", out)
