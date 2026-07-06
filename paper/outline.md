@@ -274,11 +274,11 @@ Figure 5: STICK vs switch position, zero-shot model vs policy-trained model.
 
 | # | content | source | status |
 |---|---|---|---|
-| Fig 1 | architecture diagram | to draw | TODO |
-| Fig 2 | task schematic (conv + switch) | to draw | TODO |
-| Fig 3 | training dynamics dsv4w (CE, distill, stages, anneal) | train log | TODO (log parse) |
-| Fig 4 | superposition mechanism (slot sims, eff_rank vs rule rank) | probes step_3000 | TODO (re-run probe, save arrays) |
-| Fig 5 | STICK vs position: zero-shot vs trained | switch_probe --sweep on dsv4m + dsv4w | numbers frozen, plot TODO |
+| Fig 1 | architecture diagram | fig1_architecture.svg (hand SVG) | DONE |
+| Fig 2 | task schematic (conv + switch) | fig2_task.svg (hand SVG) | DONE |
+| Fig 3 | training dynamics dsv4w s42+s43 (CE, acc, distill, anneal) | metrics.jsonl both seeds | DONE |
+| Fig 4 | superposition (slot sims, rule PCA, write redundancy, 2 seeds) | superposition_probe.py s42@3000 + s43@4000 | DONE |
+| Fig 5 | switch policy: zero-shot vs s42 vs s43, traces + position sweep | switch_probe_k2 --sweep --dump ×3 | DONE |
 | Tab 1 | intro teaser (bank/TTT/ICL one-liner) | Tab 3 subset | frozen |
 | Tab 2 | central claim, two seeds | probes s42@3000 / s43@4000 | frozen |
 | Tab 3 | act-1 matrix (pool × arm) | ttt_demo.py dsv4m | frozen |
