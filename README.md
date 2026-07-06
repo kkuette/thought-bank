@@ -16,7 +16,7 @@ Without Backward** — [PDF](paper/paper.pdf) ·
 [DOI 10.5281/zenodo.21222901](https://doi.org/10.5281/zenodo.21222901)
 
 The paper corresponds to tag
-[`V0.2.1-preprint`](https://github.com/kkuette/thought-bank/tree/V0.2.1-preprint),
+[`V0.2.2-preprint`](https://github.com/kkuette/thought-bank/tree/V0.2.2-preprint),
 archived at the DOI above; `main` continues to evolve past it.
 
 Three claims, all on a 3.08M-parameter DeepSeek-style trunk with an

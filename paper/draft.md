@@ -614,7 +614,7 @@ leave it to future work.
 
 Code, configurations, and analysis probes are available at
 github.com/kkuette/thought-bank (this paper corresponds to tag
-`V0.2.1-preprint`, archived at DOI 10.5281/zenodo.21222901; the
+`V0.2.2-preprint`, archived at DOI 10.5281/zenodo.21222901; the
 repository continues to evolve). The policy cell trains in ≈5 h on a
 single RTX 3090; every probe and both TTT arms run on a single GPU or,
 more slowly, on CPU (evaluation data is generated on the CPU RNG in
