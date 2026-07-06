@@ -26,8 +26,8 @@ import sys, torch, torch.nn.functional as F
 
 WT = "."
 sys.path.insert(0, WT)
-from deepseek_v4_mini.config import DeepSeekV4MiniConfig
-from deepseek_v4_mini.model import DualModalDeepSeekV4Mini
+from deepseek_v4_mini.config import ThoughtBankConfig
+from deepseek_v4_mini.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space
 
 torch.manual_seed(0)
@@ -42,8 +42,8 @@ N = 128                                  # conversations (batched lanes)
 
 import yaml
 raw = yaml.safe_load(open(CFG))
-cfg = DeepSeekV4MiniConfig.from_yaml(CFG)
-model = DualModalDeepSeekV4Mini(cfg)
+cfg = ThoughtBankConfig.from_yaml(CFG)
+model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")
 model.load_state_dict(sd["model"]); model.eval()
 print(f"loaded {CKPT.split('/')[-2]}/{CKPT.split('/')[-1]} (step {sd['step']})")

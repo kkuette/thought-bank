@@ -1,5 +1,5 @@
 """
-Training script for DeepSeekV4Mini.
+Training script for TrunkLM.
 
 Usage:
     python -m deepseek_v4_mini.train configs/tiny.yaml
@@ -28,8 +28,8 @@ from torch.utils.checkpoint import checkpoint
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from .config import DeepSeekV4MiniConfig
-from .model import DeepSeekV4Mini, DualModalDeepSeekV4Mini
+from .config import ThoughtBankConfig
+from .model import TrunkLM, ThoughtBankLM
 
 
 # ── Muon optimiser ────────────────────────────────────────────────────────────
@@ -1804,7 +1804,7 @@ def main() -> None:
     with open(cfg_path) as f:
         raw = yaml.safe_load(f)
 
-    model_cfg = DeepSeekV4MiniConfig.from_yaml(cfg_path)
+    model_cfg = ThoughtBankConfig.from_yaml(cfg_path)
     train_cfg = raw.get("training", {})
     data_cfg  = raw.get("data", {})
 
@@ -1827,11 +1827,11 @@ def main() -> None:
 
     # ── Model ─────────────────────────────────────────────────────────────────
     if model_cfg.use_dual_stream:
-        model = DualModalDeepSeekV4Mini(model_cfg).to(device)
-        tqdm.write("Architecture: DualModalDeepSeekV4Mini (with memory bank)")
+        model = ThoughtBankLM(model_cfg).to(device)
+        tqdm.write("Architecture: ThoughtBankLM (with memory bank)")
     else:
-        model = DeepSeekV4Mini(model_cfg).to(device)
-        tqdm.write("Architecture: DeepSeekV4Mini (no memory bank)")
+        model = TrunkLM(model_cfg).to(device)
+        tqdm.write("Architecture: TrunkLM (no memory bank)")
     tqdm.write(f"Model: {model.num_params():,} parameters")
 
     # ── Warm restart (SGDR-style) ─────────────────────────────────────────────

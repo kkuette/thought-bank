@@ -1,4 +1,4 @@
-from .model import DeepSeekV4Mini, DualModalDeepSeekV4Mini
-from .config import DeepSeekV4MiniConfig
+from .model import TrunkLM, ThoughtBankLM
+from .config import ThoughtBankConfig
 
-__all__ = ["DeepSeekV4Mini", "DualModalDeepSeekV4Mini", "DeepSeekV4MiniConfig"]
+__all__ = ["TrunkLM", "ThoughtBankLM", "ThoughtBankConfig"]

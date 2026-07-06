@@ -39,7 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .mhc import RMSNorm
-from .config import DeepSeekV4MiniConfig
+from .config import ThoughtBankConfig
 
 
 class ThoughtStream(nn.Module):
@@ -51,7 +51,7 @@ class ThoughtStream(nn.Module):
       _write(H_text, bank, pad)          → [B, M', mem_dim] bank with the thought appended
     """
 
-    def __init__(self, cfg: DeepSeekV4MiniConfig) -> None:
+    def __init__(self, cfg: ThoughtBankConfig) -> None:
         super().__init__()
         self.cfg = cfg
         d = cfg.mem_dim

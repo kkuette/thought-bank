@@ -26,8 +26,8 @@ likely cause of the 0.48 plateau (vs 0.95 at 9-turn maintenance).
 """
 import sys, torch, torch.nn.functional as F
 sys.path.insert(0, ".")
-from deepseek_v4_mini.config import DeepSeekV4MiniConfig
-from deepseek_v4_mini.model import DualModalDeepSeekV4Mini
+from deepseek_v4_mini.config import ThoughtBankConfig
+from deepseek_v4_mini.model import ThoughtBankLM
 
 torch.manual_seed(0)
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/multiturn_rule_horizon/final.pt"
@@ -37,8 +37,8 @@ TURNS = 24
 SHIFTS = list(range(1, 32, 4))          # 8 probe shifts
 R = 16                                  # conversations per shift
 
-cfg = DeepSeekV4MiniConfig.from_yaml(CFG)
-model = DualModalDeepSeekV4Mini(cfg)
+cfg = ThoughtBankConfig.from_yaml(CFG)
+model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")
 model.load_state_dict(sd["model"]); model.eval()
 print(f"loaded {CKPT} (step {sd['step']})")

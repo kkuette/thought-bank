@@ -169,8 +169,8 @@ expert collapse.
 
 | Class | Description |
 |---|---|
-| `DeepSeekV4Mini` | Single text stream; optional legacy bolt-on cross-attention memory |
-| `DualModalDeepSeekV4Mini` | Text stream + fast-weight thought bank (recommended) |
+| `TrunkLM` | Single text stream; optional legacy bolt-on cross-attention memory |
+| `ThoughtBankLM` | Text stream + fast-weight thought bank (recommended) |
 
 ### Parameter counts
 
@@ -187,11 +187,11 @@ Dominated by the token embedding (`vocab_size × d_model`).
 ## Quick start
 
 ```python
-from deepseek_v4_mini import DualModalDeepSeekV4Mini, DeepSeekV4MiniConfig
+from deepseek_v4_mini import ThoughtBankLM, ThoughtBankConfig
 import torch
 
-cfg   = DeepSeekV4MiniConfig.tiny()
-model = DualModalDeepSeekV4Mini(cfg)
+cfg   = ThoughtBankConfig.tiny()
+model = ThoughtBankLM(cfg)
 
 ids = torch.randint(0, cfg.vocab_size, (2, 64))
 
@@ -325,17 +325,17 @@ open question is the top-end train/held gap (0.98 vs 0.69).
 
 ## Configuration
 
-All hyperparameters live in `DeepSeekV4MiniConfig` (`config.py`).
+All hyperparameters live in `ThoughtBankConfig` (`config.py`).
 
 ```python
-cfg = DeepSeekV4MiniConfig(
+cfg = ThoughtBankConfig(
     d_model=256, n_layers=6, n_heads=4, d_head=64,
     csa_m=4, hca_m=32, top_k_csa=8, n_win=16,
     n_experts=8, top_k_experts=2, d_ff=512,
     mem_dim=64, max_mem=32, mem_seed_slots=4, mem_read_rank=16,
 )
-cfg = DeepSeekV4MiniConfig.from_yaml("deepseek_v4_mini/configs/small.yaml")
-cfg = DeepSeekV4MiniConfig.tiny()   # ~6.5M params
+cfg = ThoughtBankConfig.from_yaml("deepseek_v4_mini/configs/small.yaml")
+cfg = ThoughtBankConfig.tiny()   # ~6.5M params
 ```
 
 Model knobs (`config.py`):
@@ -380,12 +380,12 @@ Training/data knobs (YAML `training:` / `data:`):
 
 ```
 deepseek_v4_mini/
-  config.py      — DeepSeekV4MiniConfig dataclass + YAML loader
+  config.py      — ThoughtBankConfig dataclass + YAML loader
   mhc.py         — ManifoldHyperConnections + RMSNorm
   attention.py   — CompressedSparseAttention, HeavilyCompressedAttention, RoPE
   moe.py         — SwiGLU, DeepSeekMoE
   memory.py      — ThoughtStream: bank seeding + gated write + FIFO (write side only)
-  model.py       — DeepSeekV4Mini, DualModalDeepSeekV4Mini, DualModalBlock (fast-weight read)
+  model.py       — TrunkLM, ThoughtBankLM, DualModalBlock (fast-weight read)
   train.py       — training loop, probes, synthetic tasks, teacher-forced bootstrap
   eval_memory.py — offline PPL with vs without the bank
   analysis/      — offline mechanistic diagnostics + campaign results (see its README)

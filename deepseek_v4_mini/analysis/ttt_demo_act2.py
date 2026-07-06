@@ -23,8 +23,8 @@ import copy, sys, time
 import torch, torch.nn.functional as F, yaml
 
 sys.path.insert(0, ".")
-from deepseek_v4_mini.config import DeepSeekV4MiniConfig
-from deepseek_v4_mini.model import DualModalDeepSeekV4Mini
+from deepseek_v4_mini.config import ThoughtBankConfig
+from deepseek_v4_mini.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space
 
 torch.manual_seed(0)
@@ -38,8 +38,8 @@ N_CONV, TURNS_PRE, TURNS_POST = 64, 4, 4
 N1, N2, LR = 50, 50, 1e-3            # act-1 best-fit recipe
 
 raw = yaml.safe_load(open(CFG))
-cfg = DeepSeekV4MiniConfig.from_yaml(CFG)
-model = DualModalDeepSeekV4Mini(cfg)
+cfg = ThoughtBankConfig.from_yaml(CFG)
+model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")
 model.load_state_dict(sd["model"]); model.eval()
 P = sum(p.numel() for p in model.parameters())
