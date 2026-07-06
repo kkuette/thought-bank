@@ -1,6 +1,6 @@
 # Thought Bank
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21222901.svg)](https://doi.org/10.5281/zenodo.21222901)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21225721.svg)](https://doi.org/10.5281/zenodo.21225721)
 
 Research repo exploring **persistent thought memory** for language models. The
 active line of work is **`deepseek_v4_mini`**: a small reproduction of the
@@ -13,7 +13,8 @@ a backward pass**.
 
 **A Trained Fast-Weight Memory: Continual Rule Binding at Inference
 Without Backward** — [PDF](paper/paper.pdf) ·
-[DOI 10.5281/zenodo.21222901](https://doi.org/10.5281/zenodo.21222901)
+[DOI 10.5281/zenodo.21225721](https://doi.org/10.5281/zenodo.21225721)
+(this version; all versions: [10.5281/zenodo.21222901](https://doi.org/10.5281/zenodo.21222901))
 
 The paper corresponds to tag
 [`V0.2.2-preprint`](https://github.com/kkuette/thought-bank/tree/V0.2.2-preprint),
