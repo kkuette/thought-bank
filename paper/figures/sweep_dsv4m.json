@@ -1,5 +1,5 @@
 {
- "ckpt": "/home/kkuette/thought-bank/.claude/worktrees/interesting-clarke-c68f5c/checkpoints/multiturn_rule_k2_inter_s128_dsv4m/final.pt",
+ "ckpt": "checkpoints/multiturn_rule_k2_inter_s128_dsv4m/final.pt",
  "arms": {
   "sw@2": {
    "turns": 16,

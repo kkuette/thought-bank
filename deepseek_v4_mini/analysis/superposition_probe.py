@@ -22,6 +22,7 @@ from deepseek_v4_mini.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space, _effective_rank
 
 torch.manual_seed(0)
+DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CKPT = sys.argv[1]
 CFG = sys.argv[sys.argv.index("--cfg") + 1] if "--cfg" in sys.argv else \
     "deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w.yaml"
@@ -34,8 +35,8 @@ raw = yaml.safe_load(open(CFG))
 cfg = ThoughtBankConfig.from_yaml(CFG)
 model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")
-model.load_state_dict(sd["model"]); model.eval()
-print(f"loaded {CKPT} (step {sd['step']})")
+model.load_state_dict(sd["model"]); model.eval(); model.to(DEV)
+print(f"loaded {CKPT} (step {sd['step']}) | device {DEV.type}")
 
 _units, _n, TRAIN, HELD, _apply = _rule_space(raw["data"])
 TRAIN_T = torch.tensor(TRAIN)
@@ -82,9 +83,9 @@ with torch.no_grad():
     s[:, 1] = draw(TRAIN_T, N, avoid=s[:, 0])
     mem = None
     for k in range(K):
-        mem = model(present_seg(s[:, k], k), init_mem=mem, compute_logits=False)["mem_bank"]
+        mem = model(present_seg(s[:, k], k).to(DEV), init_mem=mem, compute_logits=False)["mem_bank"]
     for t in range(8):
-        mem = model(query_seg(t % K), init_mem=mem, compute_logits=False)["mem_bank"]
+        mem = model(query_seg(t % K).to(DEV), init_mem=mem, compute_logits=False)["mem_bank"]
     sl = F.normalize(mem.float(), dim=2)                      # [N, M, D]
     sim = torch.einsum("nad,nbd->nab", sl, sl).mean(0)        # [M, M]
     ranks = [_effective_rank(mem[b:b + 1]) for b in range(N)]
@@ -99,9 +100,9 @@ with torch.no_grad():
     B = 64
     for i0 in range(0, len(rids), B):
         chunk = torch.tensor(rids[i0:i0 + B])
-        bank = model(present_seg(chunk, 0, n=len(chunk)), init_mem=None,
+        bank = model(present_seg(chunk, 0, n=len(chunk)).to(DEV), init_mem=None,
                      compute_logits=False)["mem_bank"]
-        codes[i0:i0 + len(chunk)] = bank[:, -1]
+        codes[i0:i0 + len(chunk)] = bank[:, -1].cpu()
     out["rule_eff_rank"] = _effective_rank(codes.unsqueeze(0))
     out["rule_codes"] = codes.tolist()
     out["rule_ids"] = rids
@@ -124,7 +125,7 @@ with torch.no_grad():
     mem = None
     redund, labels = [], []
     for k in range(K):
-        new = model(present_seg(s[:, k], k), init_mem=mem, compute_logits=False)["mem_bank"]
+        new = model(present_seg(s[:, k], k).to(DEV), init_mem=mem, compute_logits=False)["mem_bank"]
         r = write_redundancy(mem, new)
         if r is not None:
             redund.append(r); labels.append(f"present k{k}")
@@ -132,10 +133,10 @@ with torch.no_grad():
     for t in range(16):
         if t == 8:                                            # switch key0
             s[:, 0] = draw(TRAIN_T, N, avoid=s[:, 0])
-            new = model(present_seg(s[:, 0], 0), init_mem=mem, compute_logits=False)["mem_bank"]
+            new = model(present_seg(s[:, 0], 0).to(DEV), init_mem=mem, compute_logits=False)["mem_bank"]
             redund.append(write_redundancy(mem, new)); labels.append("SWITCH k0")
             mem = new
-        new = model(query_seg(t % K), init_mem=mem, compute_logits=False)["mem_bank"]
+        new = model(query_seg(t % K).to(DEV), init_mem=mem, compute_logits=False)["mem_bank"]
         redund.append(write_redundancy(mem, new)); labels.append(f"query t{t}")
         mem = new
     out["write_redundancy"] = redund

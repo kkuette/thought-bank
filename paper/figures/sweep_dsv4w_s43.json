@@ -1,5 +1,5 @@
 {
- "ckpt": "/home/kkuette/thought-bank/.claude/worktrees/wizardly-antonelli-af2b45/checkpoints/multiturn_rule_k2_inter_s128_dsv4w_s43/final.pt",
+ "ckpt": "checkpoints/multiturn_rule_k2_inter_s128_dsv4w_s43/final.pt",
  "arms": {
   "sw@2": {
    "turns": 16,

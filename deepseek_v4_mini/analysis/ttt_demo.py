@@ -33,7 +33,7 @@ on cost; out-of-family gradient keeps an edge the bank structurally lacks
 (family-transfer arc dsv4n/o/q closed negative).
 
 Usage: PYTHONPATH=. python deepseek_v4_mini/analysis/ttt_demo.py [ckpt] [--train-pool] [--sub]
-CPU-friendly (tiny model); safe to run alongside a GPU training.
+Runs on GPU when available (data generation stays on the CPU RNG), CPU otherwise.
 """
 import copy, math, sys, time
 import torch, torch.nn.functional as F, yaml
@@ -44,8 +44,8 @@ from deepseek_v4_mini.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space
 
 torch.manual_seed(0)
+DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CKPT = (sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else
-        "/home/kkuette/thought-bank/.claude/worktrees/interesting-clarke-c68f5c/"
         "checkpoints/multiturn_rule_k2_inter_s128_dsv4m/final.pt")
 CFG  = "deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128_dsv4m.yaml"
 if "--cfg" in sys.argv:
@@ -62,9 +62,10 @@ raw = yaml.safe_load(open(CFG))
 cfg = ThoughtBankConfig.from_yaml(CFG)
 model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")
-model.load_state_dict(sd["model"]); model.eval()
+model.load_state_dict(sd["model"]); model.eval(); model.to(DEV)
 P = sum(p.numel() for p in model.parameters())
-print(f"loaded step {sd['step']} | params {P/1e6:.2f}M | pool = {'TRAIN' if USE_TRAIN else 'HELD (fresh laws)'}")
+print(f"loaded step {sd['step']} | params {P/1e6:.2f}M | device {DEV.type} "
+      f"| pool = {'TRAIN' if USE_TRAIN else 'HELD (fresh laws)'}")
 
 _units, _n, TRAIN, HELD, _apply = _rule_space(raw["data"])
 POOL = torch.tensor(TRAIN if USE_TRAIN else HELD)
@@ -117,10 +118,10 @@ def eval_queries(mdl, mem0=None, carry=False):
     for t in range(TURNS):
         k, idx = t % K, t // K
         xq, y = query_batch(k, idx)
-        out = mdl(xq, init_mem=mem if carry else mem0, compute_logits=True)
+        out = mdl(xq.to(DEV), init_mem=mem if carry else mem0, compute_logits=True)
         if carry:
             mem = out["mem_bank"]
-        hits += int((out["logits"][:, -1].argmax(-1) == y).sum()); tot += y.numel()
+        hits += int((out["logits"][:, -1].argmax(-1).cpu() == y).sum()); tot += y.numel()
     return hits / tot
 
 fwd_flops = lambda tokens: 2 * P * tokens                    # per-lane proxy
@@ -130,7 +131,7 @@ t0 = time.perf_counter()
 with torch.no_grad():
     mem = None
     for k in range(K):
-        mem = model(pres_rows(k), init_mem=mem, compute_logits=False)["mem_bank"]
+        mem = model(pres_rows(k).to(DEV), init_mem=mem, compute_logits=False)["mem_bank"]
     acc_bank = eval_queries(model, mem, carry=True)
 t_bank = (time.perf_counter() - t0) / N_CONV
 cost_bank = fwd_flops(K * (1 + 2 * m))                       # 2 x 13-token forwards
@@ -145,8 +146,8 @@ with torch.no_grad():
         k, idx = t % K, t // K
         xq, y = query_batch(k, idx)
         rows = torch.cat([pres_rows(k), xq[:, 1:]], dim=1)   # pairs + query in-window
-        out = model(rows, init_mem=None, compute_logits=True)
-        hits += int((out["logits"][:, -1].argmax(-1) == y).sum()); tot += y.numel()
+        out = model(rows.to(DEV), init_mem=None, compute_logits=True)
+        hits += int((out["logits"][:, -1].argmax(-1).cpu() == y).sum()); tot += y.numel()
     acc_icl = hits / tot
 print(f"ablate  acc={acc_abl:.3f}   (chance = {1/S:.3f})")
 print(f"icl     acc={acc_icl:.3f}   (pairs in-window at every query)")
@@ -168,7 +169,7 @@ def ttt_eval(mdl, ci):
         k, idx = t % K, t // K
         s, _, unseen = CONVS[ci][k]
         q = unseen[idx % len(unseen)]
-        xq = torch.tensor([[KEY_OFF + k, SYM_OFF + q]])
+        xq = torch.tensor([[KEY_OFF + k, SYM_OFF + q]], device=DEV)
         out = mdl(xq, init_mem=None, compute_logits=True)
         hits += int(out["logits"][0, -1].argmax(-1) == SYM_OFF + _apply(s, q)); tot += 1
     return hits, tot
@@ -176,7 +177,7 @@ def ttt_eval(mdl, ci):
 if NO_TTT:
     sys.exit(0)
 print(f"\nttt (bank ablated, AdamW on {K*m} pairs/conv, per-conv clone):")
-best = {n: (0.0, None) for n in TTT_EVALS}
+best = {n: (-1.0, None) for n in TTT_EVALS}
 for lr in TTT_LRS:
     accs = {n: 0 for n in TTT_EVALS}; tots = {n: 0 for n in TTT_EVALS}
     fit_h = fit_t = 0                      # does TTT at least FIT its 12 pairs?
@@ -186,6 +187,7 @@ for lr in TTT_LRS:
         mdl = copy.deepcopy(model)
         opt = torch.optim.AdamW(mdl.parameters(), lr=lr, weight_decay=0.0)
         xr, yr = ttt_examples(ci)
+        xr, yr = xr.to(DEV), yr.to(DEV)
         for step in range(1, max(TTT_EVALS) + 1):
             out = mdl(xr, init_mem=None, compute_logits=True)
             loss = F.cross_entropy(out["logits"][:, -1], yr)

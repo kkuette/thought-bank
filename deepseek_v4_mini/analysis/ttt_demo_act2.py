@@ -17,7 +17,7 @@ mid-conversation, key0's rule is REPLACED while key1 must keep serving.
 
 Rules: s1/s_b from TRAIN, switch target from TRAIN or HELD (--held).
 Usage: PYTHONPATH=. python deepseek_v4_mini/analysis/ttt_demo_act2.py [ckpt] [--held]
-CPU-friendly; safe alongside a GPU training.
+Runs on GPU when available (data generation stays on the CPU RNG), CPU otherwise.
 """
 import copy, sys, time
 import torch, torch.nn.functional as F, yaml
@@ -28,6 +28,7 @@ from deepseek_v4_mini.model import ThoughtBankLM
 from deepseek_v4_mini.train import _rule_space
 
 torch.manual_seed(0)
+DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CKPT = (sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else
         "checkpoints/multiturn_rule_k2_inter_s128_dsv4w/step_3000.pt")
 CFG  = "deepseek_v4_mini/configs/multiturn_rule_k2_inter_s128struct_dsv4w.yaml"
@@ -41,9 +42,10 @@ raw = yaml.safe_load(open(CFG))
 cfg = ThoughtBankConfig.from_yaml(CFG)
 model = ThoughtBankLM(cfg)
 sd = torch.load(CKPT, map_location="cpu")
-model.load_state_dict(sd["model"]); model.eval()
+model.load_state_dict(sd["model"]); model.eval(); model.to(DEV)
 P = sum(p.numel() for p in model.parameters())
-print(f"loaded {CKPT} (step {sd['step']}) | switch target pool: {'HELD' if SW_HELD else 'TRAIN'}")
+print(f"loaded {CKPT} (step {sd['step']}) | device {DEV.type} "
+      f"| switch target pool: {'HELD' if SW_HELD else 'TRAIN'}")
 
 _u, _n, TRAIN, HELD, _apply = _rule_space(raw["data"])
 TRAIN_T, HELD_T = torch.tensor(TRAIN), torch.tensor(HELD)
@@ -85,23 +87,23 @@ fwd_flops = lambda tokens: 2 * P * tokens
 # ── bank arm ─────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def bank_arm():
-    mem = model(pres_rows(s_a, 0), init_mem=None, compute_logits=False)["mem_bank"]
-    mem = model(pres_rows(s_b, 1), init_mem=mem, compute_logits=False)["mem_bank"]
+    mem = model(pres_rows(s_a, 0).to(DEV), init_mem=None, compute_logits=False)["mem_bank"]
+    mem = model(pres_rows(s_b, 1).to(DEV), init_mem=mem, compute_logits=False)["mem_bank"]
     def run_qs(n_turns, s0, track_old=None):
         nonlocal mem
         accs = {0: [], 1: []}; stick = [0, 0]
         for t in range(n_turns * K):
             k = t % K
             xq, y = q_batch(s0 if k == 0 else s_b, k)
-            out = model(xq, init_mem=mem, compute_logits=True)
+            out = model(xq.to(DEV), init_mem=mem, compute_logits=True)
             mem = out["mem_bank"]
-            pred = out["logits"][:, -1].argmax(-1)
+            pred = out["logits"][:, -1].argmax(-1).cpu()
             accs[k].append(float((pred == y).float().mean()))
             if track_old is not None and k == 0:
                 _, y_old = q_batch(track_old, 0)   # NOTE: fresh q, approx STICK
         return accs
     pre = run_qs(TURNS_PRE, s_a)
-    mem = model(pres_rows(s_a2, 0), init_mem=mem, compute_logits=False)["mem_bank"]  # THE UPDATE
+    mem = model(pres_rows(s_a2, 0).to(DEV), init_mem=mem, compute_logits=False)["mem_bank"]  # THE UPDATE
     post = run_qs(TURNS_POST, s_a2)
     return pre, post
 
@@ -129,16 +131,16 @@ pa2, ya2 = pair_rows(s_a2, 0)     # key0 NEW pairs (the switch data)
 
 def fit_acc(mdl, rows, ys):
     with torch.no_grad():
-        out = mdl(rows.view(-1, 2), init_mem=None, compute_logits=True)
-        return float((out["logits"][:, -1].argmax(-1) == ys.view(-1)).float().mean())
+        out = mdl(rows.view(-1, 2).to(DEV), init_mem=None, compute_logits=True)
+        return float((out["logits"][:, -1].argmax(-1).cpu() == ys.view(-1)).float().mean())
 
 def q_acc(mdl, s_k, k, n=8):
     hits = 0
     with torch.no_grad():
         for _ in range(n):
             xq, y = q_batch(s_k, k)
-            out = mdl(xq, init_mem=None, compute_logits=True)
-            hits += int((out["logits"][:, -1].argmax(-1) == y).sum())
+            out = mdl(xq.to(DEV), init_mem=None, compute_logits=True)
+            hits += int((out["logits"][:, -1].argmax(-1).cpu() == y).sum())
     return hits / (n * N_CONV)
 
 fitA1 = fitB1 = fitA2n = fitB2 = fitA2o = 0.0
@@ -147,24 +149,26 @@ t0 = time.perf_counter()
 for ci in range(N_CONV):
     mdl = copy.deepcopy(model)
     opt = torch.optim.AdamW(mdl.parameters(), lr=LR, weight_decay=0.0)
-    x1 = torch.cat([pa[ci], pb[ci]]); y1 = torch.cat([ya[ci], yb[ci]])
+    x1 = torch.cat([pa[ci], pb[ci]]).to(DEV); y1 = torch.cat([ya[ci], yb[ci]]).to(DEV)
     for _ in range(N1):                                   # phase 1: learn both rules
         out = mdl(x1, init_mem=None, compute_logits=True)
         loss = F.cross_entropy(out["logits"][:, -1], y1)
         opt.zero_grad(); loss.backward(); opt.step()
     with torch.no_grad():
-        o = mdl(torch.cat([pa[ci], pb[ci]]), init_mem=None, compute_logits=True)
-    fitA1 += float((o["logits"][:m, -1].argmax(-1) == ya[ci]).float().mean())
-    fitB1 += float((o["logits"][m:, -1].argmax(-1) == yb[ci]).float().mean())
+        o = mdl(x1, init_mem=None, compute_logits=True)
+    pred = o["logits"][:, -1].argmax(-1).cpu()
+    fitA1 += float((pred[:m] == ya[ci]).float().mean())
+    fitB1 += float((pred[m:] == yb[ci]).float().mean())
     for _ in range(N2):                                   # phase 2: THE SWITCH
-        out = mdl(pa2[ci], init_mem=None, compute_logits=True)
-        loss = F.cross_entropy(out["logits"][:, -1], ya2[ci])
+        out = mdl(pa2[ci].to(DEV), init_mem=None, compute_logits=True)
+        loss = F.cross_entropy(out["logits"][:, -1], ya2[ci].to(DEV))
         opt.zero_grad(); loss.backward(); opt.step()
     with torch.no_grad():
-        o = mdl(torch.cat([pa2[ci], pb[ci], pa[ci]]), init_mem=None, compute_logits=True)
-    fitA2n += float((o["logits"][:m, -1].argmax(-1) == ya2[ci]).float().mean())
-    fitB2  += float((o["logits"][m:2*m, -1].argmax(-1) == yb[ci]).float().mean())
-    fitA2o += float((o["logits"][2*m:, -1].argmax(-1) == ya[ci]).float().mean())
+        o = mdl(torch.cat([pa2[ci], pb[ci], pa[ci]]).to(DEV), init_mem=None, compute_logits=True)
+    pred = o["logits"][:, -1].argmax(-1).cpu()
+    fitA2n += float((pred[:m] == ya2[ci]).float().mean())
+    fitB2  += float((pred[m:2*m] == yb[ci]).float().mean())
+    fitA2o += float((pred[2*m:] == ya[ci]).float().mean())
 dt = time.perf_counter() - t0
 n = N_CONV
 step_cost = 3 * fwd_flops(2 * m * 2)   # fwd+bwd on 12 2-token rows

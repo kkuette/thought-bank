@@ -1,5 +1,10 @@
 # A Trained Fast-Weight Memory: Continual Rule Binding at Inference Without Backward
 
+**Tony Denion**¹ · **Claude Fable (Anthropic)**²
+¹ Independent researcher — awakeproduction@hotmail.fr
+² AI co-author; experimental campaign and drafting conducted with Claude
+Fable 5 via Claude Code
+
 *Draft v0.2 — 2026-07-06. Markdown master (figures, appendices and
 references in); LaTeX port after prose freeze.*
 
@@ -84,9 +89,10 @@ full policy: persistence 0.000 at every switch position, clean dirty-bank
 writes, no retention cliff (§8). The architecture supplies a substrate;
 the training distribution decides what the memory *does*, the way
 augmentation decides a vision model's invariances. Anyone equipping a
-model with a memory mechanism should expect the same: an inference-time
-behaviour the training distribution never exercised should be presumed
-absent until probed.
+model with a memory mechanism should expect the same: if a behaviour —
+overwriting a stale entry, keeping a neighbour intact, recalling after a
+delay — never occurred in the training conversations, assume the deployed
+model cannot do it until a probe shows otherwise.
 
 Third, we show the training problem is itself non-trivial and give a
 working recipe. Joint training of write, storage and read collapses into
@@ -143,11 +149,29 @@ sequential updates it exhibits classic catastrophic interference
 (McCloskey & Cohen, 1989) — which our forward-only write structurally
 avoids, degrading instead by eviction, a capacity knob.
 
+**Concurrent work (2026).** Two adjacent lines have moved fast while this
+work was underway. Hypernetworks that map a context to a LoRA adapter in
+a single forward pass — Doc-to-LoRA (Charakorn et al., 2026), SHINE
+(Liu et al., 2026) — are, at LLM scale, the same mechanism as our read
+head: forward-only installation of context as weights. They are
+*per-prompt*, however: one context, one disposable adapter. None
+maintains a persistent multi-slot state across sequential writes, so the
+questions this paper is about — replacement mid-conversation, collateral
+interference, what an untrained write policy does to a dirty bank — do
+not arise in their setting. On the memory side, fast-weight stores
+updated at inference by chunk-level gradient descent (FwPKM; Zhao &
+Jones, 2026) and trained controllers that allocate test-time gradient
+steps (Mei et al., 2026) keep the backward pass we remove; their "write
+policy" is a budget over gradient updates, whereas ours is a forward
+behaviour installed by the training distribution and absent without it
+(§8).
+
 **Base architecture.** The trunk miniaturizes the DeepSeek line of
 efficient transformers — latent-compressed attention (MLA; DeepSeek-AI,
 2024a) and native sparse attention (Yuan et al., 2025), fine-grained
 mixture-of-experts with shared experts (DeepSeekMoE; Dai et al., 2024),
-as consolidated in DeepSeek-V3 (DeepSeek-AI, 2024b) and its V4 successor —
+as consolidated in DeepSeek-V3 (DeepSeek-AI, 2024b) and DeepSeek-V4
+(DeepSeek-AI, 2026) —
 plus hyper-connection residual streams (Zhu et al., 2024). These choices are load-bearing for realism (the bank is
 grafted onto a production-style stack, not a bespoke toy), not for the
 claims.
@@ -181,7 +205,8 @@ slot into a low-rank MLP applied sequentially to the residual stream at
 block 0. The bank is the only state crossing segment boundaries — no
 backward pass, no optimizer, no weight copy at inference.*
 
-**Trunk.** The trunk is a miniature of the DeepSeek-V4 stack: compressed
+**Trunk.** The trunk is a miniature of the DeepSeek-V4 stack
+(DeepSeek-AI, 2026): compressed
 sparse attention (a two-tier local/compressed scheme in the spirit of
 DeepSeek's sparse attention, with latent-compressed queries), a
 fine-grained DeepSeekMoE feed-forward with a shared expert, and
@@ -511,11 +536,11 @@ absent from the training distribution was absent from the behaviour —
 down to the write head being unable to produce a readable code on a bank
 state it had never written on. We believe this is the observation most
 likely to transfer beyond our toy: a memory mechanism does not come with
-its policy included, and each inference-time behaviour one wants
-(retention horizons, overwrite discipline — or usages we did not test,
-such as interleaved ingestion and later recall of multiple contexts)
-should be presumed to need matching pressure in the training
-distribution until probed.
+its policy included. Each inference-time behaviour one wants — retention
+horizons, overwrite discipline, or usages we did not test, such as
+interleaved ingestion and later recall of multiple contexts — should be
+assumed to require matching pressure in the training distribution, until
+a probe shows the model has it for free.
 
 ## 9. Findings and boundaries
 
@@ -526,10 +551,11 @@ stream: 0.863 on the non-switched key post-switch) while seed 43 flushes
 the whole bank and rewrites only the switched binding (0.011 — chance) —
 despite being the stronger model on every other axis (held 0.997–1.000).
 The non-switched key accounts for 17% of query tokens, so seed 43 pays
-chance-level loss on those queries for the entire run — its training CE
-converges to a visibly higher band than seed 42's (≈2.6 vs ≈0.4 over the
-last 500 steps; App. A) — and the gradient still never crosses into the
-selective basin. The attractor is
+chance-level loss on those queries for the entire run — at matched step
+and learning rate (steps 2500–3000) its training CE band is ≈3.4 vs ≈0.5
+for seed 42, and a further 1000 steps of LR decay only brings it to ≈2.5
+(App. A) — and the gradient still never crosses into the selective
+basin. The attractor is
 visible at the write itself: the switch write's redundancy with the
 resident bank is +0.50 for seed 42 (it preserves the resident
 superposition) but −0.10 for seed 43 (it displaces it; Fig. 4C). Two
@@ -588,10 +614,26 @@ leave it to future work.
 
 Code, configurations, and analysis probes are available at
 github.com/kkuette/thought-bank. The policy cell trains in ≈5 h on a
-single RTX 3090; every probe and both TTT arms run on CPU. Seeds 42/43;
-data generators are deterministic given the config; checkpoints saved
-every 100 steps. An end-to-end script reproducing Tables 2–4 and Figure 5
-from a fresh clone is provided (repro/).
+single RTX 3090; every probe and both TTT arms run on a single GPU or,
+more slowly, on CPU (evaluation data is generated on the CPU RNG in
+either case). Seeds 42/43; data generators are deterministic given the
+config; checkpoints saved every 100 steps. An end-to-end script
+reproducing Tables 2–4 and Figures 3–5 from a fresh clone is provided
+(repro/).
+
+## Authorship note
+
+This work is an extended human–AI collaboration: the experimental
+campaign, analysis, and drafting were conducted jointly by the human
+author and Claude Fable 5 (Anthropic), used via Claude Code, and we
+credit the model as co-author accordingly. Research direction, design
+decisions, validation of every claim, and responsibility for errors
+remain with the human author. Because arXiv and most venues currently do
+not accept AI systems as formal authors, this work exists in two
+versions: the present one (the repository master, with the model
+credited as co-author) and a submission version whose byline reduces to
+the human author, with this note standing as the disclosure. The two are
+otherwise identical.
 
 ## References
 
@@ -606,12 +648,17 @@ from a fresh clone is provided (repro/).
   Richemond, P. H., McClelland, J., Hill, F. (2022). Data Distributional
   Properties Drive Emergent In-Context Learning in Transformers.
   NeurIPS 35.
+- Charakorn, R., Cetin, E., Uesaka, S., Lange, R. T. (2026).
+  Doc-to-LoRA: Learning to Instantly Internalize Contexts.
+  arXiv:2602.15902.
 - Dai, D., Deng, C., Zhao, C., et al. (2024). DeepSeekMoE: Towards
   Ultimate Expert Specialization in Mixture-of-Experts Language Models.
   arXiv:2401.06066.
 - DeepSeek-AI (2024a). DeepSeek-V2: A Strong, Economical, and Efficient
   Mixture-of-Experts Language Model. arXiv:2405.04434.
 - DeepSeek-AI (2024b). DeepSeek-V3 Technical Report. arXiv:2412.19437.
+- DeepSeek-AI (2026). DeepSeek-V4: Towards Highly Efficient
+  Million-Token Context Intelligence. arXiv:2606.19348.
 - Finn, C., Abbeel, P., Levine, S. (2017). Model-Agnostic Meta-Learning
   for Fast Adaptation of Deep Networks. ICML.
 - Graves, A., Wayne, G., Danihelka, I. (2014). Neural Turing Machines.
@@ -622,9 +669,14 @@ from a fresh clone is provided (repro/).
 - Hao, S., Sukhbaatar, S., Su, D., Li, X., Hu, Z., Weston, J., Tian, Y.
   (2024). Training Large Language Models to Reason in a Continuous
   Latent Space. arXiv:2412.06769.
+- Liu, Y., Wang, X., Mao, Y., Gelbery, Y., Maron, H., Zhang, M. (2026).
+  SHINE: A Scalable In-Context Hypernetwork for Mapping Context to LoRA
+  in a Single Pass. arXiv:2602.06358.
 - McCloskey, M., Cohen, N. J. (1989). Catastrophic Interference in
   Connectionist Networks: The Sequential Learning Problem. Psychology of
   Learning and Motivation, 24, 109–165.
+- Mei, L., Liu, S., Wang, Y., et al. (2026). Gated Differentiable
+  Working Memory for Long-Context Language Modeling. arXiv:2601.12906.
 - Power, A., Burda, Y., Edwards, H., Babuschkin, I., Misra, V. (2022).
   Grokking: Generalization Beyond Overfitting on Small Algorithmic
   Datasets. arXiv:2201.02177.
@@ -655,12 +707,10 @@ from a fresh clone is provided (repro/).
 - Yuan, J., Gao, H., Dai, D., et al. (2025). Native Sparse Attention:
   Hardware-Aligned and Natively Trainable Sparse Attention.
   arXiv:2502.11089.
+- Zhao, T., Jones, L. (2026). Fast-weight Product Key Memory.
+  arXiv:2601.00671.
 - Zhu, D., Huang, H., Huang, Z., Zeng, Y., Mao, Y., Wu, B., Min, Q.,
   Zhou, X. (2024). Hyper-Connections. arXiv:2409.19606.
-
-*(The DeepSeek-V4 report, which consolidates the MLA + sparse-attention +
-DeepSeekMoE stack our trunk miniaturizes, is cited as the V4 successor of
-DeepSeek-AI (2024b); we will pin the exact reference at the LaTeX port.)*
 
 ## Appendix A. Training dynamics of the policy cell
 
@@ -681,11 +731,15 @@ this diversity (contrast the ≤25-rule regime of §5).
 Two curves are worth reading against §9. First, the distillation loss
 *rises* after the anneal (0.03 → 0.76 / 0.30) while accuracy climbs — the
 post-anneal code drift of App. B, a health signal at β=0. Second, the two
-seeds' final CE bands differ by construction of their attractors: seed 43
-converges to ≈2.6 (vs ≈0.4 for seed 42) because it answers at chance on
-the non-switched key's queries (~17% of query tokens) in every switch
-conversation. A visible, persistent loss penalty is being paid, and
-gradient descent still does not cross between replacement policies.
+seeds' CE bands differ by construction of their attractors: seed 43
+answers at chance on the non-switched key's queries (~17% of query
+tokens) in every switch conversation. The runs have different lengths
+(seed 42 was stopped at 3000 steps, seed 43 ran to 4000), so the honest
+comparison is at matched step and learning rate: over steps 2500–3000,
+seed 43's CE band is ≈3.4 against seed 42's ≈0.5, and seed 43's extra
+1000 steps of LR decay (to 3e-5) only bring it to ≈2.5. A visible,
+persistent loss penalty is being paid, and gradient descent still does
+not cross between replacement policies.
 
 ## Appendix B. Post-anneal code drift: the teacher is scaffolding
 
