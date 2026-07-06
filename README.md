@@ -1,5 +1,7 @@
 # Thought Bank
 
+[![DOI](https://zenodo.org/badge/1032593199.svg)](https://doi.org/10.5281/zenodo.21222901)
+
 Research repo exploring **persistent thought memory** for language models. The
 active line of work is **`deepseek_v4_mini`**: a small reproduction of the
 DeepSeek-V4 architecture fused with a **fast-weight thought bank** — a rolling
