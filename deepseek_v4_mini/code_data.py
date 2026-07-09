@@ -141,10 +141,20 @@ class CodeChunkStream:
                  stream_cap: int = 60000, cache_dir: str = "data_cache",
                  content_key: str = "content", config_name: str = "",
                  min_chunks: int = 1, stream_skip: int = 0,
-                 sources: list[dict] | None = None) -> None:
+                 sources: list[dict] | None = None,
+                 var_chunk: list | tuple | None = None) -> None:
         self.tok = tokenizer
         self.L = int(seq_len); self.K = int(chunks_per_conv); self.B = int(batch)
         self.rng = random.Random(seed + (0 if split == "train" else 101))
+        # var_chunk=[lo, hi]: VARIABLE chunk lengths ~ U[lo, hi], re-cut at sampling
+        # time from the cached fixed-L slices (contiguous, so cat() reconstructs the
+        # token stream — the tokenized cache is untouched). Breaks the fixed-512
+        # write positions (anti positional-shortcut; RL prerequisite). batch=1 only.
+        self.var_chunk = tuple(int(v) for v in var_chunk) if var_chunk else None
+        if self.var_chunk:
+            lo, hi = self.var_chunk
+            assert self.B == 1, "var_chunk: ragged variable chunks require batch=1"
+            assert 1 <= lo <= hi <= self.L, f"var_chunk {self.var_chunk} vs seq_len {self.L}"
 
         common = dict(split=split, seq_len=self.L,
                       max_chunks_per_file=max_chunks_per_file, cache_dir=cache_dir)
@@ -212,6 +222,7 @@ class CodeChunkStream:
         v.B = 1                                         # views serve batch=1 eval paths
         v.src_files = [self.src_files[i]]; v.src_weights = [1.0]
         v.src_names = [self.src_names[i]]; v._wsum = 1.0
+        v.var_chunk = self.var_chunk
         v.files = self.src_files[i]
         v.n_files = len(v.files); v.n_chunk = sum(len(f) for f in v.files)
         return v
@@ -221,6 +232,18 @@ class CodeChunkStream:
         fl = self.src_files[self._pick_source()]
         return fl[self.rng.randrange(len(fl))]
 
+    def _reslice(self, f: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Variable-length re-cut of a cached file: chunk lengths ~ U[lo, hi].
+        Cached chunks are contiguous slices, so cat() reconstructs the (capped)
+        token stream; only the boundaries change, never the content."""
+        lo, hi = self.var_chunk
+        t = torch.cat(f)
+        out, i = [], 0
+        while i < t.numel():
+            n = self.rng.randint(lo, hi)
+            out.append(t[i:i + n]); i += n
+        return out
+
     def next_conv(self) -> list[dict]:
         """A random-DEPTH window of consecutive chunks from ONE file (batch=1). The
         conversation length m is SAMPLED per call in [2, min(K, nc)] (or 1 when the
@@ -228,6 +251,8 @@ class CodeChunkStream:
         (1-hop … K-hop), not always the deepest. A random start offset is then drawn.
         Each seg: {input_ids [1, Lj], attention_mask [1, Lj]} — Lj varies (last ragged)."""
         f = self._pick_file()
+        if self.var_chunk:
+            f = self._reslice(f)
         nc = len(f)
         hi = min(self.K, nc)
         m = hi if hi < 2 else self.rng.randint(2, hi)  # randint inclusive => depth in [2, hi]
@@ -303,10 +328,20 @@ class CodeChunkStream:
         """A window of EXACTLY n_chunks consecutive chunks from a random file with
         nc >= n_chunks (None if no such file). Same seg format as next_conv. Used by
         the depth-stratified eval to control conversation depth instead of sampling it."""
-        cands = [f for f in self.files if len(f) >= n_chunks]
-        if not cands:
-            return None
-        f = cands[self.rng.randrange(len(cands))]
+        if self.var_chunk:
+            # conservative token filter: total >= n_chunks*hi guarantees the re-cut
+            # yields at least n_chunks chunks whatever lengths the rng draws.
+            hi = self.var_chunk[1]
+            cands = [f for f in self.files
+                     if sum(c.numel() for c in f) >= n_chunks * hi]
+            if not cands:
+                return None
+            f = self._reslice(cands[self.rng.randrange(len(cands))])
+        else:
+            cands = [f for f in self.files if len(f) >= n_chunks]
+            if not cands:
+                return None
+            f = cands[self.rng.randrange(len(cands))]
         st = self.rng.randrange(0, len(f) - n_chunks + 1)
         segs = []
         for j in range(st, st + n_chunks):

@@ -179,6 +179,16 @@ def main(cfg_path: str, resume: bool = False) -> None:
           f"max_mem {cfg.max_mem} | <think>={think_id} <blank>={blank_id} vocab {cfg.vocab_size}",
           flush=True)
 
+    # init_from: CONTINUED pretraining — model weights from a finished run's
+    # checkpoint, fresh optimizer/schedule/data (unlike --resume, which restores
+    # the full training state of THIS run). Used by the var-chunk phase (v2c).
+    init_from = t.get("init_from")
+    if init_from:
+        ck0 = torch.load(init_from, map_location="cpu")
+        model.load_state_dict(ck0["model"])
+        print(f"init_from: model weights <- {init_from} (step {ck0.get('step', '?')})",
+              flush=True)
+
     # teacher: distill the last bank slot toward a fixed random projection of the
     # mean-pooled chunk gist (a target the write CAN produce), β anneals 1->0.
     tf_cfg = raw.get("teacher", {}) or {}
@@ -208,6 +218,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
               min_chunks=int(d.get("min_chunks", 1)),
               stream_skip=int(d.get("stream_skip", 0)),
               sources=d.get("sources"),
+              var_chunk=d.get("var_chunk"),
               seed=int(t.get("seed", 0)))
     train_stream = CodeChunkStream(tok, split="train", **sd)
     eval_stream  = CodeChunkStream(tok, split="held", **{**sd, "batch": 1})  # eval = batch=1 paths
