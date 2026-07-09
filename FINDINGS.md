@@ -37,6 +37,54 @@ test this — before scale.
 
 ---
 
+## 2026-07-10 — continued pretraining works: bootstrap once, then train like a normal LM
+
+**TL;DR.** Once the memory circuit has been bootstrapped (teacher + anneal, see
+the 2026-07-09 entry), the checkpoint behaves like an ordinary pretrained LM:
+you can warm-restart it with **no teacher, no anneal**, at a moderate LR, and
+even **change the data regime** — and the bank not only survives, it improves.
+The teacher scaffold is a one-time cost, not a permanent training dependency.
+
+### Setup
+
+`v2c_varlen`: continued pretrain of the 97M `v2b_mix` final checkpoint
+(`init_from`), 400 steps at LR 2.4e-4 (the post-first-decay plateau of the
+original WSD schedule), teacher fully off (β=0 from step 0), same per-group
+Muon LR scales. Regime change on top: chunks are re-cut at **variable lengths
+[128, 512]** instead of fixed 512 — this breaks the positional shortcut where
+`<think>` always lands at position 512, a prerequisite for RL over *when* to
+write. Config:
+[`deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml`](deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml).
+
+### What happened
+
+- In-context loss resumes exactly where the parent left it (starts at 5.93 vs
+  ~10.8 from scratch) and keeps descending — no shock, no NaN, no
+  re-warmup drama beyond 20 steps.
+- The deferred-continuation GAP — the fragile quantity, historically the first
+  thing to die (ignore-bank fixed point, Muon shape trap) — **goes up** under
+  the new regime: codeparrot +1.27 nats @100 → **+1.50 @200** (the parent
+  plateaued around +0.79), fineweb +0.34 → +0.82 @300, positive at every
+  write depth d2–d8 on both domains.
+- So the write/read mechanism is not anchored to fixed chunk boundaries: gists
+  written at arbitrary positions in [128, 512] carry the same (better)
+  file-specific signal.
+
+### Why it matters
+
+Every intervention so far (bootstrap, anneal timing, per-group LR) protected a
+circuit that was assumed fragile. This shows the trained circuit is **robust
+under ordinary fine-tuning dynamics**: the standard toolbox — continued
+pretraining, domain adaptation, and next, RL from a checkpoint — applies
+as-is. The GRPO phase can `init_from` a bootstrapped model and optimize the
+write *policy* without re-solving the credit-assignment problem that made
+bootstrap necessary in the first place.
+
+Repro: `python deepseek_v4_mini/code_defer_native.py deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml`
+(needs `checkpoints/code_defer_native_v2b_mix/final.pt`).
+
+---
+
 ## 2026-07-09 — dsv6: the bank as long-context memory on real data (97M, code+web mix)
 
 **TL;DR.** A 97M from-scratch model with an 8-slot thought bank, trained 2000
