@@ -25,6 +25,30 @@ paired per file:
               only trained to predict the chunk after the LAST write), so read
               the lag PROFILE, not the absolute level.
 
+Three later probes (2026-07-10) extend the battery toward the "more than a
+window" claims — store-both-and-select, bank-as-workspace, gist-as-abstraction:
+
+  cohab       TWO files A and B share the bank (interleaved a0,b0,a1,b1,a2,b2
+              and blocked a0,a1,a2,b0,b1,b2) vs their mono banks; the SAME
+              superposed bank is decoded against A's target AND B's target.
+              Cohabitation cost per file + recency asymmetry (B always ends).
+  reflect     k consecutive THOUGHT turns (blank forwards whose bank write is
+              carried, exactly the deferred format) inserted between the writes
+              and the final decode, k=0..3. CE(k) dropping below CE(0) = the
+              bank serves as an iterative workspace on real data (dsv5f's cell,
+              production conditions). Each thought evicts one oldest slot.
+  invar       does the gist store the DEFINITION or the SURFACE? (a) reseg:
+              the same c0..c2 tokens re-cut at shifted boundaries (offset 128,
+              same content minus the first 128 tokens, farthest from target);
+              (b) rename (code source only): identifiers consistently renamed
+              qz0..qzN via regex, then re-tokenized — semantics ~preserved,
+              token surface destroyed. Score each against the own-bank floor
+              and the swap (different file) ceiling: invariance = how far the
+              perturbed bank stays from "just another file's bank".
+              Caveats: reseg chunks are off-512 (OOD length for fixed-L ckpts;
+              clean on varlen ckpts); rename is regex-level (strings/attributes
+              get renamed too — surface perturbation, not compiler-grade).
+
 Usage (repo root):
     PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
         deepseek_v4_mini/configs/code_defer_native_v2b_mix.yaml \
@@ -245,8 +269,128 @@ def probe_eviction(raw, tok, model, dev, n_files):
             print(f"  {lag:>4} {status:>12} {st.mean(g):>+9.3f}+-{se:.3f} {len(g):>4}")
 
 
+def probe_cohab(raw, tok, model, dev, n_files):
+    write_seq, defer_ce = _mk_ops(model, tok, dev)
+    stream = _stream(raw, tok, seed=444)
+    pools = _pools(stream)
+    for si, nm in enumerate(stream.src_names):
+        fs = pools[si]
+        res = {k: [] for k in ("monoA_A", "inter_A", "block_A", "reset_A",
+                               "monoB_B", "inter_B", "block_B", "reset_B")}
+        for i, f in enumerate(fs[:n_files]):
+            g = fs[(i + 1) % min(len(fs), 200)]           # B = neighbor file
+            gtA = f[3][:DL].unsqueeze(0).to(dev)
+            gtB = g[3][:DL].unsqueeze(0).to(dev)
+            inter = write_seq([f[0], g[0], f[1], g[1], f[2], g[2]])
+            block = write_seq([f[0], f[1], f[2], g[0], g[1], g[2]])
+            res["monoA_A"].append(defer_ce(write_seq([f[0], f[1], f[2]]), gtA))
+            res["inter_A"].append(defer_ce(inter, gtA))
+            res["block_A"].append(defer_ce(block, gtA))
+            res["reset_A"].append(defer_ce(None, gtA))
+            res["monoB_B"].append(defer_ce(write_seq([g[0], g[1], g[2]]), gtB))
+            res["inter_B"].append(defer_ce(inter, gtB))
+            res["block_B"].append(defer_ce(block, gtB))
+            res["reset_B"].append(defer_ce(None, gtB))
+        n = len(res["monoA_A"])
+        print(f"\n[{nm}] COHABITATION (n={n}, one bank decoded against BOTH targets; "
+              f"B always written last)")
+        _report(res, n, [
+            ("inter_A", "monoA_A", "cohab cost for A, interleaved"),
+            ("block_A", "monoA_A", "cohab cost for A, blocked (A oldest)"),
+            ("inter_B", "monoB_B", "cohab cost for B, interleaved"),
+            ("block_B", "monoB_B", "cohab cost for B, blocked (B recent)"),
+            ("reset_A", "inter_A", "A GAP surviving cohabitation"),
+            ("reset_B", "inter_B", "B GAP surviving cohabitation")])
+
+
+def probe_reflect(raw, tok, model, dev, n_files):
+    write_seq, defer_ce = _mk_ops(model, tok, dev)
+    blank_id = tok.convert_tokens_to_ids("<blank>")
+    stream = _stream(raw, tok, seed=606)
+    pools = _pools(stream)
+
+    def think_turn(bank):
+        di = torch.full((1, DL), blank_id, dtype=torch.long, device=dev)
+        with torch.no_grad():
+            return model(di, init_mem=bank)["mem_bank"]
+
+    KS = (0, 1, 2, 3)
+    for si, nm in enumerate(stream.src_names):
+        res = {f"k{k}": [] for k in KS}
+        res["reset"] = []
+        for f in pools[si][:n_files]:
+            gt = f[3][:DL].unsqueeze(0).to(dev)
+            bank = write_seq([f[0], f[1], f[2]])
+            for k in KS:
+                res[f"k{k}"].append(defer_ce(bank, gt))
+                bank = think_turn(bank)                 # k -> k+1 thought turns
+            res["reset"].append(defer_ce(None, gt))
+        n = len(res["reset"])
+        print(f"\n[{nm}] REFLECT-k (n={n}, k blank thought-turns carried before decode; "
+              f"each thought evicts one oldest slot)")
+        _report(res, n, [(f"k{k}", "k0", f"k={k} vs k=0") for k in KS[1:]])
+
+
+_PY_KW = frozenset("""False None True and as assert async await break class continue
+def del elif else except finally for from global if import in is lambda nonlocal
+not or pass print raise return self set str try while with yield int len dict
+list range object type import""".split())
+
+
+def _rename_ids(text):
+    """Consistently rename the most frequent identifiers to qz0..qzN (regex-level:
+    strings/attributes included — surface perturbation, not compiler-grade)."""
+    import re
+    from collections import Counter
+    words = Counter(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", text))
+    cand = [w for w, _ in words.most_common(48) if w.lower() not in _PY_KW][:24]
+    mapping = {w: f"qz{i}" for i, w in enumerate(cand)}
+    return re.sub(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b",
+                  lambda m: mapping.get(m.group(0), m.group(0)), text)
+
+
+def probe_invar(raw, tok, model, dev, n_files):
+    write_seq, defer_ce = _mk_ops(model, tok, dev)
+    L = int(raw["data"]["seq_len"])
+    stream = _stream(raw, tok, seed=888)
+    pools = _pools(stream)
+    for si, nm in enumerate(stream.src_names):
+        fs = pools[si]
+        is_code = "code" in nm.lower() or si == 0
+        keys = ["own", "reseg", "swap", "reset"] + (["rename"] if is_code else [])
+        res = {k: [] for k in keys}
+        for i, f in enumerate(fs[:n_files]):
+            g = fs[(i + 1) % min(len(fs), 200)]
+            gt = f[3][:DL].unsqueeze(0).to(dev)
+            toks = torch.cat([f[0], f[1], f[2]])
+            res["own"].append(defer_ce(write_seq([f[0], f[1], f[2]]), gt))
+            # (a) reseg: boundaries shifted by 128 (drops the first 128 tokens,
+            # the ones FARTHEST from the target)
+            sh = toks[128:]
+            reseg = [sh[j * L:(j + 1) * L] for j in range(-(-sh.numel() // L))]
+            res["reseg"].append(defer_ce(write_seq(reseg), gt))
+            # (b) rename: same definition, destroyed surface (code only)
+            if is_code:
+                rt = torch.tensor(
+                    tok.encode(_rename_ids(tok.decode(toks)), add_special_tokens=False),
+                    dtype=torch.long)
+                ren = [rt[j * L:(j + 1) * L] for j in range(-(-rt.numel() // L))]
+                res["rename"].append(defer_ce(write_seq(ren), gt))
+            res["swap"].append(defer_ce(write_seq([g[0], g[1], g[2]]), gt))
+            res["reset"].append(defer_ce(None, gt))
+        n = len(res["own"])
+        print(f"\n[{nm}] INVARIANCE (n={n}, target = ORIGINAL c3 opening; "
+              f"invariance = perturbed bank stays near own, far from swap)")
+        pairs = [("reseg", "own", "reseg cost (segmentation invariance)"),
+                 ("swap", "own", "swap distance (specificity ceiling)")]
+        if is_code:
+            pairs.insert(1, ("rename", "own", "rename cost (surface invariance)"))
+        _report(res, n, pairs)
+
+
 PROBES = {"swap": probe_swap, "dup": probe_dup, "distractor": probe_distractor,
-          "order": probe_order, "eviction": probe_eviction}
+          "order": probe_order, "eviction": probe_eviction,
+          "cohab": probe_cohab, "reflect": probe_reflect, "invar": probe_invar}
 
 
 def main():

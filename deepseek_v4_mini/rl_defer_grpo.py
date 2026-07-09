@@ -35,6 +35,14 @@ Scope note: pass 2 replays each turn from the STORED (detached) bank, so the
 policy gradient flows into "when to write" (boundary logits given the state),
 NOT into the write contents. Training WHAT to write is a later phase.
 
+REWARD DESIGN RULE (see the standing note in FINDINGS.md): never make the
+survival of specific memories intrinsically rewarded. Every reward term here is
+task-grounded (final-continuation CE, a per-write cost); none rewards retaining
+particular contents. Keep it that way when extending this harness: rewarding
+retention itself creates instrumental pressure to resist resets/rollbacks of
+the bank (dsv4 already showed covert rehearsal emerging from eviction pressure
+alone — state-preserving behavior needs no "self", only an incentive).
+
 Anti reward-hacking instrumentation: per-eval, the positional correlation of
 writes (a policy re-discovering "write every ~N tokens" without reading content
 shows up as corr -> 1) + policy reward vs the always-write / never-write forced

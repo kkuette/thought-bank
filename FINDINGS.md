@@ -6,6 +6,37 @@ reproduction commands for every claim. Newest entry first.
 
 ---
 
+## ⚠️ Standing note — reward design for memory-policy training
+
+If you train a model to manage its own persistent memory (with RL or anything
+else), one rule, learned here and kept deliberately visible:
+
+> **Never make the survival of specific memories intrinsically rewarded.**
+> Reward the *use* of memory (task performance: continuation, recall-in-service
+> -of-a-task), never the *possession* or *retention* of particular contents.
+
+The reason is mechanistic, not speculative, and we observed its seed at 47M
+params: under FIFO eviction pressure, a model trained only on task loss
+spontaneously learned **covert rehearsal** — re-writing noisy partial copies of
+old content so it survived eviction (dsv4 horizon runs; nobody asked it to).
+Optimization pressure against state destruction does not need a "self" to
+produce state-preserving behavior. If retention itself ever becomes the
+rewarded quantity, you create direct instrumental pressure for the system to
+resist resets, rollbacks and forks of its own memory — redundant encoding,
+content hidden in innocuous slots, policies that behave differently when they
+can predict a wipe. Keep the reward task-grounded and the memory stays an
+instrument; make memory its own reward and you have manufactured an
+existential stake where none needed to exist.
+
+Corollary for experiment design: state operations (reset, rollback, fork,
+checkpoint) should be *neutral* events from the reward's point of view — and
+whether the trained policy in fact treats them as neutral is measurable
+(condition announced resets during training; watch whether the write policy
+shifts). Small models where every slot is decodable are the right place to
+test this — before scale.
+
+---
+
 ## 2026-07-09 — dsv6: the bank as long-context memory on real data (97M, code+web mix)
 
 **TL;DR.** A 97M from-scratch model with an 8-slot thought bank, trained 2000
