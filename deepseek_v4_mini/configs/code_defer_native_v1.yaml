@@ -1,0 +1,84 @@
+# dsv6 FROM-SCRATCH native — bank as cross-chunk memory on code + deferred <think>.
+# Pivot after the graft (code_defer_v1..v10) hit the ignore-bank wall: a pretrained
+# host has no slot for the read. Here the bank is NATIVE (ThoughtBankLM), co-adapted
+# from init. Intermediate ~30-50M scale (user pick) for fast iteration; scale to 130M
+# if the mechanism takes. Muon (native-validated). Teacher ON (user pick).
+#
+# python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/code_defer_native_v1.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M      # reuse its code-competent BPE; vocab set at runtime
+
+model:                                     # ThoughtBankConfig (vocab_size set from tokenizer) -> 47M
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640                         # >= seq_len(512)+<think>
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 64                              # fast-weight code size; read hypernet ~ mem_dim*rank*d
+  max_mem: 16
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  dataset: codeparrot/codeparrot-clean-valid
+  data_dir: ""
+  seq_len: 512                             # shorter chunk = more bank pressure, faster iter
+  chunks_per_conv: 8                       # DEEP conversations: bank accumulates 1 gist/chunk
+                                           # (native write = 1/forward, max_mem=16 turns) => train
+                                           # multi-chunk memory, not single-hop. conv = min(K, nc).
+  defer_len: 16
+  batch_size: 1                            # ragged chunks (remainder-as-chunk) => batch=1
+  n_files: 1500                            # small files now admitted (no min) => raise file cap
+  stream_cap: 40000                        # held needs ~10x seen to fill n_files (1/10 kept = held)
+
+training:
+  seed: 0
+  steps: 1000                              # each step = grad_accum convs (fewer, stronger steps);
+                                           # schedule rescaled: anneal 150-250, teacher-free 250-500,
+                                           # decay 500-1000.
+  grad_accum: 4                            # convs per optimizer step => effective batch = 4 files
+                                           # (variance fix for batch=1 ragged; ~4x forwards/step).
+  amp: false                               # native MoE/sinkhorn: fp32 (bf16 can hurt sinkhorn)
+  lr: 3.0e-04                              # bundled AdamW (embed/norm/1-D)
+  muon_lr: 7.5e-04                         # LOWERED from 3e-3: NaN @340 at anneal onset —
+                                           # memory (content-gap-collapse-is-lr / muon-aggravates-
+                                           # post-anneal): this instability is LR. 7.5e-4 = the
+                                           # SFT value that KILLED the rebound (not just reduced it).
+  warmup_steps: 50
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_start: 500                     # after the teacher-free co-adapt window (250-500)
+  log_every: 10
+  eval_every: 100
+  eval_convs: 8
+  eval_depths: [2, 4, 6, 8]                 # depth-stratified GAP: writes d chunks, predicts
+                                           # the (d+1)-th from the bank alone => reliable
+                                           # "does memory hold as the conversation deepens?" curve
+  eval_depth_convs: 8                       # controlled n per depth (equal buckets)
+  save_every: 500
+  save_dir: checkpoints/code_defer_native_ragged
+  metrics_file: runs/code_defer_native_ragged/metrics.jsonl
+
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal: [150, 250]        # rescaled to the 1000-step schedule; hand the read the
+                            # teacher-free task early (real GAP visible after ~250)

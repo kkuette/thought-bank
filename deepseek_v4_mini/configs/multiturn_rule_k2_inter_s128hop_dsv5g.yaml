@@ -1,0 +1,116 @@
+# dsv5g — NO-THINK CONTROL ARM for the think cell (validates dsv5f).
+#
+# Same base (warm dsv5b), same hop surface [k_a, <hop>, k_b, x], same hop_p,
+# same halved muon_lr — but hop_grant: false: the hop query's label is the
+# DIRECT 2-hop answer f(f(x)), no granted think segment, no teacher.
+#
+# The cell's validity hinges on this arm STAYING AT CHANCE on the hop label:
+# if the model can learn the direct composition in ONE forward (an n·s
+# one-shot shortcut through the read), then dsv5f's granted segment was
+# never necessary and the "compute through the bank" claim dies. dsv5f
+# reference (grant + symbol teacher): mid decoded 1.000 / free chain 0.578 /
+# pre-hop bank ablation 0.000 at final.
+#
+# Watch: hop-label CE contribution / rule_acc stays high on standard turns
+# while the hop positions stay unlearned; also watch for a dsv5d-style
+# tear-down (the direct label pressure is the same class of new gradient —
+# muon_lr already halved, but if it collapses, cut early: the control only
+# needs enough steps to show the shortcut does NOT emerge).
+#
+# Verdict probe: hop_probe.py --op (bare protocol lines; the think-chained
+# lines are meaningless here — no grant was ever trained).
+vocab_size: 136
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+n_hc: 2
+sinkhorn_iters: 20
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+mem_dim: 32
+max_mem: 8
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+balance_loss_weight: 0.0001
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+mem_code_mixup_start: 500
+mem_read_swiglu: true
+mem_write_gate: false
+mem_write_gate_merge: true
+mem_write_merge_tau: 0.85
+mem_teacher_forcing: false
+mem_teacher_fourier: true
+mem_teacher_fourier_kmax: 8
+mem_teacher_distill_cosine: true
+mem_teacher_distill_weight: 2.0
+training:
+  device: auto
+  seed: 43
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: wsd
+  wsd_decay_start: 1100
+  wsd_decay_at_anneal_end: false
+  wsd_decay_offset: 800
+  wsd_decay_on_plateau: true
+  wsd_plateau_delta: 0.05
+  wsd_plateau_patience: 300
+  teacher_lr: 3e-4
+  muon_lr: 0.0019
+  weight_decay: 0.1
+  muon_rms_match: true
+  adam_eps: 1.0e-20
+  steps: 1500
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 20
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_s128hop_dsv5g
+  run_name: dsv4mini_multiturn_rule_k2_inter_s128hop_dsv5g
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s128hop_dsv5g/metrics.jsonl
+  init_from: checkpoints/multiturn_rule_k2_inter_s128structmerge_dsv5b/final.pt
+data:
+  task: multiturn_rule
+  n_symbols: 128
+  n_examples: 6
+  turns_per_conv: 8
+  turns_range:
+  - 8
+  - 16
+  switch_phase_min: 4
+  switch_phase_max: 12
+  n_contexts: 2
+  rule_family: affine
+  affine_units:
+  - 1
+  heldout_rule_mod: 8
+  batch_size: 64
+  curriculum_rules_start: 0
+  switch_max: 2
+  hop_p: 0.3
+  hop_grant: false
+  hop_keys: 1
+mem_read_spectral_norm: false
+mem_read_layers:
+- 0
+mem_teacher_anneal_start: 400
+mem_teacher_anneal_end: 900

@@ -1,0 +1,54 @@
+# sft_v1 — first real-data run: SmolLM2-135M + thought-bank graft, verbalized
+# bank tasks with UltraChat-injected distractors + pure-replay conversations.
+#
+# Recipe (memory dsv4mini-real-data-sft-smollm): two LR groups (host 1e-5
+# protected / graft 1e-3 warmed up), replay woven in (distractor replies are
+# supervised real turns + bank_p ramp keeps pure-replay majority early),
+# TBPTT window 8 segments. Eval = content-gap (carried vs reset bank) on
+# train and held value words every 200 steps; the carried-reset gap IS the
+# claim, held values test decode generalization.
+host: HuggingFaceTB/SmolLM2-135M
+tokenizer: HuggingFaceTB/SmolLM2-135M
+graft:
+  mem_dim: 32
+  # 16 slots: a full conversation (~12-14 segments, one write each) fits the
+  # FIFO horizon. At 8, diverse real-text distractor writes (never above the
+  # merge tau, unlike synthetic near-copy query writes) would force-evict the
+  # rule slots before the late queries — we'd measure a horizon artifact, not
+  # bank capacity. mem_dim stays 32 (carried 128-symbol rules at 3M scale;
+  # bump to 64 only if eff_rank saturates = the v2 knob).
+  max_mem: 16
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  mem_write_gate_merge: true
+  mem_write_merge_tau: 0.85
+  read_layer: 0
+training:
+  seed: 43
+  steps: 3000
+  lr_host: 1.0e-5
+  lr_bank: 1.0e-3
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 1.0
+  bptt_window: 8
+  bank_p0: 0.25          # start replay-heavy…
+  bank_p1: 0.75          # …ramp to bank-task-heavy
+  bank_ramp_steps: 1000
+  log_every: 20
+  eval_every: 200
+  eval_convs: 4
+  save_every: 500
+  save_dir: checkpoints/sft_smollm_v1
+  metrics_file: runs/sft_smollm_v1/metrics.jsonl
+  save_host_final: true
+data:
+  batch_size: 8
+  eval_batch_size: 8
+  n_pairs: 2
+  turns: 8
+  distractor_p: 0.4
+  switch_p: 0.0
+  distractor_source: ultrachat
+  replay_turns: 6

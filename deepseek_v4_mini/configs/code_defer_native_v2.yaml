@@ -1,0 +1,74 @@
+# dsv6 native v2 — RICHER but FEWER memory slots + more data.
+# Changes vs v1 (ragged run): mem_dim 64 -> 512 (= seq-len-scale gist, close the ~1.5-nat
+# read/gist headroom), max_mem 16 -> 8 (K=8 conv fits its 8 writes exactly; seed slots evict
+# as real gists arrive, no write lost; read ~2x cheaper), full codeparrot-clean (not valid)
+# for volume. Goal: lift the verbatim ceiling (data) AND close the gist headroom (mem_dim).
+# -> 97M params.
+#
+# python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/code_defer_native_v2.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # ThoughtBankConfig -> 97M
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512                             # = seq_len scale; richer gist (read hypernet ~ mem_dim*rank*d)
+  max_mem: 8                               # fits a K=8 conv exactly; seeds evict, writes kept; cheaper read
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  dataset: codeparrot/codeparrot-clean     # FULL clean train split (millions of files) for volume
+  data_dir: ""
+  seq_len: 512
+  chunks_per_conv: 8                       # deep conversations; conv depth sampled in [2, min(K,nc)]
+  defer_len: 16
+  batch_size: 1                            # ragged chunks => batch=1
+  n_files: 6000                            # ~4x the ragged run's file pool
+  stream_cap: 90000                        # held needs ~10x seen to fill n_files
+
+training:
+  seed: 0
+  steps: 2000                              # ~1.7 passes over the bigger corpus
+  grad_accum: 4                            # effective batch = 4 convs (batch=1 variance fix)
+  amp: false
+  lr: 3.0e-04
+  muon_lr: 7.5e-04                         # validated; watch NaN at anneal (no guard, per user)
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_start: 1000                    # teacher-free co-adapt 450-1000, then decay 1000-2000
+  log_every: 20
+  eval_every: 200
+  eval_convs: 8
+  eval_depths: [2, 4, 6, 8]                 # reliable depth-stratified GAP curve
+  eval_depth_convs: 8
+  save_every: 500
+  save_dir: checkpoints/code_defer_native_v2
+  metrics_file: runs/code_defer_native_v2/metrics.jsonl
+
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal: [300, 450]        # distill collapses early; hand the read the teacher-free task ~450

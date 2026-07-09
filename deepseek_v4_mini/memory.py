@@ -101,6 +101,23 @@ class ThoughtStream(nn.Module):
         m_new    = self._new_thought(H_text, mem_bank, pad_mask)   # [B, 1, mem_dim]
         if self.training and self.cfg.mem_write_noise > 0.0:
             m_new = m_new + self.cfg.mem_write_noise * torch.randn_like(m_new)
+        if (getattr(self.cfg, "mem_write_gate_merge", False)
+                and mem_bank.size(1) >= self.cfg.max_mem):
+            # Gate v2c (dedup-refresh): a near-duplicate write replaces its twin
+            # slot instead of costing the oldest distinct memory its FIFO slot.
+            # Novel writes keep plain FIFO semantics (drop slot 0). Write content
+            # is never attenuated — the read sees full-norm codes either way.
+            B, M, D = mem_bank.shape
+            mn  = F.normalize(m_new.squeeze(1), dim=-1)
+            bn  = F.normalize(mem_bank.detach().float(), dim=-1).to(m_new.dtype)
+            cos = torch.einsum("bd,bmd->bm", mn, bn)               # [B, M]
+            max_cos, twin = cos.max(dim=1)
+            merge = max_cos > float(getattr(self.cfg, "mem_write_merge_tau", 0.85))
+            drop  = torch.where(merge, twin, torch.zeros_like(twin))   # else oldest
+            self.last_merge_rate = merge.float().mean().detach()
+            keep = torch.arange(M, device=mem_bank.device).unsqueeze(0) != drop.unsqueeze(1)
+            kept = mem_bank[keep].view(B, M - 1, D)                # order preserved
+            return torch.cat([kept, m_new], dim=1)
         mem_bank = torch.cat([mem_bank, m_new], dim=1)
         if mem_bank.size(1) > self.cfg.max_mem:
             mem_bank = mem_bank[:, -self.cfg.max_mem:, :]
@@ -139,9 +156,39 @@ class ThoughtStream(nn.Module):
             mn  = F.normalize(m, dim=-1)                          # [B, mem_dim]
             bn  = F.normalize(bank.detach().float(), dim=-1).to(m.dtype)  # [B, M, mem_dim]
             cos = torch.einsum("bd,bmd->bm", mn, bn)             # [B, M]
-            self.last_write_redundancy = cos.amax(dim=1).mean()  # closest neighbour
+            max_cos, nn_idx = cos.max(dim=1)                      # [B] closest neighbour
+            self.last_write_redundancy = max_cos.mean()
         else:
+            max_cos = nn_idx = None
             self.last_write_redundancy = torch.zeros((), device=H_text.device)
+
+        if getattr(self.cfg, "mem_write_gate_delta", False):
+            # Gate v2b: delta write — subtract the stored component (projection on
+            # the closest slot, positive part only) so only the NOVEL part is
+            # written. Duplicates cancel; partial copies keep their correction.
+            if nn_idx is None:
+                return m.unsqueeze(1)
+            s_hat = bn.gather(1, nn_idx.view(-1, 1, 1).expand(-1, 1, bn.size(-1))).squeeze(1)  # [B, mem_dim]
+            coef  = torch.einsum("bd,bd->b", m, s_hat).clamp_min(0.0).unsqueeze(-1)  # [B, 1]
+            m_new = m - coef * s_hat
+            # telemetry: write_alpha = E[|m'|/|m|] (fraction of the write that survives)
+            ratio = m_new.norm(dim=-1) / m.norm(dim=-1).clamp_min(1e-8)
+            self.last_write_alpha      = ratio.detach().mean()
+            self.last_write_alpha_mean = ratio.mean()
+            return m_new.unsqueeze(1)
+
+        if getattr(self.cfg, "mem_write_gate_novelty", False):
+            # Gate v2: parameter-free novelty gate — duplicates are skimmed to
+            # zero, novel writes pass whole. Differentiable through m only (the
+            # bank is stop-grad, so the model can't game the gate by trashing
+            # stored slots). α/p heads above stay unused.
+            if max_cos is None:
+                g = torch.ones_like(m[:, :1])                     # empty bank: all novel
+            else:
+                g = (1.0 - max_cos).clamp(0.0, 1.0).unsqueeze(-1) # [B, 1]
+            self.last_write_alpha      = g.detach().mean()        # telemetry: write_alpha = E[g]
+            self.last_write_alpha_mean = g.mean()
+            return (g * m).unsqueeze(1)                           # [B, 1, mem_dim]
 
         if not self.cfg.mem_write_gate:
             return m.unsqueeze(1)               # ungated: pure normalised thought
