@@ -1,0 +1,126 @@
+# dsv5f — dsv5d + SYMBOL TEACHER on hop segments only + muon_lr/2.
+#
+# dsv5d (same cell, teacher OFF, muon_lr 0.00375) COLLAPSED by step 150: the
+# supervised mid gradient demanded VALUE writes from a write head that only
+# ever coded RULES; at full LR it tore the organized circuit (redund 1.0->0.51,
+# sanity f_A 0.000) and the rebuild settled toward the ignore-bank fixed point
+# (ablation_gap ~0, the historical wall that only the teacher kick ever broke).
+# Fix = the same kick one level up: blend the HOP forward's write toward
+# Fourier[mid] + distill, anneal beta 1->0 over [400,900]. Presentations stay
+# teacher-FREE (hop_teacher: true): post-anneal rule codes drifted off the
+# Fourier circle, re-forcing them would tear the circuit a second time.
+#
+# Two user design revisions vs dsv5c (2026-07-07 evening, both in one arm —
+# NOT a clean ablation vs dsv5c, noted):
+#  1. Surface: hop query = [k_a, <hop>, k_b, x] (HOP = token 2, local
+#     composition operator "apply then pass"). The bare doubled-key surface
+#     collided with the pre-trained last-key parse (dsv5c sanity dip) and
+#     shadowed plain queries; depth stays countable (#HOP), chains stay
+#     natural, plain [k,x] is never shadowed.
+#  2. Granted think segment = SUPERVISED CHAIN (multi-output think):
+#     X = [THINK, mid] (teacher-forced), Y = [mid, final]. Position 0 must
+#     DECODE the intermediate from the bank — nothing about x in-window, the
+#     causal claim lives there; position 1 applies the rule to the in-window
+#     mid (already-trained skill). Factorizes dsv5c's unsupervised bank
+#     roundtrip (f² stuck at 0.000 through step 200) into two supervised
+#     skills; generalizes to n outputs ([THINK, m1, m2] / [m1, m2, final]).
+#
+# Verdict probe: hop_probe.py --op (emission; mid decoded from bank; final
+# with forced mid; free chain; PRE-hop bank ablation = causal control; n=3
+# op-format with a length-3 chain never trained).
+vocab_size: 136
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+n_hc: 2
+sinkhorn_iters: 20
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+mem_dim: 32
+max_mem: 8
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+balance_loss_weight: 0.0001
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+mem_code_mixup_start: 500
+mem_read_swiglu: true
+mem_write_gate: false
+mem_write_gate_merge: true
+mem_write_merge_tau: 0.85
+mem_teacher_forcing: true
+mem_teacher_fourier: true
+mem_teacher_fourier_kmax: 8
+mem_teacher_distill_cosine: true
+mem_teacher_distill_weight: 2.0
+training:
+  device: auto
+  seed: 43
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: wsd
+  wsd_decay_start: 1100
+  wsd_decay_at_anneal_end: false
+  wsd_decay_offset: 800
+  wsd_decay_on_plateau: true
+  wsd_plateau_delta: 0.05
+  wsd_plateau_patience: 300
+  teacher_lr: 3e-4
+  muon_lr: 0.0019
+  weight_decay: 0.1
+  muon_rms_match: true
+  adam_eps: 1.0e-20
+  steps: 1500
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 20
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_s128hop_dsv5f
+  run_name: dsv4mini_multiturn_rule_k2_inter_s128hop_dsv5f
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s128hop_dsv5f/metrics.jsonl
+  init_from: checkpoints/multiturn_rule_k2_inter_s128structmerge_dsv5b/final.pt
+data:
+  task: multiturn_rule
+  n_symbols: 128
+  n_examples: 6
+  turns_per_conv: 8
+  turns_range:
+  - 8
+  - 16
+  switch_phase_min: 4
+  switch_phase_max: 12
+  n_contexts: 2
+  rule_family: affine
+  affine_units:
+  - 1
+  heldout_rule_mod: 8
+  batch_size: 64
+  curriculum_rules_start: 0
+  switch_max: 2
+  hop_p: 0.3
+  hop_grant: true
+  hop_keys: 1
+  hop_teacher: true
+mem_read_spectral_norm: false
+mem_read_layers:
+- 0
+mem_teacher_anneal_start: 400
+mem_teacher_anneal_end: 900

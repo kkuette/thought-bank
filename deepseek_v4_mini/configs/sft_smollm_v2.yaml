@@ -1,0 +1,48 @@
+host: HuggingFaceTB/SmolLM2-135M
+tokenizer: HuggingFaceTB/SmolLM2-135M
+graft:
+  mem_dim: 32
+  max_mem: 16
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  mem_write_gate_merge: true
+  mem_write_merge_tau: 0.85
+  read_layer: 0
+training:
+  seed: 43
+  steps: 3000
+  lr_host: 1.0e-05
+  lr_bank: 0.001
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 1.0
+  bptt_window: 8
+  bank_p0: 0.25
+  bank_p1: 0.75
+  bank_ramp_steps: 1000
+  log_every: 20
+  eval_every: 200
+  eval_convs: 4
+  save_every: 500
+  save_dir: checkpoints/sft_smollm_v2
+  metrics_file: runs/sft_smollm_v2/metrics.jsonl
+  save_host_final: true
+data:
+  batch_size: 8
+  eval_batch_size: 8
+  n_pairs: 2
+  turns: 8
+  distractor_p: 0.4
+  switch_p: 0.0
+  distractor_source: ultrachat
+  replay_turns: 6
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal:
+  - 1200
+  - 2000
+  anneal_trigger: ans_ce_below
+  anneal_len: 800
+  margin: 0.5

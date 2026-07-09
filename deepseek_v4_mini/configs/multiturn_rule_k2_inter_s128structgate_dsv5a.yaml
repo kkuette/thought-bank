@@ -1,0 +1,119 @@
+# dsv5a — GATE v2 (NOVELTY, parameter-free) from scratch on the STRUCT base.
+#
+# User pivot 2026-07-07: redesign the gate — first test WITHOUT p or alpha.
+# New mechanism (memory.py, mem_write_gate_novelty): the written vector is
+# scaled by g = clamp(1 − max_j cos(m, slot_j), 0, 1) against the stop-grad
+# bank. Near-duplicates (cos→1) are skimmed to zero, novel thoughts pass
+# whole; no learned gate parameters at all (α/p heads stay untrained).
+# Differentiable through m only — the model cannot game the gate by trashing
+# stored slots. This is the direct lever on the redund≈0.50 observation
+# (half the writes are near-copies): rehearsal-by-redundancy gets pruned,
+# freeing slots. Telemetry: write_alpha now logs E[g].
+#
+# SINGLE DIFF vs multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml:
+#   mem_write_gate_novelty false -> true (mem_write_gate stays false).
+# Baseline (s43 gate-OFF): addition held bank acc 1.000 @4000 (ttt_demo).
+#
+# Reads:
+#   - ~= baseline with redund << 0.50 -> free selectivity: the bank holds
+#     the same content in fewer effective copies (streaming candidate).
+#   - retention/held drops -> the redundancy WAS load-bearing (rehearsal
+#     memory: noisy partial copies carry past eviction) — skimming it
+#     starves the carry.
+#   - bootstrap stalls -> early writes all look "novel" but the gate's
+#     norm attenuation (E[g]~0.8 vs random seeds) starves the teacher
+#     distill target; suspect gate x teacher interaction (dsv4u fallback:
+#     gate off during bootstrap, on at anneal).
+vocab_size: 136
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+n_hc: 2
+sinkhorn_iters: 20
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+mem_dim: 32
+max_mem: 8
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+balance_loss_weight: 0.0001
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+mem_code_mixup_start: 500
+mem_read_swiglu: true
+mem_write_gate: false
+mem_write_gate_novelty: true
+mem_teacher_forcing: true
+mem_teacher_fourier: true
+mem_teacher_fourier_kmax: 8
+mem_teacher_distill_cosine: true
+mem_teacher_anneal_start: 2600
+mem_teacher_anneal_end: 3100
+mem_teacher_anneal_len: 300
+mem_teacher_distill_weight: 2.0
+training:
+  device: auto
+  seed: 43
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: wsd
+  wsd_decay_start: 3000
+  wsd_decay_at_anneal_end: true
+  wsd_decay_offset: 800
+  teacher_lr: 3e-4
+  muon_lr: 0.00375
+  weight_decay: 0.1
+  muon_rms_match: true
+  adam_eps: 1.0e-20
+  steps: 4000
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 20
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_s128structgate_dsv5a
+  run_name: dsv4mini_multiturn_rule_k2_inter_s128structgate_dsv5a
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s128structgate_dsv5a/metrics.jsonl
+data:
+  task: multiturn_rule
+  n_symbols: 128
+  n_examples: 6
+  turns_per_conv: 8
+  turns_range:
+  - 8
+  - 16
+  switch_phase_min: 4
+  switch_phase_max: 12
+  n_contexts: 2
+  rule_family: affine
+  affine_units:
+  - 1
+  heldout_rule_mod: 8
+  batch_size: 64
+  curriculum_rules_start: 16
+  curriculum_mode: mastery
+  curriculum_ce_thresh: 4.3
+  curriculum_dwell_min: 150
+  curriculum_pool_full_n: 112
+  curriculum_anneal_at_n: 64
+  switch_max: 2
+mem_read_spectral_norm: false
+mem_read_layers:
+- 0

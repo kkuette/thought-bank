@@ -737,6 +737,36 @@ def _build_synthetic_rule(cfg_dict: dict):
         assert not sw, "structure knobs replace the legacy switch_at"
         assert t_lo >= 2 and t_hi >= t_lo and (not ph_lo or ph_hi >= ph_lo >= 1)
         assert k_hi >= k_lo >= 1
+    # Hop (reflection cell): with prob hop_p a query turn becomes a 2-hop task
+    # [key, HOP, key, x] -> f(f(x)) (hop_keys=2: [k_a, HOP, k_b, x] ->
+    # f_b(f_a(x))). HOP (token 2, free) is a local composition operator (user
+    # design 2026-07-07): `k HOP` = "apply k then pass the result on"; the
+    # final key stays bare before x. Depth = the HOP count (n-hop reads
+    # [k,HOP,k,HOP,...,k,x]), and the plain query surface [k,x] is never
+    # shadowed — no collision with the pre-trained last-key parse.
+    # hop_grant=true trains the THINK protocol BY LABELS, not by input format
+    # (user decision 2026-07-07): the hop query's answer label is THINK; the
+    # harness then grants one scratch segment whose sole input is THINK and
+    # whose label is the final answer. The bank is the only bridge — the
+    # scratch segment carries nothing about x, so the intermediate must have
+    # been WRITTEN. hop_grant=false is the no-think control arm: same hop
+    # query, direct f(f(x)) label, no granted segment (must stay at chance,
+    # else the one-shot shortcut n·s invalidates the cell).
+    THINK  = 1                                   # vocab token 1 is free here
+    HOPTOK = 2                                   # composition operator `k HOP`
+    hop_p     = float(d.get("hop_p", 0.0))
+    hop_grant = bool(d.get("hop_grant", True))
+    hop_keys  = int(d.get("hop_keys", 1))
+    # hop_teacher: teacher targets move to the HOP segments ONLY — the hop
+    # query's write is blended/distilled toward the Fourier code of the
+    # INTERMEDIATE SYMBOL mid (rules and symbols live on the same mod-S
+    # circle, one table serves both) and presentations yield -1 (no teacher:
+    # post-anneal rule codes have drifted off the Fourier circle, re-forcing
+    # them would tear the organized circuit — dsv5d collapse, 2026-07-07).
+    hop_tf    = bool(d.get("hop_teacher", False))
+    if hop_p:
+        assert max(K, k_hi) > 1, "hop needs key tokens (n_contexts >= 2)"
+        assert hop_keys in (1, 2)
     SYM_OFF = 3
     KEY_OFF = SYM_OFF + S                        # key tokens live above the symbols
     # each phase draws its own perm, so the unseen-query budget is per phase
@@ -845,7 +875,12 @@ def _build_synthetic_rule(cfg_dict: dict):
                     while nxt <= turns_c - 1 and (not sw_max or len(sw_at) < sw_max):
                         sw_at.append(nxt)            # ≥1 query after the last switch
                         nxt += int(torch.randint(ph_lo, ph_hi + 1, (1,)))
-                cfg_dict["_conv"] = {"n_seg": K_c + turns_c + len(sw_at), "k": K_c}
+                # hop draws are fixed up front: each granted hop adds one segment
+                hop_at = ([bool(torch.rand(1) < hop_p) for _ in range(turns_c)]
+                          if hop_p else [False] * turns_c)
+                n_hop_seg = sum(hop_at) if hop_grant else 0
+                cfg_dict["_conv"] = {"n_seg": K_c + turns_c + len(sw_at) + n_hop_seg,
+                                     "k": K_c}
                 s      = cp[torch.randint(0, len(cp), (bs, K_c))]
                 ex     = [[] for _ in range(bs)]  # per lane, per context: shown inputs
                 unseen = [[] for _ in range(bs)]  # per lane, per context: query pool
@@ -869,7 +904,8 @@ def _build_synthetic_rule(cfg_dict: dict):
                             Y[b, off + 2 * j] = SYM_OFF + yi
                             Msk[b, off + 2 * j] = (j >= 1)   # j=0 unlearnable (shift unknown yet)
                     return (X, Y, Msk, torch.full((bs,), reset, dtype=torch.bool),
-                            s[:, k].clone())
+                            (torch.full((bs,), -1, dtype=torch.long) if hop_tf
+                             else s[:, k].clone()))
 
                 for k in range(K_c):
                     yield _present_key(k, reset=(k == 0))
@@ -892,6 +928,55 @@ def _build_synthetic_rule(cfg_dict: dict):
                         yield _present_key(k_sw, reset=False)
                         sw_i += 1
                     k = t % K_c
+                    no_tf = torch.full((bs,), -1, dtype=torch.long)
+                    if hop_at[t]:
+                        # hop query: [key_a, HOP, key_b, x]; k_a applied first,
+                        # its result passed on to k_b (bare key = final apply).
+                        # hop_keys=1 doubles the same key (f∘f); hop_keys=2
+                        # chains two different keys (f_b∘f_a).
+                        ka = k
+                        kb = k if hop_keys == 1 else int((k + 1 + int(torch.randint(0, K_c - 1, (1,)))) % K_c)
+                        xq = torch.zeros((bs, 4), dtype=torch.long)
+                        yq = torch.zeros((bs, 4), dtype=torch.long)
+                        msk = torch.zeros((bs, 4), dtype=torch.bool)
+                        xq[:, 0] = KEY_OFF + key_tok[ka]
+                        xq[:, 1] = HOPTOK
+                        xq[:, 2] = KEY_OFF + key_tok[kb]
+                        msk[:, 3] = True
+                        yfin = torch.zeros(bs, dtype=torch.long)
+                        ymid = torch.zeros(bs, dtype=torch.long)
+                        for b in range(bs):
+                            pool = unseen[b][ka]
+                            q = pool[q_cnt[ka] % len(pool)]
+                            mid = _apply(int(s[b, ka]), q)
+                            xq[b, 3] = SYM_OFF + q
+                            ymid[b] = SYM_OFF + mid
+                            yfin[b] = SYM_OFF + _apply(int(s[b, kb]), mid)
+                        q_cnt[ka] += 1
+                        if hop_grant:
+                            # answer label = THINK -> the model learns to ASK
+                            # for the scratch segment. The granted segment is a
+                            # SUPERVISED CHAIN (user design, multi-output think):
+                            # X = [THINK, mid] (teacher-forced), Y = [mid, final].
+                            # Position 0 must DECODE the intermediate from the
+                            # bank (nothing about x in-window = the causal claim);
+                            # position 1 applies the rule to the in-window mid
+                            # (already-trained skill). Factorizes the unsupervised
+                            # bank roundtrip into two supervised skills.
+                            yq[:, 3] = THINK
+                            # hop_teacher: the hop forward's write must carry the
+                            # intermediate — teacher-force it toward Fourier[mid]
+                            yield (xq, yq, msk, torch.zeros(bs, dtype=torch.bool),
+                                   (ymid - SYM_OFF).clone() if hop_tf else no_tf.clone())
+                            xt = torch.full((bs, 2), THINK, dtype=torch.long)
+                            xt[:, 1] = ymid
+                            yt = torch.stack([ymid, yfin], dim=1)
+                            mt = torch.ones((bs, 2), dtype=torch.bool)
+                            yield xt, yt, mt, torch.zeros(bs, dtype=torch.bool), no_tf.clone()
+                        else:
+                            yq[:, 3] = yfin   # no-think control: direct 2-hop label
+                            yield xq, yq, msk, torch.zeros(bs, dtype=torch.bool), no_tf.clone()
+                        continue
                     xq = torch.zeros((bs, off + 1), dtype=torch.long)
                     yq = torch.zeros((bs, off + 1), dtype=torch.long)
                     msk = torch.zeros((bs, off + 1), dtype=torch.bool)
@@ -904,7 +989,7 @@ def _build_synthetic_rule(cfg_dict: dict):
                         xq[b, off] = SYM_OFF + q
                         yq[b, off] = SYM_OFF + _apply(int(s[b, k]), q)
                     q_cnt[k] += 1
-                    yield xq, yq, msk, torch.zeros(bs, dtype=torch.bool), torch.full((bs,), -1, dtype=torch.long)
+                    yield xq, yq, msk, torch.zeros(bs, dtype=torch.bool), no_tf
 
     return RuleDS()
 
@@ -1965,6 +2050,11 @@ def main() -> None:
     # forward_backward). W=1 keeps the old behaviour (write head never trains).
     mem_bptt_window = max(1, int(train_cfg.get("mem_bptt_window", 2)))
     mem_probe_every = int(train_cfg.get("mem_probe_every", 0))  # 0 = off
+    # bank viz (TensorBoard figures): writes captured during training (lane 0,
+    # zero extra forwards), dumped at the mem-probe cadence.
+    viz_buf: list = []
+    viz_final = viz_last = None
+    _viz_hop_tf = bool(data_cfg.get("hop_teacher", False))
     mem_persist     = bool(data_cfg.get("persist", False))      # carry bank across steps
     mem_multiturn   = data_cfg.get("task") in ("multiturn", "multiturn_gist", "multiturn_gist_kv", "multiturn_rule")  # per-turn forward
     mem_synth_mt    = data_cfg.get("task") in ("multiturn_gist", "multiturn_gist_kv", "multiturn_rule")  # synthetic probe (no tokenizer)
@@ -2009,6 +2099,12 @@ def main() -> None:
                        # CE, so a CE gate must never be the only way to anneal)
     if tf_on:
         S_rule      = _rule_space(data_cfg)[1]    # rule count (shift: S; affine: φ(S)·S)
+        if bool(data_cfg.get("hop_teacher", False)):
+            # hop teacher targets are SYMBOL ids (the intermediate mid) — they
+            # index the same Fourier table, valid only if it covers [0, S)
+            assert S_rule >= int(data_cfg.get("n_symbols", 32)), \
+                "hop_teacher needs the Fourier table to cover the symbol circle"
+            tqdm.write("Teacher: HOP segments only (Fourier[mid]); presentations untouched")
         teacher_emb = nn.Embedding(S_rule, model_cfg.mem_dim).to(device)
         if bool(getattr(model_cfg, "mem_teacher_fourier", False)):
             _kmax = int(getattr(model_cfg, "mem_teacher_fourier_kmax", 0))
@@ -2157,6 +2253,8 @@ def main() -> None:
                 else:
                     init_mem = init_mem.masked_fill(reset.view(-1, 1, 1), 0.0)
             if struct_rand and bool(reset.all()):
+                if viz_buf:                       # previous conversation complete
+                    viz_last, viz_buf = (viz_buf, viz_final), []
                 conv_len, micro_conv = int(raw["_conv"]["n_seg"]), 0
                 conv_k = int(raw["_conv"].get("k", 0))
             accum = conv_len if struct_rand else grad_accum
@@ -2231,6 +2329,13 @@ def main() -> None:
                 # this presentation is PAST the establish block = a switch write
                 redund_sw = (logs["write_redund"] if redund_sw is None
                              else min(redund_sw, logs["write_redund"]))
+            if writer is not None and struct_rand:
+                # lane-0 write trail for the bank figures (post-blend code)
+                _vk = ("present" if micro_conv < conv_k else
+                       (("hop" if _viz_hop_tf else "switch")
+                        if (rule_s is not None and bool((rule_s >= 0).all())) else "turn"))
+                viz_buf.append((mem_bank[0, -1].detach().float().cpu(), _vk))
+                viz_final = mem_bank[0].detach().float().cpu()
             persist_mem = mem_bank                         # keep graph within the window
             seg_loss = scaler.scale(loss / accum)
             window_loss = seg_loss if window_loss is None else window_loss + seg_loss
@@ -2403,6 +2508,15 @@ def main() -> None:
                     f"  eff_rank={mp['mem_eff_rank']:.2f}/{mp['mem_slots_final']:.0f}"
                     f"  turns={mp['mem_turns']:.0f}{acc}"
                 )
+            if writer is not None and viz_last is not None:
+                from .bank_viz import (bank_content_fig, bank_similarity_fig,
+                                       writes_pca_fig)
+                _wl, _fb = viz_last
+                writer.add_figure("bank/content", bank_content_fig(_fb), step)
+                writer.add_figure("bank/similarity", bank_similarity_fig(_fb), step)
+                writer.add_figure("bank/writes_pca",
+                                  writes_pca_fig(torch.stack([w for w, _ in _wl]),
+                                                 [k for _, k in _wl]), step)
 
         # Memory usefulness probe (ablation: CE with vs without the bank)
         if mem_probe_every and mem_seg_len and not mem_multiturn and step % mem_probe_every == 0:

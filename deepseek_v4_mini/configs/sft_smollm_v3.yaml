@@ -1,0 +1,77 @@
+# sft_v3 — DIVERSITY arm, TRACTABLE pool (512, not the full ~5k vocab).
+# The open-5k run (AdamW and Muon both) diverged: ema_bank blew past the
+# no-bank floor ln(5k)≈8.5 to 14 — a 5000-way exact-match decode from a
+# 32-dim bank code does not bootstrap. Cap the pool at 512 (train 448 /
+# held 64 via idx%8) so the decode is learnable while surface diversity
+# (open-ish values + phrasing + variable keys) still breaks pure recognition.
+# One lever, three faces (data diversity):
+#   - value_source vocab, capped 512 → held = idx % 8 == 0 (64 never-seen)
+#   - phrasing_diversity  → 6 presentation + 5 query templates
+#   - keys 2-4 syllables, K ~ U[2,3] per conversation
+# Muon on the graft (lr 3e-3 rms_match, synthetic recipe) + WSD decay after
+# the anneal. Teacher margin 3.0: threshold ln(448)−3 ≈ 3.1, below the
+# floor ln(448) ≈ 6.1 — firing means "the read exploits the bank".
+host: HuggingFaceTB/SmolLM2-135M
+tokenizer: HuggingFaceTB/SmolLM2-135M
+graft:
+  mem_dim: 32
+  max_mem: 16
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  mem_write_gate_merge: true
+  mem_write_merge_tau: 0.85
+  read_layer: 0
+training:
+  seed: 43
+  steps: 3000
+  lr_host: 1.0e-05
+  lr_bank: 0.001
+  opt_bank: muon           # graft 2-D matrices on Muon+rms_match (synthetic recipe)
+  muon_lr: 7.5e-4          # halved again from 1.5e-3: at 1.5e-3 the loss dipped
+                           # to 4.70@260 then REBOUNDED out of the nascent
+                           # answer-decode basin (acc stuck ~0.03 despite loss→2
+                           # on the diluted format tokens). Lower peak to hold
+                           # the step-260 basin instead of overshooting it.
+  warmup_steps: 100
+  weight_decay: 0.01
+  wsd_decay: true          # ramp both LR groups 1->0 from anneal-end to final step
+  wsd_floor: 0.0
+  grad_clip: 1.0
+  bptt_window: 8
+  bank_p0: 0.25
+  bank_p1: 0.75
+  bank_ramp_steps: 1000
+  log_every: 20
+  eval_every: 200
+  eval_convs: 4
+  save_every: 500
+  save_dir: checkpoints/sft_smollm_v3
+  metrics_file: runs/sft_smollm_v3/metrics.jsonl
+  save_host_final: true
+data:
+  batch_size: 8
+  eval_batch_size: 8
+  n_pairs: 2
+  n_pairs_max: 3
+  turns: 8
+  distractor_p: 0.4
+  switch_p: 0.0
+  distractor_source: ultrachat
+  replay_turns: 6
+  value_source: vocab
+  value_pool_cap: 512      # tractable pool (train 448 / held 64) — 5k diverges
+  value_min_len: 3
+  value_max_len: 10
+  phrasing_diversity: true
+  key_syll_min: 2
+  key_syll_max: 4
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal:
+  - 1200
+  - 2000
+  anneal_trigger: ans_ce_below
+  anneal_len: 800
+  margin: 3.0

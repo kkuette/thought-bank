@@ -1,0 +1,117 @@
+# dsv5b — GATE v2c (dedup-refresh) WARM ARM on dsv4w_s43@4000.
+#
+# Inference probe verdict (gate_probe.py, 2026-07-07): v2a/v2b attenuate
+# legitimate installs (post-anneal code cone blinds the cosine) and starve
+# the rehearsal carry — dead at inference; v2c merge (duplicate REPLACES its
+# twin slot, content never attenuated) fixes the FIFO horizon completely
+# (late 0.998 vs 0.131) but blocks supersession (repl 0.27 vs 1.00): the
+# stale code is never erased, the read faces two codes for one key.
+#
+# User framing: the probe only shows an UNTRAINED read facing new write
+# semantics — during training write and read co-adapt. This warm arm asks:
+# does the policy learn supersession in a non-evicting bank? Same family,
+# same structure-randomized switch distribution (switches ARE the
+# supersession training signal), teacher OFF (post-anneal base), full pool
+# (family already mastered — no diversity shock, unlike dsv4z), 1000 steps.
+# v2b (delta write) stays in reserve for a from-scratch co-adaptation test.
+#
+# Verdict metric = gate_probe.py re-run on the final ckpt:
+#   - repl recovers (>>0.27) with late ~1.0 -> policy learned supersession
+#     (STICK twin: memory policy is a trained behaviour) -> from-scratch
+#     candidate + a result in itself (16-turn retention at 8 slots).
+#   - repl stays low -> merge needs a true ERASE primitive (GDN-2's second
+#     gate), design v2c' before spending more compute.
+#
+# Diff vs multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml:
+#   mem_write_gate_merge true (tau 0.85); teacher OFF; init_from s43@4000;
+#   curriculum OFF; steps 1000; plateau decay (fallback 700).
+vocab_size: 136
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+n_hc: 2
+sinkhorn_iters: 20
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+mem_dim: 32
+max_mem: 8
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+balance_loss_weight: 0.0001
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+mem_code_mixup_start: 500
+mem_read_swiglu: true
+mem_write_gate: false
+mem_write_gate_merge: true
+mem_write_merge_tau: 0.85
+mem_teacher_forcing: false
+mem_teacher_fourier: true
+mem_teacher_fourier_kmax: 8
+mem_teacher_distill_cosine: true
+mem_teacher_distill_weight: 2.0
+training:
+  device: auto
+  seed: 43
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: wsd
+  wsd_decay_start: 700
+  wsd_decay_at_anneal_end: false
+  wsd_decay_offset: 800
+  wsd_decay_on_plateau: true
+  wsd_plateau_delta: 0.05
+  wsd_plateau_patience: 300
+  teacher_lr: 3e-4
+  muon_lr: 0.00375
+  weight_decay: 0.1
+  muon_rms_match: true
+  adam_eps: 1.0e-20
+  steps: 1000
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 20
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_s128structmerge_dsv5b
+  run_name: dsv4mini_multiturn_rule_k2_inter_s128structmerge_dsv5b
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s128structmerge_dsv5b/metrics.jsonl
+  init_from: checkpoints/multiturn_rule_k2_inter_s128_dsv4w_s43/step_4000.pt
+data:
+  task: multiturn_rule
+  n_symbols: 128
+  n_examples: 6
+  turns_per_conv: 8
+  turns_range:
+  - 8
+  - 16
+  switch_phase_min: 4
+  switch_phase_max: 12
+  n_contexts: 2
+  rule_family: affine
+  affine_units:
+  - 1
+  heldout_rule_mod: 8
+  batch_size: 64
+  curriculum_rules_start: 0
+  switch_max: 2
+mem_read_spectral_norm: false
+mem_read_layers:
+- 0

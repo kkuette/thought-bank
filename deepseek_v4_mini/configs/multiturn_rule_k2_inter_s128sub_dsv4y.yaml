@@ -1,0 +1,120 @@
+# dsv4y — MINIMAL family transfer, TEACHER-FREE: subtraction on dsv4w_s43.
+#
+# Question (user, 2026-07-07): can the model LEARN a new family CLOSE to its
+# own from the organized circuit? dsv4n (a in {3,5} on dsv4m) closed negative;
+# this is the same test on the MINIMAL fresh family — subtraction
+# y = (s - x) mod 128 = affine a = -1 = 127 (same circle, same geometry,
+# reversed direction; the ttt_demo --sub fairness arm). Zero-shot floor
+# measured on the base ckpt before this run: bank 0.012, ICL 0.012,
+# ablate 0.014 (chance 0.008) — the family is fully out of the meta-learned one.
+#
+# Base = dsv4w_s43 step_4000 (structure-randomized policy base, seed
+# replication, post-anneal: the model owns its own code geometry; teacher
+# would fight the drifted codes — teacher OFF is both the honest arm and
+# the compatible one). Fresh optimizer/schedule via init_from.
+#
+# Reads:
+#   - learns (>> 0.13 affineL-v2-with-teacher reference) -> the organized
+#     circuit re-induces a NEIGHBOUR law without any bootstrap; dsv4n's
+#     negative was about family distance, not about teacher-per-family.
+#   - stalls at CE floor -> replicates dsv4n on the closest possible family:
+#     even a reversed direction needs the kick -> meta-training frontier is
+#     sharp. Either way the demo claim boundary gets its training-side number.
+#   - offline afterwards: re-probe ADDITION (shift) on the final ckpt =
+#     catastrophic-forgetting measure at family scale.
+#
+# Diff vs multiturn_rule_k2_inter_s128struct_dsv4w_s43.yaml:
+#   affine_units [1] -> [127]; mem_teacher_forcing false; init_from s43@4000;
+#   steps 2000; wsd decay on plateau (dsv4n recipe) instead of anneal-tied.
+vocab_size: 136
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+n_hc: 2
+sinkhorn_iters: 20
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+mem_dim: 32
+max_mem: 8
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+balance_loss_weight: 0.0001
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+mem_code_mixup_start: 500
+mem_read_swiglu: true
+mem_write_gate: false
+mem_teacher_forcing: false
+mem_teacher_fourier: true
+mem_teacher_fourier_kmax: 8
+mem_teacher_distill_cosine: true
+mem_teacher_distill_weight: 2.0
+training:
+  device: auto
+  seed: 43
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: wsd
+  wsd_decay_start: 1500
+  wsd_decay_at_anneal_end: false
+  wsd_decay_offset: 800
+  wsd_decay_on_plateau: true
+  wsd_plateau_delta: 0.05
+  wsd_plateau_patience: 300
+  teacher_lr: 3e-4
+  muon_lr: 0.00375
+  weight_decay: 0.1
+  muon_rms_match: true
+  adam_eps: 1.0e-20
+  steps: 2000
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 20
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_s128sub_dsv4y
+  run_name: dsv4mini_multiturn_rule_k2_inter_s128sub_dsv4y
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s128sub_dsv4y/metrics.jsonl
+  init_from: checkpoints/multiturn_rule_k2_inter_s128_dsv4w_s43/step_4000.pt
+data:
+  task: multiturn_rule
+  n_symbols: 128
+  n_examples: 6
+  turns_per_conv: 8
+  turns_range:
+  - 8
+  - 16
+  switch_phase_min: 4
+  switch_phase_max: 12
+  n_contexts: 2
+  rule_family: affine
+  affine_units:
+  - 127
+  heldout_rule_mod: 8
+  batch_size: 64
+  curriculum_rules_start: 16
+  curriculum_mode: mastery
+  curriculum_ce_thresh: 4.3
+  curriculum_dwell_min: 150
+  curriculum_pool_full_n: 112
+  switch_max: 2
+mem_read_spectral_norm: false
+mem_read_layers:
+- 0

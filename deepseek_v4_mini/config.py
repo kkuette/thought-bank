@@ -118,6 +118,26 @@ class ThoughtBankConfig:
     # coordination variable during bootstrap. Keep OFF while bootstrapping the
     # fast-weight transport, re-enable for streaming write selectivity.
     mem_write_gate: bool = True
+    # Novelty gate (gate v2, no learned parameters): the written vector is scaled
+    # by g = clamp(1 − max_j cos(m, slot_j), 0, 1) against the stop-grad bank —
+    # near-duplicates (cos→1) are skimmed to zero, novel thoughts pass whole.
+    # No scalar α, no per-dim p (their heads stay untrained). Takes precedence
+    # over mem_write_gate. Differentiable through m, so the write head still
+    # trains via TBPTT.
+    mem_write_gate_novelty: bool = False
+    # Delta write (gate v2b, no learned parameters): instead of scaling the whole
+    # vector, SUBTRACT the component already stored — m' = m − max(⟨m, ŝ*⟩, 0)·ŝ*
+    # with ŝ* the closest (cosine) bank slot, stop-grad. Exact duplicates cancel
+    # to zero, partial copies keep their novel correction (delta-rule twin,
+    # Schlag et al. 2021). Takes precedence over mem_write_gate_novelty.
+    mem_write_gate_delta: bool = False
+    # Dedup-refresh (gate v2c, GDN-2 lesson: decouple "is it new content?" from
+    # "which slot pays for it"): the write is NEVER attenuated; when the new
+    # thought's closest bank slot exceeds mem_write_merge_tau in cosine, the
+    # write REPLACES that twin slot (recency refresh) instead of FIFO-evicting
+    # the oldest distinct memory. Only active once the bank is at capacity.
+    mem_write_gate_merge: bool = False
+    mem_write_merge_tau: float = 0.85
 
     # ── Teacher-forced bank bootstrap (multiturn_rule) ────────────────────────
     # Breaks the "ignore-bank" fixed point: during bootstrap the read consumes a

@@ -1,0 +1,106 @@
+# dsv4z — dsv4y CURRICULUM ABLATION: full pool from step 0.
+#
+# Question (user, 2026-07-07, asked mid-dsv4y): the mastery ramp (16->112)
+# was designed to bootstrap the read from scratch — is it still needed for
+# family transfer on an ORGANIZED circuit? Single diff vs dsv4y:
+# curriculum OFF (full 112-rule train pool from step 0). Same base ckpt
+# (dsv4w_s43@4000), same family (subtraction a=127), teacher-free, same
+# LR recipe, same 2000 steps, same seed.
+#
+# dsv4y reference trajectory (with ramp): lift-off @200, ref-0.13 crossed
+# @500, plateau ~0.25 from 1000 on; final 0.255/0.255 train=held.
+# Reads:
+#   - matches/beats dsv4y -> the ramp is a from-scratch artifact; transfer
+#     claim simplifies to "warm restart + data of the new family".
+#   - stalls at chance -> the ramp is load-bearing even warm: diversity
+#     shock re-creates the ignore-bank basin (curriculum = the cheap kick).
+#   - same 0.25 plateau either way -> plateau is structural, not a
+#     curriculum artifact (feeds the 1-read-per-4-blocks suspicion).
+vocab_size: 136
+d_model: 128
+n_layers: 4
+n_heads: 2
+d_head: 32
+dropout: 0.0
+max_seq_len: 64
+n_hc: 2
+sinkhorn_iters: 20
+csa_m: 4
+hca_m: 16
+top_k_csa: 4
+n_win: 8
+d_latent_q: 32
+n_groups: 1
+n_experts: 4
+n_shared: 1
+top_k_experts: 1
+d_ff: 256
+mem_dim: 32
+max_mem: 8
+mem_seed_slots: 4
+mem_read_rank: 16
+mem_read_dropout: 0.0
+balance_loss_weight: 0.0001
+mem_write_diversity: 0.0
+mem_code_mixup_p: 0.0
+mem_code_mixup_start: 500
+mem_read_swiglu: true
+mem_write_gate: false
+mem_teacher_forcing: false
+mem_teacher_fourier: true
+mem_teacher_fourier_kmax: 8
+mem_teacher_distill_cosine: true
+mem_teacher_distill_weight: 2.0
+training:
+  device: auto
+  seed: 43
+  lr: 3e-4
+  use_muon: true
+  lr_schedule: wsd
+  wsd_decay_start: 1500
+  wsd_decay_at_anneal_end: false
+  wsd_decay_offset: 800
+  wsd_decay_on_plateau: true
+  wsd_plateau_delta: 0.05
+  wsd_plateau_patience: 300
+  teacher_lr: 3e-4
+  muon_lr: 0.00375
+  weight_decay: 0.1
+  muon_rms_match: true
+  adam_eps: 1.0e-20
+  steps: 2000
+  warmup_steps: 0
+  grad_clip: 1.0
+  precision: bf16
+  mem_segment_len: 0
+  mem_bptt_window: 20
+  grad_accum: 10
+  mem_probe_every: 100
+  log_every: 50
+  save_every: 100
+  save_dir: checkpoints/multiturn_rule_k2_inter_s128sub_dsv4z
+  run_name: dsv4mini_multiturn_rule_k2_inter_s128sub_dsv4z
+  tensorboard: false
+  metrics_file: runs/dsv4mini_multiturn_rule_k2_inter_s128sub_dsv4z/metrics.jsonl
+  init_from: checkpoints/multiturn_rule_k2_inter_s128_dsv4w_s43/step_4000.pt
+data:
+  task: multiturn_rule
+  n_symbols: 128
+  n_examples: 6
+  turns_per_conv: 8
+  turns_range:
+  - 8
+  - 16
+  switch_phase_min: 4
+  switch_phase_max: 12
+  n_contexts: 2
+  rule_family: affine
+  affine_units:
+  - 127
+  heldout_rule_mod: 8
+  batch_size: 64
+  curriculum_rules_start: 0
+  switch_max: 2
+mem_read_spectral_norm: false
+mem_read_layers:
+- 0
