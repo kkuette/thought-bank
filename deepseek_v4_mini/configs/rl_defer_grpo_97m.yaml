@@ -66,7 +66,10 @@ rl:
   group_size: 8                            # G rollouts of the same conversation
   groups_per_step: 4                       # conversations per optimizer step
   lr: 5.0e-06
-  temp: 1.0
+  temp: 3.0                                # BERNOULLI temp (see boundary_step): v2c probe
+                                           # gives P(<think>)~2e-3 at boundaries (varlen killed
+                                           # the positional prior); T=3 lifts rollout p to ~0.1
+                                           # so G=8 groups are action-diverse
   lambda_write: 0.03                       # < marginal GAP/write (~0.1) — writing must pay
   clip_low: 0.2
   clip_high: 0.28                          # DAPO clip-higher: rare actions can gain mass

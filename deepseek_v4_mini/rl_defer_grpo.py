@@ -79,9 +79,14 @@ def boundary_step(model, x, bank, think_id, temp):
     bank as returned by the forward (carried only if the action says write)."""
     xt = torch.cat([x, torch.full((1, 1), think_id, dtype=torch.long, device=x.device)], 1)
     o = model(xt, init_mem=bank)
-    lg = o["logits"].float()[0, x.size(1) - 1] / temp
+    lg = o["logits"].float()[0, x.size(1) - 1]
     logp = F.log_softmax(lg, dim=-1)
-    p_w = logp[think_id].exp().clamp(1e-6, 1.0 - 1e-6)
+    p1 = logp[think_id].exp().clamp(1e-6, 1.0 - 1e-6)
+    # temp is BERNOULLI temperature, not vocab temperature: after varlen
+    # pretraining P(<think>) sits near the base rate (~2e-3) — above uniform
+    # 1/V, so flattening the vocab softmax drags it DOWN toward 1/V instead of
+    # up toward 1/2. Tempering the write/skip odds directly gives exploration.
+    p_w = torch.sigmoid(torch.logit(p1) / temp).clamp(1e-6, 1.0 - 1e-6)
     return torch.log(p_w), torch.log1p(-p_w), o["mem_bank"], p_w
 
 
