@@ -1,0 +1,68 @@
+# dsv6 v1 — bank as cross-chunk long-context memory on real code + deferred <think>.
+# SmolLM2-135M host (NOT frozen: freeze => ignore-bank), graft read/write on Muon.
+# Per code chunk: in-context next-token LM (+ 1 write) ; then a <think> forward
+# whose input is the NEXT chunk start shifted by <think>, position 0 predicting
+# the first next-chunk token from the BANK ALONE (deferred continuation).
+# Success = defer GAP > 0 (carried beats init_mem=None) + in-context ppl stays
+# a competent LM (may rise then converge; monotone divergence = damage).
+host: HuggingFaceTB/SmolLM2-135M
+tokenizer: HuggingFaceTB/SmolLM2-135M
+graft:
+  mem_dim: 1024            # code size = seq_len (user coupling); free in params
+  max_mem: 16
+  mem_seed_slots: 4
+  mem_read_rank: 32
+  mem_read_swiglu: true
+  mem_write_gate_merge: true
+  mem_write_merge_tau: 0.85
+  read_layer: 0
+  read_cap: 0.5           # v10: bound ‖read‖ ≤ 0.5·‖h‖ — root fix for the injection blow-up
+                          # (3.6·‖h‖ cratered the host in v9). Optimizer swap alone couldn't fix it.
+data:
+  dataset: codeparrot/codeparrot-clean-valid
+  data_dir: ""
+  seq_len: 1024           # halves activations vs 2048 → keeps batch 2; shorter
+                          # chunks = more bank pressure (user: "1024 plus intéressant")
+  chunks_per_conv: 3      # conversation = 3 consecutive chunks of one file
+  defer_len: 16           # <think> forward predicts first 16 tokens of next chunk
+  batch_size: 2
+  n_files: 600
+  stream_cap: 25000
+training:
+  seed: 0
+  steps: 3000
+  lr_host: 3.0e-04         # RAISED again (v7): host too rigid to consume the read —
+                           # v5 showed think_inject 0.6 but GAP +0.03 (injects, doesn't
+                           # consume). Muon is RMS-matched so the graft outruns AdamW host
+                           # by more than the raw ratio. Reconstruction is WANTED, leak fixed.
+                           # v3 (1e-5, fixed) dipped at 400
+                           # (rigid host too slow to consume the bank). The v2 objection
+                           # (high lr => host solves alone) is VOID now — no leak to
+                           # exploit — so more plasticity should help the graft take.
+  lr_bank: 1.0e-03         # bundled AdamW (non-matrix graft params)
+  muon_lr: 5.0e-4          # graft matrices (Muon rms_match); lowered from 7.5e-4 (v5)
+  graft_optimizer: adamw   # v9: switch graft Muon->AdamW. Muon (RMS-matched, no curvature
+                           # adaptation) let the read injection blow to 2x hidden norm then
+                           # crash (think_inject 0.12->2.14->0.26, GAP collapse @2000).
+                           # AdamW's per-param adaptive step self-limits a runaway read.
+  graft_lr: 5.0e-04        # AdamW on the whole graft; 1e-3 blew up (v9), read_cap is the real fix
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0        # L = L_incontext + defer_weight * L_defer
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_start: 2000
+  log_every: 20
+  eval_every: 200
+  eval_convs: 8
+  save_every: 500
+  save_dir: checkpoints/code_defer_v10
+  metrics_file: runs/code_defer_v10/metrics.jsonl
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal: [200, 1000]       # β 1→0 EARLY: distill collapses ~step 200 (write matches gist
+                            # fast) so holding β=1 wastes steps — hand the read the real
+                            # teacher-free task sooner. 1000-2000 = teacher-free full LR,
+                            # 2000-3000 = WSD decay consolidation.

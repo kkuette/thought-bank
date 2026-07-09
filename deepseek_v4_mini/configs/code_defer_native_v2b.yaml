@@ -1,0 +1,81 @@
+# dsv6 native v2b — v2 retry with the OPTIMIZER REGIME RESTORED + bigger effective batch.
+# v2 post-mortem: GAP peaked ~600 (GAP0 +1.08) then died 800→2000 (ignore-bank). No code
+# bug — the legacy Muon √cols scaling ties per-matrix update RMS to shape, so mem_dim
+# 64→512 silently trained the read ~2.8x faster / the write ~2.8x slower at the same
+# muon_lr, during a 550-step full-LR teacher-free window, and the WSD decay (start 1000)
+# consolidated the already-dead state. Fixes:
+#   1. per-group lr_scale in the trainer (read /2.83, write x2.83) => v1-validated regime
+#   2. wsd_decay_start 700: teacher-free window 450-700 (250 steps, = v1), decay consolidates
+#      while the GAP is alive
+#   3. grad_accum 4 -> 8: less read-gradient noise; 2000x8 convs ~ 2.8 passes (~18s/step, ~10h)
+#
+# python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/code_defer_native_v2b.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # ThoughtBankConfig -> 97M
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512                             # = seq_len scale; richer gist
+  max_mem: 8                               # fits a K=8 conv exactly; seeds evict, writes kept
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  dataset: codeparrot/codeparrot-clean     # FULL clean train split for volume
+  data_dir: ""
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1                            # ragged chunks => batch=1
+  n_files: 6000
+  stream_cap: 90000
+
+training:
+  seed: 0
+  steps: 2000
+  grad_accum: 8                            # effective batch = 8 convs (~2.8 passes, ~18s/step)
+  amp: false
+  lr: 3.0e-04
+  muon_lr: 7.5e-04                         # + per-group lr_scale (muon_ref_mem_dim) => v1 regime
+  muon_ref_mem_dim: 64                     # reference mem_dim whose per-module RMS we restore
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_start: 700                     # teacher-free 450-700 (250 steps = v1), then decay
+  wsd_decay_shape: step                    # DeepSeek step: x0.316 at 700 (leave full LR in one
+                                           # step), x0.1 from 1675 (last quarter of the window)
+  log_every: 20
+  eval_every: 200
+  eval_convs: 8
+  eval_depths: [2, 4, 6, 8]
+  eval_depth_convs: 8
+  save_every: 500
+  save_dir: checkpoints/code_defer_native_v2b
+  metrics_file: runs/code_defer_native_v2b/metrics.jsonl
+
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal: [300, 450]

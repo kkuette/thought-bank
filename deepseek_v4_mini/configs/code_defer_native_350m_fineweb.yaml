@@ -1,0 +1,75 @@
+# AUTO-DERIVED from code_defer_native_350m.yaml — dataset variant 'HuggingFaceFW/fineweb'.
+# Recipe untouched; only dataset/save_dir/metrics_file differ.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  dataset: HuggingFaceFW/fineweb
+  data_dir: ''
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  n_files: 8000
+  stream_cap: 250000
+  config_name: sample-10BT
+  content_key: text
+  min_chunks: 2
+training:
+  seed: 0
+  steps: 2000
+  grad_accum: 8
+  amp: false
+  lr: 0.0003
+  muon_lr: 0.00075
+  muon_ref_mem_dim: 64
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_start: 700
+  wsd_decay_shape: step
+  log_every: 20
+  eval_every: 200
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  save_every: 500
+  save_dir: checkpoints/code_defer_native_350m_fineweb
+  metrics_file: runs/code_defer_native_350m_fineweb/metrics.jsonl
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal:
+  - 300
+  - 450

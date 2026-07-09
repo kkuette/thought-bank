@@ -64,6 +64,16 @@ The driving questions, in the order they were answered:
 > (hence the repo's former name). That line was abandoned for the autoregressive
 > fast-weight bank; the old code was removed and remains available in git history.
 
+## 🔬 After the paper: the bank on real data
+
+`main` has moved past the synthetic-rule benchmark: the current line trains
+from-scratch models (47M-97M) where the bank is the **only** channel carrying a
+real document (Python code / web text) across 512-token chunks, measured by a
+deferred-continuation loss. Latest results — +0.85 nats of bank advantage, flat
+to 10 chunks deep, shown by inference probes to be **file-specific content in a
+recency-weighted superposition** — are documented with exact reproduction
+commands in **[FINDINGS.md](FINDINGS.md)**.
+
 ---
 
 ## 🧠 Core idea
