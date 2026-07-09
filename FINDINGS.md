@@ -214,3 +214,82 @@ continuation — the `<think>` token is reserved for the model *deciding* when
 to write). The open question scaling answers: does content retrieval cross
 the greedy-decoding threshold — do file identifiers start appearing in the
 decoded continuations?
+
+---
+
+## 2026-07-08 — Grafting the bank onto a pretrained LM fails: internal wiring is not modular
+
+**TL;DR.** Before training from scratch, we spent ~10 runs trying the cheap
+route: graft the bank (read + write heads) onto a pretrained
+**SmolLM2-135M** and fine-tune. It fails in an instructive, three-way
+dead end — protect the host and the bank is silenced; let the bank in and
+the host's generalization degrades or its activations blow up. The same
+architecture trained **from scratch at one third the size** takes
+immediately. Conclusion: a fast-weight read is not a module you can bolt
+onto an existing model — the host's internal wiring has to **co-develop**
+with the memory from initialization. Pretrained representations have no
+vacant slot for an injected fast-weight pathway.
+
+### Setup
+
+Same deferred-continuation task as the entry above (the bank is the only
+bridge between 512-token chunks of real code). The bank's read (per-slot
+low-rank fast-weight MLP) and write (gist head) are grafted into
+SmolLM2-135M; the host is **not** frozen (a frozen host is the known
+ignore-bank fixed point — the read's injection is noise it never learns to
+consume). Two LRs (host low, graft high), teacher bootstrap on the write.
+Across v1→v10 we vary host LR, optimizer (Muon/AdamW), injection norm caps.
+
+### The trilemma (v8 / v9 / v10)
+
+Every variant lands on one of three failure surfaces:
+
+1. **Plastic host → generalization drift** (v8, `lr_host` 3e-4): the host
+   does learn to consume the read, but its own eval ppl drifts 4.8 → 6.7
+   while doing so; the memory GAP peaks at a weak +0.18 then **crashes to 0**
+   when the teacher is annealed away. The host "makes room" by damaging the
+   very representations the task needs.
+2. **Unbounded read → activation blow-up** (v9): the read injection grows to
+   2.1× the hidden-state norm (Muon), then 3.6× after swapping to AdamW —
+   the swap changes nothing because the optimizer was never the cause — and
+   the host craters (ppl 3.5 → 4600). An injected pathway with no
+   co-trained normalization has no equilibrium.
+3. **Bounded read → silenced bank** (v10, `read_cap`: ‖read‖ ≤ 0.5·‖h‖): the
+   host is finally stable, but the read rides the cap permanently and
+   carries ~nothing (GAP ≈ 0). The constraint that protects the host is
+   exactly the constraint that starves the memory.
+
+There is no setting between 2 and 3: the graft needs the host to *rewire
+around it*, and a pretrained host has already committed its wiring.
+
+### The control that makes it a result
+
+The identical architecture (same read, same write, same task, same data)
+trained **from scratch at 47M** — a third of SmolLM2's size, with read and
+write co-adapted from init — shows the exact opposite trajectory: the GAP
+*rises* as the teacher is removed (+0.21 → +0.55 by step 600) instead of
+collapsing, and scales from there (see the entry above: +0.85 at 97M).
+So the failure is not the architecture, the task, or the data: it is the
+**graft**. Different training histories produce internally incompatible
+wiring — the bank must be part of the computation from the start, not an
+implant.
+
+(Practical corollary for anyone trying to add fast-weight memories to
+existing checkpoints: warm-starting from a pretrained trunk buys nothing
+here; the co-adaptation is the expensive, necessary part.)
+
+### Reproduce
+
+The graft harness is committed for the record:
+`deepseek_v4_mini/smollm_graft.py` (the graft module — write head and
+fast-weight read bolted onto a HF causal LM, zero-initialised so the grafted
+model starts bit-identical to the host) driven by
+`deepseek_v4_mini/code_train.py` (dual-optimizer trainer) with
+`deepseek_v4_mini/configs/code_defer_v1.yaml`; the v1→v10 variants are LR /
+optimizer / cap settings documented above. The from-scratch control is
+`deepseek_v4_mini/code_defer_native.py` with
+`configs/code_defer_native_v1.yaml` (47M). Fair warning: reproducing the
+*failure* takes as long as reproducing the success (~hours per arm on a
+24GB GPU); the informative artifact is the trajectory shape (GAP crash at
+teacher-anneal / injection-norm blow-up / capped-read flatline), not a
+single number.
