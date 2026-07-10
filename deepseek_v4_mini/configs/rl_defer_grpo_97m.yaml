@@ -61,7 +61,15 @@ data:                                      # SAME corpus as v2b/v2c => cache hit
 
 rl:
   seed: 0
-  init_from: checkpoints/rl_defer_grpo_97m/step100.pt   # phase 3: restart from the HEALTHY
+  train_scope: think_row                   # phase 4: FREEZE the model, train only the <think>
+                                           # head row (policy = linear readout on frozen
+                                           # features). Phases 2-3 proved full-model RL erodes
+                                           # the backbone at ANY lr (reward blind to common
+                                           # capability loss); lr only delays it.
+  init_from: checkpoints/rl_defer_grpo_97m_p3/step50.pt # last canary-clean learned point
+                                           # (phase 3 @50: policy -7.83 > never -8.41 at 13%
+                                           # writes, never/always nominal; damage hit 50->75)
+  # (phase 3: restart from the HEALTHY
                                            # phase-1 step100 (redistribution learned, backbone
                                            # intact). Phase 2 (lr 2e-5) post-mortem: the policy
                                            # gradient updates ALL weights but the group baseline
@@ -74,7 +82,9 @@ rl:
   steps: 300
   group_size: 8                            # G rollouts of the same conversation
   groups_per_step: 4                       # conversations per optimizer step
-  lr: 1.0e-05                              # phase 1 (5e-6) too slow, phase 2 (2e-5) destructive
+  lr: 3.0e-04                              # 384 trainable floats only — backbone frozen, the
+                                           # lr ceiling is policy oscillation, not capability
+                                           # (history: 5e-6 slow / 2e-5 & 1e-5 destroyed full model)
   temp: 3.0                                # BERNOULLI temp (see boundary_step): v2c probe
                                            # gives P(<think>)~2e-3 at boundaries (varlen killed
                                            # the positional prior); T=3 lifts rollout p to ~0.1
@@ -92,5 +102,5 @@ rl:
   eval_every: 25
   eval_convs: 16
   save_every: 50                           # phase 2 died with zero restart points before 100
-  save_dir: checkpoints/rl_defer_grpo_97m_p3
-  metrics_file: runs/rl_defer_grpo_97m_p3/metrics.jsonl
+  save_dir: checkpoints/rl_defer_grpo_97m_p4
+  metrics_file: runs/rl_defer_grpo_97m_p4/metrics.jsonl

@@ -228,8 +228,30 @@ def main(cfg_path: str) -> None:
     ref = copy.deepcopy(model).eval()
     for p in ref.parameters():
         p.requires_grad_(False)
+
+    scope = r.get("train_scope", "full")
+    if scope == "think_row":
+        # Full-model RL erodes the backbone: the group baseline cancels any
+        # capability loss COMMON to the rollouts, so the reward is blind to it
+        # (phases 2-3 post-mortem: never/always canaries degrade at any lr,
+        # lower lr only delays it). Freeze everything; train ONLY the <think>
+        # row of the (tied) head — the policy becomes a linear readout on
+        # frozen features and the backbone is safe by construction. NB tying
+        # means this row is also <think>'s input embedding (tiny surface,
+        # canaries watch it).
+        for p in model.parameters():
+            p.requires_grad_(False)
+        W = model.lm_head.weight
+        W.requires_grad_(True)
+        _mask = torch.zeros_like(W)
+        _mask[ids[0]] = 1.0
+        W.register_hook(lambda g: g * _mask)
+        opt_params = [W]
+    else:
+        opt_params = list(model.parameters())
     print(f"GRPO policy {model.num_params():,} params <- {r['init_from']} "
-          f"(step {ck.get('step', '?')}) | ref frozen | device {device}", flush=True)
+          f"(step {ck.get('step', '?')}) | ref frozen | train_scope {scope} | "
+          f"device {device}", flush=True)
 
     L, K = int(d["seq_len"]), int(d["chunks_per_conv"])
     defer_len = int(d.get("defer_len", 16))
@@ -254,7 +276,7 @@ def main(cfg_path: str) -> None:
     kl_coef = float(r.get("kl_coef", 1.0e-3))
     min_std = float(r.get("min_reward_std", 1.0e-4))
     max_rs = int(r.get("max_resample", 4))
-    opt = torch.optim.AdamW(model.parameters(), lr=float(r.get("lr", 5.0e-6)),
+    opt = torch.optim.AdamW(opt_params, lr=float(r.get("lr", 5.0e-6)),
                             weight_decay=0.0)
     save_dir = r.get("save_dir", "checkpoints/rl_defer_grpo")
     os.makedirs(save_dir, exist_ok=True)
