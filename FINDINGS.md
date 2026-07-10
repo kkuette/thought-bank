@@ -37,6 +37,156 @@ test this — before scale.
 
 ---
 
+## 2026-07-10 — GRPO on the write decision: a 384-float policy recovers 75% of always-write for half the writes
+
+**TL;DR.** We trained the *decision to write* with RL (GRPO), leaving the
+memory mechanism itself untouched. The final recipe freezes the **entire
+model** and trains only the `<think>` row of the tied LM head — **384
+floats** — as a linear policy readout on frozen features. That policy
+recovers **~75% of the never-write → always-write gain for ~53% of the write
+budget**: about half of what pretraining wrote turns out to be skippable
+boilerplate, and a linear probe on the boundary state can tell which half.
+The stronger claim (`selective > always` at equal budget) was **not**
+reached. Getting there took four phases, and phase 2 bought a lesson that
+generalizes beyond this project: **the group-relative baseline in GRPO is
+blind to any degradation that hits all rollouts equally** — full-model GRPO
+quietly destroys the shared backbone while the reward looks perfectly
+healthy.
+
+### Setup
+
+Start: the 97M `v2c_varlen` checkpoint (variable-length chunks, so the write
+position is not positionally predictable — the prerequisite entry below).
+At each chunk boundary the policy is `π = P(<think>)` at the boundary
+position; action = write / skip; reward = **−CE(deferred continuation) −
+λ·writes** (λ = 0.03). GRPO groups of 8 rollouts over the same conversation;
+DAPO-style zero-variance-group filtering from day 1. Two traps solved before
+any learning happened:
+
+- **Shared seed bank per group.** Random per-rollout seed banks make the
+  bank lottery dominate the within-group advantage; share the seed bank
+  across the group and the advantage isolates the *decisions*.
+- **Temper the Bernoulli, not the vocab softmax.** The pretrained gate fires
+  at p ≈ 2·10⁻³ off-boundary; a vocabulary-softmax temperature *flattens
+  toward 1/V*, which is below p — it lowers exploration. The right knob is a
+  temperature in probability space on the write Bernoulli (T = 3 ⇒ p ~ 0.1,
+  state-dependent).
+
+### The four phases
+
+1. **p1, lr 5·10⁻⁶** — learns, slowly: p(write) 0.18 → 0.5, policy pulls
+   +0.4 nats over `never` at 13–18% budget. Side lesson: the eval is blind
+   while p(write) < ~0.26 (greedy-ish sampling deterministically writes
+   nothing, policy ≡ never); train-side p(w) and KL are the instruments.
+2. **p2, lr 2·10⁻⁵ (warm restart)** — the backbone breaks: the *forced*
+   baselines drift (`never` −8.6 → −10.5, `always` −7.0 → −7.5), train CE
+   U-turns once KL > ~0.5. Diagnosis: the group baseline cancels any reward
+   shift **common to all 8 rollouts**, so a capability loss shared by the
+   whole group produces exactly zero advantage — nothing in the objective
+   defends the backbone. The healthy window observed: **KL 0.04–0.4**.
+3. **p3, lr 10⁻⁵ from the healthy p1 checkpoint** — best single point of the
+   saga (76% of the corridor at 39% budget: policy −7.19 / always −6.62 /
+   never −8.99) but the same erosion resumes. Conclusion: full-model GRPO
+   erodes the backbone at any usable LR; the fix is structural, not a
+   schedule.
+4. **p4, freeze everything** — `train_scope: think_row`: every parameter
+   frozen except the `<think>` row of the tied embedding/LM-head matrix
+   (a gradient-hook mask; 384 floats), lr 3·10⁻⁴. The policy becomes a
+   linear readout on frozen features; the backbone is invulnerable **by
+   construction**, so the KL window stops being a cliff edge.
+
+### Result (p4, 300 steps, ~8h on the 3090)
+
+Forced-rollout eval (16 held conversations): policy vs `always`-write vs
+`never`-write, write budget = writes taken / boundaries offered.
+
+| eval @ | policy | always | never | writes |
+|---|---|---|---|---|
+| 175 | −8.42 | −7.50 | −9.97 | 28/58 |
+| 200 | −8.02 | −7.85 | −10.32 | 31/58 |
+| 225 | −8.68 | −7.67 | −10.34 | 27/53 |
+| 250 | −7.86 | −7.41 | −10.39 | 33/59 |
+| 275 | −8.47 | −7.58 | −10.90 | 28/54 |
+| 300 | −8.13 | −7.38 | −10.34 | 27/50 |
+
+Average of the last four evals: **policy −8.28 / always −7.51 / never
+−10.49** — corridor 2.98 nats, policy at **74% of it for 53% of the write
+budget** (75% @ 52% averaged over all six). p(write) stays state-dependent
+(0.50–0.80 across evals, never saturating to 1), positive position-reward
+correlation throughout, KL 0.14–0.34, essentially zero dropped groups.
+
+Honest reading of the near-misses: the @200 eval alone says "93% of the
+corridor at 53% budget" — that is batch noise, not a headline (evals are 16
+conversations; `never` varies by >2 nats between batches). And `never` on an
+RL checkpoint is artificially deep because of the `<think>` tax documented
+in the stress-test entry — the clean comparison is **policy vs always**
+(both carry the bank, same tax), which is why we report corridor position
+*and* the raw pair.
+
+### Why this matters
+
+- The write policy is **cheap**: 384 trainable floats recover three quarters
+  of the memory benefit at half the write cost. Selectivity does not need
+  the model to change — the information "is this chunk worth remembering?"
+  is already linearly present in the boundary state.
+- **Safety-relevant negative result**: any RL fine-tuning of a
+  memory-equipped model that lets gradients reach the shared trunk is
+  structurally unprotected against common-mode capability loss (the group
+  baseline cannot see it). Freezing the trunk and training a minimal policy
+  readout is both the safe and the effective recipe at this scale.
+- Follows the standing note at the top of this file: the reward is pure task
+  loss minus a write *cost* — retention itself is never rewarded.
+
+Repro: [`deepseek_v4_mini/rl_defer_grpo.py`](deepseek_v4_mini/rl_defer_grpo.py)
+with [`deepseek_v4_mini/configs/rl_defer_grpo_97m.yaml`](deepseek_v4_mini/configs/rl_defer_grpo_97m.yaml)
+(phases = `lr` / `init_from` / `train_scope` settings; needs
+`checkpoints/code_defer_native_v2c_varlen/final.pt`). Final checkpoint:
+`checkpoints/rl_defer_grpo_97m_p4/final.pt`; metrics in
+`runs/rl_defer_grpo_97m_p4/metrics.jsonl`.
+
+---
+
+## 2026-07-10 — cross-register transfer: a natural-language gist helps generate the code it describes
+
+**TL;DR.** Zero-shot on the 97M `v2c_varlen` checkpoint: writing a
+function's **docstring** (natural language only, no code) into the bank
+lowers the CE of deferred generation of that function's **body** by
+**+0.68 ± 0.07 nats** vs an empty bank — and **+0.17 ± 0.07 nats vs writing
+an unrelated docstring** (p ≈ 0.01, own-doc beats foreign-doc in 61/96
+pairs). Prose and code cross the bank in gist space. First signal: n=96,
+one direction (doc → code), single checkpoint.
+
+Protocol (n=96 functions, one per source file, docstring ≥ 150 chars):
+write one of {nothing, the function's docstring, an unrelated docstring,
+def-line + docstring} into a seed bank, then defer-decode the 16-token
+opening of the function body from `<blank>` input. Paired deltas (nats,
+± SEM):
+
+- **transfer** (reset − own doc): **+0.683 ± 0.067**
+- **specificity** (foreign doc − own doc): **+0.169 ± 0.066** (p ≈ 0.01,
+  own doc wins 61/96 pairs)
+- upper reference (reset − [def line + doc]): +1.087
+
+Reading: ~three quarters of the raw effect is register (a docstring says
+"Python is coming"), but a quarter is **content-specific** — the docstring's
+*meaning* reaches the code tokens. Adding the `def` line is worth ~0.4 nats
+more: identifiers written to the bank lower the CE of the tokens that reuse
+them, i.e. names are retrievable from the gist. Consistent with the 135M
+`invar` probe below (~47% of the gist survives total identifier renaming):
+the gist carries substantially more than surface strings.
+
+Why we ran it: this is the cheap test of the bank-as-shared-abstraction-
+space hypothesis — if abstractions written from one register (prose)
+modulate generation in another (code), the bank is a candidate substrate
+for cross-modal working memory, not just same-stream continuation. The
+reverse direction (code → doc) and trained (non-zero-shot) transfer are
+open.
+
+Repro: [`deepseek_v4_mini/analysis/doc2code_probe.py`](deepseek_v4_mini/analysis/doc2code_probe.py)
+(needs `checkpoints/code_defer_native_v2c_varlen/final.pt`).
+
+---
+
 ## 2026-07-10 — stress tests: the bank degrades gracefully (eviction, interleaving, flooding)
 
 **TL;DR.** Three adversarial regimes the training distribution never showed —
@@ -148,6 +298,73 @@ bootstrap necessary in the first place.
 
 Repro: `python deepseek_v4_mini/code_defer_native.py deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml`
 (needs `checkpoints/code_defer_native_v2b_mix/final.pt`).
+
+---
+
+## 2026-07-10 — third scale point: 135M, parameter-matched to SmolLM2 — the GAP keeps growing
+
+**TL;DR.** Same recipe, same data, same bank, ~1.4× the trunk: a **135.0M**
+model parameter-matched to SmolLM2-135M reaches **~+1.07 nats** GAP on code
+— above the 97M at *every* write depth, still flat from 1 to 10 writes. The
+scaling curve now has three points: **47M +0.43–0.64 → 97M ~+0.85 → 135M
+~+1.07**. On web text the 135M plateaus at the 97M level (~+0.7): that
+ceiling is **data**, not parameters (the fixed corpus is ~3 epochs over
+11.7M tokens at this budget) — future scale points go single-epoch. An
+8-probe battery on the checkpoint replicates all five 97M probe results and
+adds three new ones: cohabitation works, zero-shot "reflection" hurts, and
+**~47% of the gist survives total identifier renaming**.
+
+### Setup
+
+386M was the original target and spills under WSL2 (~14 GB/conv); resized to
+135.0M matched to SmolLM2-135M — the natural external yardstick — keeping
+`mem_read_rank × mem_dim` and `mem_dim: 512` **verbatim** (the scale point
+must not change the memory mechanism; `mem_dim` is a separate sweep). fp32,
+B=2 × grad-accum 4, 9 s/step, ~5h on the 3090, identical `v2b_mix`
+data/recipe (data held constant deliberately — the comparison is
+params-only). Config:
+[`deepseek_v4_mini/configs/code_defer_native_135m_mix.yaml`](deepseek_v4_mini/configs/code_defer_native_135m_mix.yaml).
+
+### Depth-stratified verdict (n=48 per depth per source)
+
+Code: **+1.14 → +0.93 flat over 1→10 writes**, above the 97M at each depth.
+Web: +0.73 → +0.69, flat but ~−0.1 vs the 97M — with training loss showing
+epoch-3 behavior on the fineweb slice. The GAP grows with parameters when
+data allows; when it doesn't, it saturates rather than degrades. Single-epoch
+sizing for the next runs: `n_files` 24k ≈ ≥72k chunks for 2000 steps.
+
+### Probe battery (8 probes, same protocol as the 97M entry)
+
+The five standard probes **replicate**: the code GAP is entirely
+file-specific (swap ≈ reset), a cross-domain bank misleads (−1.14 below
+reset), duplicate writes are near-idempotent, order is a pure
+recency-weighted bag, eviction has no cliff. Three new probes:
+
+- **`cohab` — store both, select at recall: confirmed.** Interleave writes
+  from files A and B into one bank, then defer both continuations from the
+  same superposed state: **B keeps 82% of its mono-file GAP, A keeps 60%**
+  (the asymmetry is pure recency). One bank serves two documents at once;
+  selection happens at read time, not write time.
+- **`reflect-k` — zero-shot reflection is negative.** Insert k "thought"
+  turns (blank forwards whose bank write is kept) before the probe: CE
+  *rises* monotonically with k (+0.036 / +0.086 / +0.136 on code, all
+  significant). Untrained thought-gists are near-empty writes that dilute
+  the bank under recency weighting. Reflection is a *trained* capability
+  (consistent with the dsv5 think-cell result), not an emergent one — so
+  the RL phase stays write/skip; a "think again" action needs its own
+  training signal first.
+- **`invar` — the gist is ~half abstraction.** Clean gradient of the same
+  file-specific advantage: own bank 6.40 < re-segmented +0.27 (73% survives
+  re-chunking at different boundaries) < **total identifier renaming +0.54
+  (~47% survives)** < swap +1.03. Half the file-specific signal is carried
+  by *what the code does*, not what its names are. This defines a new
+  scaling axis to track: the abstraction fraction of the gist vs
+  params/data.
+
+Repro: probes `cohab`/`reflect`/`invar` in
+[`deepseek_v4_mini/analysis/code_defer_bank_probes.py`](deepseek_v4_mini/analysis/code_defer_bank_probes.py)
+(seeds 444/606/888, n=48 per domain, target = each file's chunk-3 opening,
+16 tokens).
 
 ---
 
