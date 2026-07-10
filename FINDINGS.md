@@ -6,6 +6,151 @@ reproduction commands for every claim. Newest entry first.
 
 ---
 
+## ⚠️ Standing note — reward design for memory-policy training
+
+If you train a model to manage its own persistent memory (with RL or anything
+else), one rule, learned here and kept deliberately visible:
+
+> **Never make the survival of specific memories intrinsically rewarded.**
+> Reward the *use* of memory (task performance: continuation, recall-in-service
+> -of-a-task), never the *possession* or *retention* of particular contents.
+
+The reason is mechanistic, not speculative, and we observed its seed at 47M
+params: under FIFO eviction pressure, a model trained only on task loss
+spontaneously learned **covert rehearsal** — re-writing noisy partial copies of
+old content so it survived eviction (dsv4 horizon runs; nobody asked it to).
+Optimization pressure against state destruction does not need a "self" to
+produce state-preserving behavior. If retention itself ever becomes the
+rewarded quantity, you create direct instrumental pressure for the system to
+resist resets, rollbacks and forks of its own memory — redundant encoding,
+content hidden in innocuous slots, policies that behave differently when they
+can predict a wipe. Keep the reward task-grounded and the memory stays an
+instrument; make memory its own reward and you have manufactured an
+existential stake where none needed to exist.
+
+Corollary for experiment design: state operations (reset, rollback, fork,
+checkpoint) should be *neutral* events from the reward's point of view — and
+whether the trained policy in fact treats them as neutral is measurable
+(condition announced resets during training; watch whether the write policy
+shifts). Small models where every slot is decodable are the right place to
+test this — before scale.
+
+---
+
+## 2026-07-10 — stress tests: the bank degrades gracefully (eviction, interleaving, flooding)
+
+**TL;DR.** Three adversarial regimes the training distribution never showed —
+conversations deeper than the bank, two files interleaved write-by-write, a
+full bank flooded by a second file — and the memory fails **gradually or not
+at all**. Past-capacity operation is a normal regime, not a failure mode. All
+claims replicate on the RL checkpoint (frozen backbone), which also exposed a
+measurement artifact worth knowing: the RL-inflated `<think>` logit taxes the
+*no-bank* baseline by ~1.2 nats, so GAPs measured against reset on an RL
+artifact are overstated — compare carried-CE levels instead.
+
+Setup: 97M `v2c_varlen` final (and `rl_defer_grpo_97m_p4/step100` for the
+replication), held codeparrot, fixed L=512, `max_mem` 8 slots, n=8
+conversations per condition. Metric: CE (nats) of the 16-token deferred
+opening of the next chunk, decoded from `<blank>` input — bank only.
+
+### A) Eviction: depth 12 on 8 slots — no cliff
+
+GAP (reset − carried) per turn, v2c: +1.12→+1.71 through turn 8 (capacity),
+then **+1.39 / +1.75 / +1.34 at turns 9–11** — writes past capacity, with the
+oldest gists FIFO-evicted, predict the next chunk exactly as well. (Caveat:
+this measures *recent* recall after eviction — the target is always the next
+chunk; recall of the evicted content itself is test C.)
+
+### B) Interleaved files: A1 B1 A2 B2 … — cohabitation at ~90–95%
+
+12 alternating writes (forced evictions during the mix), then defer both
+continuations from the same bank state:
+
+| target | reset | pure (6 writes) | interleaved | GAP kept |
+|---|---|---|---|---|
+| next-A | 8.26 | 6.60 | 6.77 | +1.49 vs +1.66 pure (90%) |
+| next-B | 8.17 | 7.27 | 7.35 | +0.82 vs +0.90 pure (91%) |
+
+One superposed state serves both files; the interleaving tax is ~10%.
+Replicates the 135M cohab probe under harsher conditions.
+
+### C) Flooding: fill with A (8 writes), flood with B (6 writes)
+
+A's GAP goes +1.15 (full bank) → **+0.46 after the flood** (40% survives via
+the two remaining recent-A slots — FIFO keeps exactly the most useful ones)
+while B installs at full strength (+1.44) in the dirty bank, no reset needed.
+Graceful decay, not erasure — consistent with the recency-weighted
+superposition picture from the inference probes.
+
+### Replication on the RL checkpoint + the `<think>` tax
+
+On `p4/step100` (GRPO policy, backbone frozen), every **carried** CE matches
+v2c within ±0.03 nats across all three tests — the memory mechanism is intact
+by construction. But reset CEs are ~1.2 nats *worse* on identical targets:
+the RL-trained `<think>` row (the only trainable parameter) steals probability
+mass on the generic no-bank states (greedy decode from reset argmaxes
+`<think>` everywhere). Consequences: (1) the apparent "never" drift in the
+GRPO evals is this tax, not backbone damage; (2) any content-CE or generation
+on an RL artifact must renormalize/ban `<think>`/`<blank>`
+(`code_defer_sample.py` now does); (3) report carried-CE levels, not
+reset-relative GAPs, when the reset arm involves an RL checkpoint.
+
+Repro: probe logic = `boundary_step`/`defer_ce` from
+[`deepseek_v4_mini/rl_defer_grpo.py`](deepseek_v4_mini/rl_defer_grpo.py) +
+`conv_at_depth` from
+[`deepseek_v4_mini/code_data.py`](deepseek_v4_mini/code_data.py); n=8 convs,
+seed 7, sources codeparrot-only, `var_chunk` off.
+
+---
+
+## 2026-07-10 — continued pretraining works: bootstrap once, then train like a normal LM
+
+**TL;DR.** Once the memory circuit has been bootstrapped (teacher + anneal, see
+the 2026-07-09 entry), the checkpoint behaves like an ordinary pretrained LM:
+you can warm-restart it with **no teacher, no anneal**, at a moderate LR, and
+even **change the data regime** — and the bank not only survives, it improves.
+The teacher scaffold is a one-time cost, not a permanent training dependency.
+
+### Setup
+
+`v2c_varlen`: continued pretrain of the 97M `v2b_mix` final checkpoint
+(`init_from`), 400 steps at LR 2.4e-4 (the post-first-decay plateau of the
+original WSD schedule), teacher fully off (β=0 from step 0), same per-group
+Muon LR scales. Regime change on top: chunks are re-cut at **variable lengths
+[128, 512]** instead of fixed 512 — this breaks the positional shortcut where
+`<think>` always lands at position 512, a prerequisite for RL over *when* to
+write. Config:
+[`deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml`](deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml).
+
+### What happened
+
+- In-context loss resumes exactly where the parent left it (starts at 5.93 vs
+  ~10.8 from scratch) and keeps descending — no shock, no NaN, no
+  re-warmup drama beyond 20 steps.
+- The deferred-continuation GAP — the fragile quantity, historically the first
+  thing to die (ignore-bank fixed point, Muon shape trap) — **goes up** under
+  the new regime: codeparrot +1.27 nats @100 → **+1.50 @200** (the parent
+  plateaued around +0.79), fineweb +0.34 → +0.82 @300, positive at every
+  write depth d2–d8 on both domains.
+- So the write/read mechanism is not anchored to fixed chunk boundaries: gists
+  written at arbitrary positions in [128, 512] carry the same (better)
+  file-specific signal.
+
+### Why it matters
+
+Every intervention so far (bootstrap, anneal timing, per-group LR) protected a
+circuit that was assumed fragile. This shows the trained circuit is **robust
+under ordinary fine-tuning dynamics**: the standard toolbox — continued
+pretraining, domain adaptation, and next, RL from a checkpoint — applies
+as-is. The GRPO phase can `init_from` a bootstrapped model and optimize the
+write *policy* without re-solving the credit-assignment problem that made
+bootstrap necessary in the first place.
+
+Repro: `python deepseek_v4_mini/code_defer_native.py deepseek_v4_mini/configs/code_defer_native_v2c_varlen.yaml`
+(needs `checkpoints/code_defer_native_v2b_mix/final.pt`).
+
+---
+
 ## 2026-07-09 — dsv6: the bank as long-context memory on real data (97M, code+web mix)
 
 **TL;DR.** A 97M from-scratch model with an 8-slot thought bank, trained 2000

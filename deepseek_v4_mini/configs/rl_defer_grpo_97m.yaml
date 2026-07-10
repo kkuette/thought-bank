@@ -1,0 +1,106 @@
+# dsv6 RL — GRPO on the write decision, debugged at 97M on the 3090 (RL phase step 1).
+# PREREQUISITE: the v2c varlen continued-pretrain must be DONE and its <think> probe
+# re-run — a positionally-deterministic policy (v2b: P=.81-.91 @512) gives all-identical
+# GRPO groups (zero advantage). init_from points at the varlen checkpoint.
+# Question this run answers: does the policy learn to write SELECTIVELY better than
+# always-write at equal budget? (eval line: policy vs always vs never.)
+# lambda_write prices a write; the depth curve gives the marginal GAP per write
+# (~+0.1 nat incremental) => lambda must stay below it (0.03 default).
+# Rollouts are cheap (a few Bernoulli bits/conv, no token sampling); the cost is the
+# G x turns replay forwards. ~G8 x 4 groups ~ tens of forwards/step at 97M.
+#
+# python -m deepseek_v4_mini.rl_defer_grpo deepseek_v4_mini/configs/rl_defer_grpo_97m.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v2b/v2c 97M, verbatim (init_from must match)
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:                                      # SAME corpus as v2b/v2c => cache hit
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  var_chunk: [128, 512]                    # RL sees the same varlen regime as v2c
+  n_files: 6000
+  stream_cap: 90000
+
+rl:
+  seed: 0
+  train_scope: think_row                   # phase 4: FREEZE the model, train only the <think>
+                                           # head row (policy = linear readout on frozen
+                                           # features). Phases 2-3 proved full-model RL erodes
+                                           # the backbone at ANY lr (reward blind to common
+                                           # capability loss); lr only delays it.
+  init_from: checkpoints/rl_defer_grpo_97m_p3/step50.pt # last canary-clean learned point
+                                           # (phase 3 @50: policy -7.83 > never -8.41 at 13%
+                                           # writes, never/always nominal; damage hit 50->75)
+  # (phase 3: restart from the HEALTHY
+                                           # phase-1 step100 (redistribution learned, backbone
+                                           # intact). Phase 2 (lr 2e-5) post-mortem: the policy
+                                           # gradient updates ALL weights but the group baseline
+                                           # cancels any degradation COMMON to the 8 rollouts —
+                                           # nothing in the reward defends the backbone. never
+                                           # -8.6 -> -10.5 and always -7.0 -> -7.5 by step 50,
+                                           # train ce u-turned at kl>~0.5. Healthy window was
+                                           # kl 0.04-0.4 (p(w) 0.18->0.5, policy > never +0.4).
+                                           # (phase 1 init: code_defer_native_v2c_varlen/final.pt)
+  steps: 300
+  group_size: 8                            # G rollouts of the same conversation
+  groups_per_step: 4                       # conversations per optimizer step
+  lr: 3.0e-04                              # 384 trainable floats only — backbone frozen, the
+                                           # lr ceiling is policy oscillation, not capability
+                                           # (history: 5e-6 slow / 2e-5 & 1e-5 destroyed full model)
+  temp: 3.0                                # BERNOULLI temp (see boundary_step): v2c probe
+                                           # gives P(<think>)~2e-3 at boundaries (varlen killed
+                                           # the positional prior); T=3 lifts rollout p to ~0.1
+                                           # so G=8 groups are action-diverse
+  lambda_write: 0.03                       # < marginal GAP/write (~0.1) — writing must pay
+  clip_low: 0.2
+  clip_high: 0.28                          # DAPO clip-higher: rare actions can gain mass
+  kl_coef: 1.0e-2                          # on the boundary Bernoulli only — x10 after phase 2
+                                           # (1e-3 was no brake at all; NB this still does not
+                                           # protect the backbone, lr is the real guard)
+  min_reward_std: 1.0e-4                   # dynamic sampling threshold
+  max_resample: 4
+  grad_clip: 1.0
+  log_every: 1
+  eval_every: 25
+  eval_convs: 16
+  save_every: 50                           # phase 2 died with zero restart points before 100
+  save_dir: checkpoints/rl_defer_grpo_97m_p4
+  metrics_file: runs/rl_defer_grpo_97m_p4/metrics.jsonl

@@ -19,16 +19,21 @@ def _fill(x, tok, w):
     return torch.full((x.size(0), w), tok, dtype=x.dtype, device=x.device)
 
 
-def _greedy_from_bank(model, x_ref, blank_id, bank, defer_len):
+def _greedy_from_bank(model, x_ref, blank_id, bank, defer_len, ban=()):
     """Greedy-decode defer_len tokens from the deferred (all-<blank>) turn. Position i
     reads the bank; we fill position i with the model's own argmax so later positions
-    see a coherent prefix (bank stays fixed = init_mem)."""
+    see a coherent prefix (bank stays fixed = init_mem). `ban` = special/action token
+    ids excluded from the argmax (<think>/<blank> are control tokens, not content —
+    and RL on the <think> row inflates its logit enough to win greedy everywhere)."""
     B = x_ref.size(0)
     di = _fill(x_ref, blank_id, defer_len)
     out = torch.zeros(B, defer_len, dtype=torch.long, device=x_ref.device)
     for i in range(defer_len):
         o = model(di, init_mem=bank)
-        nt = o["logits"].float()[:, i].argmax(-1)
+        lg = o["logits"].float()[:, i]
+        for b in ban:
+            lg[:, b] = float("-inf")
+        nt = lg.argmax(-1)
         out[:, i] = nt
         if i + 1 < defer_len:
             di[:, i + 1] = nt      # feed prediction forward (bank unchanged)
@@ -75,8 +80,9 @@ def main(cfg_path, ckpt_path, n_ex=6, split="held"):
                 continue
             gt = segs[i + 1]["input_ids"][:, :defer_len].to(dev)         # ground truth
             dl = gt.size(1)                                              # ragged remainder may be < defer_len
-            car = _greedy_from_bank(model, x, blank_id, bank, dl)         # bank
-            res = _greedy_from_bank(model, x, blank_id, None, dl)         # no bank
+            ban = (think_id, blank_id)
+            car = _greedy_from_bank(model, x, blank_id, bank, dl, ban)    # bank
+            res = _greedy_from_bank(model, x, blank_id, None, dl, ban)    # no bank
             acc = (car[0] == gt[0]).float().mean().item()
             acc_r = (res[0] == gt[0]).float().mean().item()
             print("=" * 78)
