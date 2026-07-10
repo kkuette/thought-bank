@@ -61,11 +61,15 @@ data:                                      # SAME corpus as v2b/v2c => cache hit
 
 rl:
   seed: 0
-  init_from: checkpoints/code_defer_native_v2c_varlen/final.pt
+  init_from: checkpoints/rl_defer_grpo_97m/step100.pt   # phase 2: warm restart from the
+                                           # lr-5e-6 run — kl plateaued ~1.5e-3 at steps 50-75
+                                           # with p(w) stuck at 0.10 => x4 the lr (agreed plan);
+                                           # ref re-anchors on the step-100 policy.
+                                           # (phase 1 init: code_defer_native_v2c_varlen/final.pt)
   steps: 300
   group_size: 8                            # G rollouts of the same conversation
   groups_per_step: 4                       # conversations per optimizer step
-  lr: 5.0e-06
+  lr: 2.0e-05
   temp: 3.0                                # BERNOULLI temp (see boundary_step): v2c probe
                                            # gives P(<think>)~2e-3 at boundaries (varlen killed
                                            # the positional prior); T=3 lifts rollout p to ~0.1
@@ -81,5 +85,5 @@ rl:
   eval_every: 25
   eval_convs: 16
   save_every: 100
-  save_dir: checkpoints/rl_defer_grpo_97m
-  metrics_file: runs/rl_defer_grpo_97m/metrics.jsonl
+  save_dir: checkpoints/rl_defer_grpo_97m_p2
+  metrics_file: runs/rl_defer_grpo_97m_p2/metrics.jsonl
