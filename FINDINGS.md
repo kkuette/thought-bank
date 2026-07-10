@@ -37,6 +37,72 @@ test this — before scale.
 
 ---
 
+## 2026-07-10 — stress tests: the bank degrades gracefully (eviction, interleaving, flooding)
+
+**TL;DR.** Three adversarial regimes the training distribution never showed —
+conversations deeper than the bank, two files interleaved write-by-write, a
+full bank flooded by a second file — and the memory fails **gradually or not
+at all**. Past-capacity operation is a normal regime, not a failure mode. All
+claims replicate on the RL checkpoint (frozen backbone), which also exposed a
+measurement artifact worth knowing: the RL-inflated `<think>` logit taxes the
+*no-bank* baseline by ~1.2 nats, so GAPs measured against reset on an RL
+artifact are overstated — compare carried-CE levels instead.
+
+Setup: 97M `v2c_varlen` final (and `rl_defer_grpo_97m_p4/step100` for the
+replication), held codeparrot, fixed L=512, `max_mem` 8 slots, n=8
+conversations per condition. Metric: CE (nats) of the 16-token deferred
+opening of the next chunk, decoded from `<blank>` input — bank only.
+
+### A) Eviction: depth 12 on 8 slots — no cliff
+
+GAP (reset − carried) per turn, v2c: +1.12→+1.71 through turn 8 (capacity),
+then **+1.39 / +1.75 / +1.34 at turns 9–11** — writes past capacity, with the
+oldest gists FIFO-evicted, predict the next chunk exactly as well. (Caveat:
+this measures *recent* recall after eviction — the target is always the next
+chunk; recall of the evicted content itself is test C.)
+
+### B) Interleaved files: A1 B1 A2 B2 … — cohabitation at ~90–95%
+
+12 alternating writes (forced evictions during the mix), then defer both
+continuations from the same bank state:
+
+| target | reset | pure (6 writes) | interleaved | GAP kept |
+|---|---|---|---|---|
+| next-A | 8.26 | 6.60 | 6.77 | +1.49 vs +1.66 pure (90%) |
+| next-B | 8.17 | 7.27 | 7.35 | +0.82 vs +0.90 pure (91%) |
+
+One superposed state serves both files; the interleaving tax is ~10%.
+Replicates the 135M cohab probe under harsher conditions.
+
+### C) Flooding: fill with A (8 writes), flood with B (6 writes)
+
+A's GAP goes +1.15 (full bank) → **+0.46 after the flood** (40% survives via
+the two remaining recent-A slots — FIFO keeps exactly the most useful ones)
+while B installs at full strength (+1.44) in the dirty bank, no reset needed.
+Graceful decay, not erasure — consistent with the recency-weighted
+superposition picture from the inference probes.
+
+### Replication on the RL checkpoint + the `<think>` tax
+
+On `p4/step100` (GRPO policy, backbone frozen), every **carried** CE matches
+v2c within ±0.03 nats across all three tests — the memory mechanism is intact
+by construction. But reset CEs are ~1.2 nats *worse* on identical targets:
+the RL-trained `<think>` row (the only trainable parameter) steals probability
+mass on the generic no-bank states (greedy decode from reset argmaxes
+`<think>` everywhere). Consequences: (1) the apparent "never" drift in the
+GRPO evals is this tax, not backbone damage; (2) any content-CE or generation
+on an RL artifact must renormalize/ban `<think>`/`<blank>`
+(`code_defer_sample.py` now does); (3) report carried-CE levels, not
+reset-relative GAPs, when the reset arm involves an RL checkpoint.
+
+Repro: probe logic = `boundary_step`/`defer_ce` from
+[`deepseek_v4_mini/rl_defer_grpo.py`](deepseek_v4_mini/rl_defer_grpo.py) +
+`conv_at_depth` from
+[`deepseek_v4_mini/code_data.py`](deepseek_v4_mini/code_data.py); n=8 convs,
+seed 7, sources codeparrot-only, `var_chunk` off.
+
+---
+
 ## 2026-07-10 — continued pretraining works: bootstrap once, then train like a normal LM
 
 **TL;DR.** Once the memory circuit has been bootstrapped (teacher + anneal, see
