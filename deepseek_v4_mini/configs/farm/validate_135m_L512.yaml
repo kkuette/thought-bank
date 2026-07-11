@@ -1,0 +1,92 @@
+# dsv6 native 135M mix — SCALING POINT, phase 0c revised (47M -> 97M v2b_mix -> 135M this).
+# 386M bf16 spilled into WSL2 shared memory even at batch 1 => rescoped to 135.0M:
+# params matched to SmolLM2-135M (SAME tokenizer, 49152+2 vocab) for DIRECT comparison —
+# the graft counterpart ("SmolLM2 could not host the bank; a native 135M can").
+# d_model 384->512, n_layers 6, d_ff 1024, mem_read_rank 16->12: r*d = 6144 UNCHANGED,
+# so every read matrix keeps its v2b shape (no new Muon sqrt(cols) exposure; the write
+# head's cols grow 384->512 = x1.15 effective RMS, negligible vs the x2.8 that killed v2).
+# mem_dim/max_mem UNCHANGED (512/8): the scaling claim needs the memory mechanism
+# verbatim — mem_dim is a separate capacity sweep at 97M, not a scale-point variable.
+# fp32 (validated regime; bf16 gets its own dedicated validation later), B=2 x G=4 =
+# effective 8 convs as v2b_mix. Est ~8-10 s/step => 2000 steps ~ 4.5-5.5h on the 3090.
+#
+# python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/code_defer_native_135m_mix.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # ThoughtBankConfig -> 135.0M
+  d_model: 512
+  n_layers: 6
+  n_heads: 8
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1024
+  mem_dim: 512                             # unchanged — memory mechanism verbatim
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 12                        # 16 -> 12: r*d = 6144 constant across scale
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: /mnt/tb/data_cache                                      # SAME corpus knobs as v2b_mix => cache hit
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  n_files: 6000                            #   with the WSL2 spill again; 2x4 = same 8
+  stream_cap: 90000
+
+training:
+  seed: 0
+  steps: 100
+  grad_accum: 8
+  amp: true
+  lr: 3.0e-04
+  muon_lr: 7.5e-04
+  muon_ref_mem_dim: 64                     # per-group lr_scale: read /2.83, write x2.83
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_start: 700
+  wsd_decay_shape: step                    # x0.316 at 700, x0.1 from 1675
+  log_every: 20
+  eval_every: 200
+  eval_convs: 8
+  eval_depths: [2, 4, 6, 8]
+  eval_depth_convs: 8
+  save_every: 500
+  save_dir: /mnt/tb/checkpoints/farm/validate_135m_L512
+  metrics_file: /mnt/tb/runs/farm_validate_135m_L512/metrics.jsonl
+
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal: [300, 450]
