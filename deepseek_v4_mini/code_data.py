@@ -323,10 +323,15 @@ class CodeChunkStream:
         SAME file's successor chunk, -100-padded) because the next seg in the flat
         list usually belongs to another file. Kills the no-reset boundary confound:
         an off-topic LAST write no longer implies the current thread is dead — the
-        read must select by content, not by a recency/boundary heuristic."""
+        read must select by content, not by a recency/boundary heuristic.
+        n_streams: int = fixed F; (lo, hi) = F ~ U[lo, hi] SAMPLED per conv (like
+        depth): some convs are 2 deep subjects, some are hi brief ones. F is then
+        capped by m_total, so shallow convs stay naturally less fragmented."""
         assert self.B == 1, "interleave: ragged variable-depth streams require batch=1"
         dl = int(defer_len)
         m_total = self.rng.randint(2, self.K)
+        if isinstance(n_streams, (list, tuple)):
+            n_streams = self.rng.randint(int(n_streams[0]), int(n_streams[1]))
         F = min(int(n_streams), m_total)
         cuts = sorted(self.rng.sample(range(1, m_total), F - 1)) if F > 1 else []
         parts = [b - a for a, b in zip([0] + cuts, cuts + [m_total])]

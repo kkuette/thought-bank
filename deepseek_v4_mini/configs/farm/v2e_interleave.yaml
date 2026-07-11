@@ -1,7 +1,10 @@
-# v2e — INTERLEAVED regime (idea G, user 2026-07-11): each conv = 2 files whose
-# chunks are randomly MIXED in one bank lifetime (within-file order kept, defer
-# target = same-file successor). School-style spaced practice: no boundaries at
-# all, so the read cannot learn the v2d shortcut "off-topic last write => the
+# v2e — INTERLEAVED regime (idea G, user 2026-07-11): each conv = F ~ U[2,4]
+# files ("subjects") whose chunks are randomly MIXED in one bank lifetime
+# (within-file order kept, defer target = same-file successor). School-style
+# spaced practice: more subjects = more spacing between same-thread chunks =
+# more selection pressure; F capped by m_total so shallow convs stay coherent.
+# No boundaries at all, so the read cannot learn the v2d shortcut "off-topic
+# last write => the
 # old thread is dead" (v2d probes: distractor-last collapses BELOW reset +0.87,
 # vs v2c which survives at -0.96 — a learned boundary inference, not a filter).
 # Here mid-file continuations follow off-topic writes at every depth: the only
@@ -91,6 +94,8 @@ training:
   save_every: 400
   save_dir: /mnt/tb/checkpoints/farm/v2e_interleave
   metrics_file: /mnt/tb/runs/farm_v2e_interleave/metrics.jsonl
-  interleave_files: 2
+  interleave_files:
+  - 2
+  - 4
 teacher:
   enabled: false
