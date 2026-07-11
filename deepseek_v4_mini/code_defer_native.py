@@ -265,6 +265,14 @@ def main(cfg_path: str, resume: bool = False) -> None:
 
     steps = int(t["steps"]); warmup = int(t.get("warmup_steps", 100))
     grad_accum = int(t.get("grad_accum", 1))          # convs per optimizer step (effective batch)
+    # no_reset_files N > 1: chain N consecutive files into one bank lifetime — the bank
+    # is carried (detached) across file boundaries instead of reset, so every file after
+    # the first STARTS with the previous file's gists in its slots (dirty-bank regime).
+    # Boundary defer stays masked for free: batch=1 derives defer targets within-file only.
+    no_reset_files = int(t.get("no_reset_files", 1))
+    if no_reset_files > 1:
+        assert int(d["batch_size"]) == 1, "no_reset_files requires batch_size 1 (ragged mode)"
+        assert grad_accum % no_reset_files == 0, "grad_accum must be a multiple of no_reset_files"
     lam = float(t.get("defer_weight", 1.0))
     wsd = bool(t.get("wsd_decay", True)); wsd_floor = float(t.get("wsd_floor", 0.0))
     decay_start = int(t.get("wsd_decay_start", int(steps * 0.66)))
@@ -361,10 +369,15 @@ def main(cfg_path: str, resume: bool = False) -> None:
         # gradient accumulation: G independent conversations (batch=1 each, bank reset
         # between them) summed into one optimizer step => effective batch = G files,
         # variance reduced without padding/GPU-batching the ragged chunks.
+        bank_carry = None
         for _g in range(grad_accum):
             segs = (train_stream.next_conv_batch(defer_len) if train_stream.B > 1
                     else train_stream.next_conv())
-            bank = None; total = 0.0
+            if no_reset_files > 1 and _g % no_reset_files != 0:
+                bank = bank_carry                     # dirty start: previous file's gists
+            else:
+                bank = None
+            total = 0.0
             for i, s in enumerate(segs):
                 x = s["input_ids"].to(device)
                 xt = _append(x, think_id)
@@ -399,6 +412,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     total = total + lam * dloss; d_v += float(dloss.detach()); d_cnt += 1
                     # deferred forward's own write is discarded (do NOT carry od bank)
             (total / grad_accum).backward()          # mean over the G accumulated convs
+            if no_reset_files > 1:
+                # graph freed per file; the carried bank is data, not gradient path
+                bank_carry = bank.detach() if bank is not None else None
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(t.get("grad_clip", 1.0)))
         opt.step()
         ic_v /= max(ic_cnt, 1); d_v /= max(d_cnt, 1)

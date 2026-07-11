@@ -25,7 +25,8 @@ apt-get install -y nvidia-driver firmware-misc-nonfree
 echo "== Montage NFS =="
 mkdir -p "$MNT"
 # NFSv3 : server0/Unraid a refuse le v4 lors de la mise en place (2026-07-10)
-FSTAB_LINE="${NFS_HOST}:/mnt/user/${NFS_SHARE} ${MNT} nfs vers=3,nolock,hard,noatime,_netdev 0 0"
+# automount : évite la course au boot quand le réseau (pont wifi) est lent à monter
+FSTAB_LINE="${NFS_HOST}:/mnt/user/${NFS_SHARE} ${MNT} nfs vers=3,nolock,hard,noatime,_netdev,x-systemd.automount,x-systemd.mount-timeout=90 0 0"
 grep -qF "$FSTAB_LINE" /etc/fstab || echo "$FSTAB_LINE" >> /etc/fstab
 mount -a
 mountpoint -q "$MNT" && echo "NFS OK: $MNT" || { echo "ECHEC montage NFS"; exit 1; }
@@ -33,17 +34,19 @@ mountpoint -q "$MNT" && echo "NFS OK: $MNT" || { echo "ECHEC montage NFS"; exit 
 echo "== Arborescence partagée (no-op si déjà là) =="
 mkdir -p "$MNT"/{data,checkpoints,runs,queue,queue/running,queue/done,queue/failed}
 
-echo "== Env Python =="
-if [ ! -d /opt/tb-venv ]; then
-  python3 -m venv /opt/tb-venv
-  /opt/tb-venv/bin/pip install --upgrade pip
-  /opt/tb-venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu121
-  /opt/tb-venv/bin/pip install numpy pyyaml tokenizers datasets safetensors
-fi
-
 echo "== Repo =="
 if [ ! -d /opt/thought-bank ]; then
   git clone https://github.com/kkuette/thought-bank /opt/thought-bank
+fi
+
+echo "== Env Python =="
+if [ ! -d /opt/tb-venv ]; then
+  python3 -m venv /opt/tb-venv
+  # TMPDIR : /tmp est un tmpfs limité par la RAM (trixie) — le wheel torch (780 Mo) le remplit
+  export TMPDIR=/var/tmp
+  /opt/tb-venv/bin/pip install --upgrade pip
+  /opt/tb-venv/bin/pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121
+  /opt/tb-venv/bin/pip install --no-cache-dir -r /opt/thought-bank/requirements.txt
 fi
 
 echo "== Power limit au boot =="
