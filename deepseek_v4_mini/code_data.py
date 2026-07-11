@@ -314,6 +314,43 @@ class CodeChunkStream:
                          "defer_tgt": tgt})
         return segs
 
+    def next_conv_interleaved(self, n_streams: int, defer_len: int = 16) -> list[dict]:
+        """Idea G (2026-07-11): ONE bank lifetime holds n_streams files whose chunks
+        are randomly interleaved (within-file order preserved) — school-style spaced
+        practice instead of sequential no-reset chains. The total chunk budget matches
+        next_conv (m ~ U[2, K]) split across the streams, so VRAM/compute are unchanged
+        vs v2c; only the STRUCTURE differs. Each seg carries its own defer_tgt (the
+        SAME file's successor chunk, -100-padded) because the next seg in the flat
+        list usually belongs to another file. Kills the no-reset boundary confound:
+        an off-topic LAST write no longer implies the current thread is dead — the
+        read must select by content, not by a recency/boundary heuristic."""
+        assert self.B == 1, "interleave: ragged variable-depth streams require batch=1"
+        dl = int(defer_len)
+        m_total = self.rng.randint(2, self.K)
+        F = min(int(n_streams), m_total)
+        cuts = sorted(self.rng.sample(range(1, m_total), F - 1)) if F > 1 else []
+        parts = [b - a for a, b in zip([0] + cuts, cuts + [m_total])]
+        streams: list[list[dict]] = []
+        for m in parts:
+            f = self._pick_file()
+            if self.var_chunk:
+                f = self._reslice(f)
+            m = min(m, len(f))
+            st = self.rng.randrange(0, len(f) - m + 1)
+            q = []
+            for j in range(st, st + m):
+                ids = f[j].unsqueeze(0)                     # [1, Lj]
+                tgt = torch.full((1, dl), -100, dtype=torch.long)
+                if j + 1 < len(f):                          # same-file successor
+                    nx = f[j + 1][:dl]                      # (ragged tail ok)
+                    tgt[0, :nx.numel()] = nx
+                q.append({"input_ids": ids, "attention_mask": torch.ones_like(ids),
+                          "defer_tgt": tgt})
+            streams.append(q)
+        labels = [i for i, q in enumerate(streams) for _ in q]
+        self.rng.shuffle(labels)                            # uniform random merge
+        return [streams[i].pop(0) for i in labels]
+
     def _pick_source(self) -> int:
         if len(self.src_files) == 1:
             return 0

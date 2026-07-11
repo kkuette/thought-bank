@@ -273,6 +273,14 @@ def main(cfg_path: str, resume: bool = False) -> None:
     if no_reset_files > 1:
         assert int(d["batch_size"]) == 1, "no_reset_files requires batch_size 1 (ragged mode)"
         assert grad_accum % no_reset_files == 0, "grad_accum must be a multiple of no_reset_files"
+    # interleave_files F > 1 (idea G): each conv = F files' chunks randomly interleaved
+    # in ONE bank lifetime (same total chunk budget as next_conv). Trains content-based
+    # selection without the no-reset boundary confound (v2d probes 2026-07-11: no-reset
+    # learned "off-topic last write => new file" and collapses on mid-file distractors).
+    interleave_files = int(t.get("interleave_files", 1))
+    if interleave_files > 1:
+        assert int(d["batch_size"]) == 1, "interleave_files requires batch_size 1 (ragged mode)"
+        assert no_reset_files == 1, "interleave_files and no_reset_files are exclusive arms"
     lam = float(t.get("defer_weight", 1.0))
     wsd = bool(t.get("wsd_decay", True)); wsd_floor = float(t.get("wsd_floor", 0.0))
     decay_start = int(t.get("wsd_decay_start", int(steps * 0.66)))
@@ -372,7 +380,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
         bank_carry = None
         for _g in range(grad_accum):
             segs = (train_stream.next_conv_batch(defer_len) if train_stream.B > 1
-                    else train_stream.next_conv())
+                    else train_stream.next_conv_interleaved(interleave_files, defer_len)
+                    if interleave_files > 1 else train_stream.next_conv())
             if no_reset_files > 1 and _g % no_reset_files != 0:
                 bank = bank_carry                     # dirty start: previous file's gists
             else:
