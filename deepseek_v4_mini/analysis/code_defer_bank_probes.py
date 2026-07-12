@@ -335,6 +335,40 @@ def probe_cued(raw, tok, model, dev, n_files):
             ("thread_lbl", "clean_lbl", "LIVE-THREAD-LAST cost, label-cued")])
 
 
+def probe_merge(raw, tok, model, dev, n_files):
+    """v3 cascade brick test (user spec 2026-07-12): the tensor hierarchy merges
+    stored matrices AT READ TIME via a function (v1 = average). Is the existing
+    read robust to consuming an AVERAGE of independently-written banks? Write
+    bank_A and bank_B (and 3 more for the depth-2 simulation) separately, then
+    decode A's target from: its mono bank, avg of 2 banks (block-1 unit), avg
+    of 4 banks (block-2 unit), vs reset. Superposition probes (2026-07-09)
+    showed the read already consumes recency-weighted superpositions ~linearly
+    — this measures the CAPACITY of that linearity, zero-shot, no new archi.
+    Caveat: seed slots are averaged too (variance halves) — plain-average v1."""
+    write_seq, defer_ce = _mk_ops(model, tok, dev)
+    stream = _stream(raw, tok, seed=999)
+    pools = _pools(stream)
+    for si, nm in enumerate(stream.src_names):
+        fs = pools[si]
+        res = {k: [] for k in ("mono", "avg2", "avg4", "reset")}
+        for i, f in enumerate(fs[:n_files]):
+            others = [fs[(i + k) % min(len(fs), 200)] for k in (1, 2, 3)]
+            gt = f[3][:DL].unsqueeze(0).to(dev)
+            bank_a = write_seq([f[0], f[1], f[2]])
+            banks_o = [write_seq([g[0], g[1], g[2]]) for g in others]
+            res["mono"].append(defer_ce(bank_a, gt))
+            res["avg2"].append(defer_ce((bank_a + banks_o[0]) / 2, gt))
+            res["avg4"].append(defer_ce(
+                (bank_a + banks_o[0] + banks_o[1] + banks_o[2]) / 4, gt))
+            res["reset"].append(defer_ce(None, gt))
+        print(f"\n[{nm}] MERGE-BY-AVERAGE (n={len(res['mono'])}, target = A's c3 opening)")
+        _report(res, len(res["mono"]), [
+            ("avg2", "mono", "cost of 2-way average (block-1 unit)"),
+            ("avg4", "mono", "cost of 4-way average (block-2 unit)"),
+            ("avg2", "reset", "avg2 vs reset (does A survive the merge?)"),
+            ("avg4", "reset", "avg4 vs reset")])
+
+
 def probe_order(raw, tok, model, dev, n_files):
     write_seq, defer_ce = _mk_ops(model, tok, dev)
     stream = _stream(raw, tok, seed=777)
@@ -508,7 +542,7 @@ def probe_invar(raw, tok, model, dev, n_files):
 PROBES = {"swap": probe_swap, "dup": probe_dup, "distractor": probe_distractor,
           "order": probe_order, "eviction": probe_eviction,
           "cohab": probe_cohab, "reflect": probe_reflect, "invar": probe_invar,
-          "cued": probe_cued}
+          "cued": probe_cued, "merge": probe_merge}
 
 
 def main():
