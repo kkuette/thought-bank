@@ -56,6 +56,11 @@ Description=Power-limit GPUs a ${POWER_LIMIT}W
 After=multi-user.target
 [Service]
 Type=oneshot
+# post-mortem 2026-07-12 : au boot le driver peut ne pas etre pret — sans
+# retry le oneshot echoue et les GPU restent a 310W (suspect n°1 de la coupure)
+RemainAfterExit=yes
+TimeoutStartSec=600
+ExecStartPre=/bin/sh -c 'until /usr/bin/nvidia-smi >/dev/null 2>&1; do sleep 5; done'
 ExecStart=/usr/bin/nvidia-smi -pm 1
 ExecStart=/usr/bin/nvidia-smi -pl ${POWER_LIMIT}
 [Install]
@@ -70,6 +75,9 @@ cat > /etc/systemd/system/tb-worker@.service <<'EOF'
 Description=thought-bank GPU worker %i
 After=gpu-powerlimit.service remote-fs.target
 Requires=remote-fs.target
+# post-mortem 2026-07-12 : NFS pas pret au boot => crash-loop rapide => la
+# rate-limit systemd abandonne le worker pour de bon (gpu1 mort au redemarrage)
+StartLimitIntervalSec=0
 [Service]
 Environment=GPU_ID=%i
 Environment=TB_MNT=/mnt/tb
