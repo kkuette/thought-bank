@@ -218,6 +218,64 @@ def probe_distractor(raw, tok, model, dev, n_files):
             ("last_xdom", "reset", "worst case vs reset (does the thread survive?)")])
 
 
+def probe_cued(raw, tok, model, dev, n_files):
+    """Cued-query thread selection (idea-G follow-up, 2026-07-12). In the
+    interleaved regime the blank defer query is AMBIGUOUS (which live thread?)
+    and v2e resolves it by recency (last_xdom +2.42 while MID is null). Real
+    usage always has a cue: the current window's tail identifies the thread.
+    Query = the last CUE tokens of a2 fed IN CONTEXT (the model's IC mode —
+    in-distribution for interleave-trained ckpts, whose IC chunks routinely
+    follow another thread's write), scored on A's c3 opening. Banks vary what
+    was written LAST:
+      clean3       a0,a1,a2                 (baseline)
+      junk_last    a0,a1,a2,Dx              (cross-domain junk written last)
+      thread_last  a0,a1,a2,b0,b1           (a LIVE same-domain thread B last)
+      reset        no bank
+    Verdict: if the cued junk/thread costs collapse toward zero while the
+    blank-query costs stay high, selection is CONTENT-driven and recency is
+    only the blank-query fallback — no focus layer needed for the cued case."""
+    write_seq, defer_ce = _mk_ops(model, tok, dev)
+    CUE = 16
+
+    def cued_ce(bank, cue, gt):
+        di = torch.cat([cue.unsqueeze(0), gt], dim=1).to(dev)   # [1, CUE+DL]
+        with torch.no_grad():
+            lg = model(di, init_mem=bank)["logits"].float()
+        # standard shift: logits at CUE-1 .. CUE+DL-2 predict gt[0..DL-1]
+        pred = lg[:, CUE - 1:CUE + DL - 1]
+        return float(F.cross_entropy(pred.reshape(-1, pred.size(-1)),
+                                     gt.reshape(-1)))
+
+    stream = _stream(raw, tok, seed=888)
+    pools = _pools(stream)
+    for si, nm in enumerate(stream.src_names):
+        fs, other = pools[si], pools[1 - si] if len(pools) > 1 else pools[si]
+        res = {k: [] for k in ("clean_blank", "junk_blank", "clean_cued",
+                               "junk_cued", "thread_cued", "reset_cued")}
+        for i, f in enumerate(fs[:n_files]):
+            B = fs[(i + 2) % min(len(fs), 200)]
+            Dx = other[i % min(len(other), 200)][0]
+            a0, a1, a2 = f[0], f[1], f[2]
+            gt = f[3][:DL].unsqueeze(0).to(dev)
+            cue = a2[-CUE:]
+            bank_clean = write_seq([a0, a1, a2])
+            bank_junk = write_seq([a0, a1, a2, Dx])
+            bank_thread = write_seq([a0, a1, a2, B[0], B[1]])
+            res["clean_blank"].append(defer_ce(bank_clean, gt))
+            res["junk_blank"].append(defer_ce(bank_junk, gt))
+            res["clean_cued"].append(cued_ce(bank_clean, cue, gt))
+            res["junk_cued"].append(cued_ce(bank_junk, cue, gt))
+            res["thread_cued"].append(cued_ce(bank_thread, cue, gt))
+            res["reset_cued"].append(cued_ce(None, cue, gt))
+        print(f"\n[{nm}] CUED thread selection (n={len(res['clean_blank'])}, "
+              f"target = A's c3 opening, cue = last {CUE} tokens of a2)")
+        _report(res, len(res["clean_blank"]), [
+            ("junk_blank", "clean_blank", "JUNK-LAST cost, blank query (recency trap)"),
+            ("junk_cued", "clean_cued", "JUNK-LAST cost, cued query (cue rescue?)"),
+            ("thread_cued", "clean_cued", "LIVE-THREAD-LAST cost, cued query"),
+            ("junk_cued", "reset_cued", "cued worst case vs cued reset (thread survives?)")])
+
+
 def probe_order(raw, tok, model, dev, n_files):
     write_seq, defer_ce = _mk_ops(model, tok, dev)
     stream = _stream(raw, tok, seed=777)
@@ -390,7 +448,8 @@ def probe_invar(raw, tok, model, dev, n_files):
 
 PROBES = {"swap": probe_swap, "dup": probe_dup, "distractor": probe_distractor,
           "order": probe_order, "eviction": probe_eviction,
-          "cohab": probe_cohab, "reflect": probe_reflect, "invar": probe_invar}
+          "cohab": probe_cohab, "reflect": probe_reflect, "invar": probe_invar,
+          "cued": probe_cued}
 
 
 def main():
