@@ -350,16 +350,26 @@ def probe_merge(raw, tok, model, dev, n_files):
     pools = _pools(stream)
     for si, nm in enumerate(stream.src_names):
         fs = pools[si]
-        res = {k: [] for k in ("mono", "avg2", "avg4", "avg8", "avg16", "reset")}
+        Ks = (2, 4, 8, 16, 32, 64)
+        res = {k: [] for k in ("mono", *(f"avg{K}" for K in Ks), "reset")}
+        pool_n = min(len(fs), 200)
+        bank_cache = {}  # deep-block averages reuse others heavily: 1 write/file
         for i, f in enumerate(fs[:n_files]):
-            others = [fs[(i + k) % min(len(fs), 200)] for k in range(1, 16)]
             gt = f[3][:DL].unsqueeze(0).to(dev)
-            bank_a = write_seq([f[0], f[1], f[2]])
-            banks_o = [write_seq([g[0], g[1], g[2]]) for g in others]
+            if i not in bank_cache:
+                bank_cache[i] = write_seq([f[0], f[1], f[2]])
+            bank_a = bank_cache[i]
+            o_sum, n_o = bank_a.clone(), 1
             res["mono"].append(defer_ce(bank_a, gt))
-            for K in (2, 4, 8, 16):
-                m = (bank_a + sum(banks_o[:K - 1])) / K
-                res[f"avg{K}"].append(defer_ce(m, gt))
+            for K in Ks:
+                while n_o < K:
+                    j = (i + n_o) % pool_n
+                    if j not in bank_cache:
+                        g = fs[j]
+                        bank_cache[j] = write_seq([g[0], g[1], g[2]])
+                    o_sum = o_sum + bank_cache[j]
+                    n_o += 1
+                res[f"avg{K}"].append(defer_ce(o_sum / K, gt))
             res["reset"].append(defer_ce(None, gt))
         print(f"\n[{nm}] MERGE-BY-AVERAGE (n={len(res['mono'])}, target = A's c3 opening)")
         _report(res, len(res["mono"]), [
@@ -367,8 +377,11 @@ def probe_merge(raw, tok, model, dev, n_files):
             ("avg4", "mono", "cost of 4-way average (block-2 unit)"),
             ("avg8", "mono", "cost of 8-way average (block-3 unit)"),
             ("avg16", "mono", "cost of 16-way average (block-4 unit)"),
+            ("avg32", "mono", "cost of 32-way average (deep-block unit)"),
+            ("avg64", "mono", "cost of 64-way average (v3 block-3 accumulator)"),
             ("avg2", "reset", "avg2 vs reset (does A survive the merge?)"),
-            ("avg16", "reset", "avg16 vs reset (the cascade floor)")])
+            ("avg16", "reset", "avg16 vs reset (old cascade floor)"),
+            ("avg64", "reset", "avg64 vs reset (fractal cascade floor)")])
 
 
 def probe_order(raw, tok, model, dev, n_files):
