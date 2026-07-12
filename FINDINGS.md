@@ -37,6 +37,155 @@ test this — before scale.
 
 ---
 
+## 2026-07-12 — Life without resets: no-reset learns a boundary heuristic, interleaving learns the filter, and selection is the missing third piece
+
+**TL;DR.** Three regimes for a bank that lives across files, judged by the
+same probe battery (n=48 held-out files, paired). (1) **No-reset chains
+(v2d)**: free on GAP but the read learns a *boundary inference* — "off-topic
+last write ⇒ a new file started" — and a mid-file distractor drops the thread
+*below* empty-bank level (+0.87 vs reset; v2c survives at −0.96). (2)
+**Interleaved training (v2e, "school" regime)**: F ~ U[2,4] files mixed in
+one bank lifetime, same chunk budget. The content filter is acquired — a
+mid-bank distractor costs **nothing** (+0.03/−0.00/+0.01 across 3 seeds, vs
++0.26 for v2c) — with the best specificity measured (+0.91) and GAP at or
+above v2c on all seeds. (3) But when the deferred query is **blank**, v2e
+continues the *last-written* thread, whatever it is (last-distractor cost
++2.40/+2.42/+2.48 — three seeds, remarkable constancy: a trained convention,
+not noise). A new cued probe shows why nothing better could have been
+learned: **thread selection is never exercised** — with any real context the
+bank is barely read (~0.03 nat vs ~1.5–2 in blank mode), and with no context
+recency is the only available policy. The fix in flight (v2f/G2) trains
+*addressed* deferred reads: every write carries a stable synthetic file label,
+and the model must continue a **non-last** thread named by a label or by a
+16-token opening. Zero-shot baseline to beat (v2c): bank value under
+addressed defer −0.8/−0.9 nat but junk/live-thread interference +0.4.
+
+### v2d (no-reset chains): the prediction failed in an instructive way
+
+Resumed v2c for 800 no-reset steps (chains of 4 files, one bank lifetime,
+defer masked at junctions). Dated prediction was "distractor cost collapses".
+Reality (codeparrot, n=48):
+
+| | v2c @400 | v2d @800 |
+|---|---|---|
+| GAP (code/web) | +1.44 / +0.82 | +1.39 / +0.81 |
+| d SPECIFIC | +0.77 | +0.79 |
+| d REGISTER (swap vs reset) | +0.82 | **+0.50** |
+| distractor LAST xdom | +0.60 | **+2.17** |
+| worst case vs reset | **−0.96** (survives) | **+0.87** (below empty) |
+
+The regime is free (GAP, specificity, no eviction cliff) but the read did not
+learn to *filter stale content* — it learned that an off-topic last write
+means the old thread is dead, because in sequential chains that correlation
+is perfect. It also discounts wrong banks harder (REGISTER halved) and is
+better from an empty bank: consistent with "restart detection", not
+selection. The sequential *form* of no-reset is the confound.
+
+### v2e (interleaved / "school" regime): the filter, replicated ×3
+
+One bank lifetime = F ~ U[2,4] files whose chunks are randomly merged
+(within-file order kept; deferred target = same-file successor, carried
+per-seg). Total chunk budget matched to v2c/v2d (m ~ U[2,K] split across
+streams) ⇒ same VRAM/compute, only the *structure* changes. 800 steps from
+v2c final, seeds 0/2/3:
+
+| seed | GAP @800 code/web | MID xdom | LAST xdom | worst vs reset |
+|---|---|---|---|---|
+| 0 | +1.61 / +0.76 | +0.03 (t 0.6) | +2.42 | +0.71 |
+| 2 | +1.97 / +1.13 | −0.00 | +2.48 | +0.48 |
+| 3 | +1.45 / +0.96 | +0.01 | +2.40 | +1.15 |
+
+Everything replicates: mid-bank distractors are **free** (the filter over old
+entries exists), specificity is the highest measured (+0.91), REGISTER is
+restored to v2c level (+0.83), recall-by-lag is at the best measured level
+with still no eviction cliff, and the mature sequential seeds (v2b @2000,
+n=3) put the seed-noise yardstick at ±0.2 on these metrics — the v2e/v2d
+last-distractor numbers are ~10σ out. The +2.4 constancy across seeds is the
+signature of a *learned convention*: in the interleaved regime the blank
+query is genuinely ambiguous (several live threads), and training always
+paired "deferred continuation" with "thread of the last write". v2d
+destroyed the thread (below reset); v2e keeps everything and *selects by
+recency*. Different failure classes: only the second one is repairable by
+giving the query an address.
+
+### The cued probe: selection is never exercised
+
+New probe (`--probes cued`): query = 16 tokens in the window instead of the
+blank. Three cue types — `cont` (a2's tail, target continues it), `id` (a1's
+interior, identifies without continuing), and defer-mode `open`/`lbl` (see
+below). On v2e/v2c/v2d alike: with *any* in-context cue the junk-last cost
+vanishes (+0.004) **but so does the bank's contribution** (clean vs reset
+under cue: −0.025/−0.037/−0.014 nat, vs ~1.5–2 nat in blank mode). The
+pathology is confined to the blank mode — but so is the bank's value. The
+model was only ever trained to read the bank as a *substitute for missing
+context*; given 16 tokens of context it stops consulting it. So
+content-based thread selection was never trained, never needed, and cannot
+be measured zero-shot. (In defer mode with a cue *prefix* the bank IS read —
+v2c zero-shot: bank value −0.82/−0.91 — but selection leaks: junk-last and
+live-thread-last cost +0.37–0.46. That leak is the target.)
+
+### G2 (v2f, running): addressed defers — the mechanism in SFT, the policy in GRPO later
+
+Data-only change on top of v2e: (a) every written chunk is prefixed with its
+file's **stable synthetic label** (`<<FILE:483920>>`, arithmetic hash of the
+opening tokens — not the real path, so addressing is measured without
+semantic leakage; no dataset/domain tier: 2 values would be a domain prior
+and a shortcut, the hierarchy belongs to the pages/strata designs); (b) with
+p=0.5 per conv position, capped at **2 per conv**, an *addressed* defer
+toward a random **non-last** live thread: cue = the thread's label (50%) or
+the raw opening of its last written chunk (50%), target = that chunk's
+successor — ~500 tokens away, so the gist is the only bridge. Loss on blank
+positions only. Division of labor decided up front: SFT creates the
+*mechanism* (dense CE — pure RL on a zero capability has no reward to
+amplify: the dsv4 ignore-bank fixed point), GRPO later learns the *policy*
+(which thread at the white turn, model-chosen labels), reward staying
+task-grounded per the standing note.
+
+Ops post-mortem: the first two farm attempts OOM'd at steps 20–50 on the
+8 GB rigs — each addressed forward holds a full fast-weight-read graph
+(hypernet cost ~independent of sequence length) until the conv's backward;
+p=0.5/seg stacked up to ~8 of them on top of a regime already at 7.2/7.8 GB.
+The cap (addr_max=2, sampled uniformly over eligible positions) brings the
+measured 10-step peak to 6.35 GiB vs 6.19 for v2e. The addr loss was already
+moving before the crash (8.04 → 7.80 by step 50, from the reset level: the
+capability starts at zero, as designed).
+
+### Side results from the same farm wave
+
+- **Seed σ (v2b from scratch, 2000 steps, n=4 so far)**: GAP code
+  +0.51/+0.74/+1.00/+1.36, web +0.81/–/+0.94/+1.00 — inter-seed σ ≈ 0.25+
+  nat on code GAP. Any ablation verdict below ~0.5 nat is seed noise; probe
+  metrics are tighter (last_xdom ±0.15).
+- **Seed-init ablation (idea E) resolved by the eval, not the training**:
+  the zeros-init arm shows "GAP +5.8" — an artifact. Its carried CE is
+  identical to uniform01 and ±1 (7.04 vs 7.00 vs 7.00): the *reset baseline*
+  collapses (CE 12.8) because an all-zeros bank is a degenerate read input,
+  while uniform seeds act as a benign "empty" marker. Init does not change
+  memory quality; it changes the ablation baseline. Compare carried, never
+  GAP, across init arms. The uniform[0,1] "lottery" is acquitted on
+  performance.
+- **mem_dim grid (preliminary, 1 seed, params confounded)**: 512→256→128
+  from scratch: GAP code ~+1.36 → +0.76 → +0.87, web ~+1.00 → +0.81 →
+  +0.93. No capacity cliff down to 128; distractor robustness *improves* at
+  small dims (last_xdom +0.41 → +0.30 → +0.13). 256 vs 128 indistinguishable
+  at seed noise.
+
+### Reproduce
+
+```bash
+# v2e interleaved (seed 0; s2/s3 = configs v2e_s2/v2e_s3)
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2e_interleave.yaml
+# v2f addressed (G2; seed 2 = v2f_addr_s2)
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2f_addr.yaml
+# probe battery incl. the cued probe (any checkpoint)
+PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
+  deepseek_v4_mini/configs/farm/v2e_interleave.yaml \
+  /mnt/tb/checkpoints/farm/v2e_interleave/final.pt \
+  --probes swap,dup,distractor,order,eviction,cued --n-files 48
+```
+
+---
+
 ## 2026-07-10 — GRPO on the write decision: a 384-float policy recovers 75% of always-write for half the writes
 
 **TL;DR.** We trained the *decision to write* with RL (GRPO), leaving the
