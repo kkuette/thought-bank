@@ -554,10 +554,188 @@ def probe_invar(raw, tok, model, dev, n_files):
         _report(res, n, pairs)
 
 
+def probe_capacity(raw, tok, model, dev, n_files):
+    """Capacity/interference curve (350M validation plan, 2026-07-13): N
+    labelled threads written into ONE bank (1 chunk each, N <= max_mem), then
+    label-cued addressed recall of EVERY thread in v2f's trained defer format.
+    recall(N) is the funding-dossier figure: how many co-resident threads
+    before addressed recall degrades? foreign = cueing an UNWRITTEN file's
+    label (should sit at ~reset: no hallucinated address). Only meaningful on
+    addr_label-trained ckpts (v2f+)."""
+    write_seq, defer_ce = _mk_ops(model, tok, dev)
+    from deepseek_v4_mini.code_data import file_label_ids
+    blank_id = tok.convert_tokens_to_ids("<blank>")
+
+    def addr_ce(bank, cue, gt):
+        C = cue.numel()
+        di = torch.cat([cue.unsqueeze(0).to(dev),
+                        torch.full((1, DL), blank_id, dtype=torch.long, device=dev)], 1)
+        with torch.no_grad():
+            lg = model(di, init_mem=bank)["logits"].float()[:, C:]
+        return float(F.cross_entropy(lg.reshape(-1, lg.size(-1)), gt.reshape(-1)))
+
+    Ns = (1, 2, 4, 8)
+    stream = _stream(raw, tok, seed=555)
+    pools = _pools(stream)
+    for si, nm in enumerate(stream.src_names):
+        fs = pools[si]
+        pool_n = min(len(fs), 200)
+        res = {k: [] for k in (*(f"n{N}" for N in Ns), "n8_old", "n8_new",
+                               "foreign", "reset")}
+        for i in range(n_files):
+            group = [fs[(i * 9 + k) % pool_n] for k in range(9)]  # 8 threads + 1 unwritten
+            labs = [file_label_ids(tok, g) for g in group]
+            for N in Ns:
+                bank = write_seq([torch.cat([labs[k], group[k][0]]) for k in range(N)])
+                ces = [addr_ce(bank, labs[k], group[k][1][:DL].unsqueeze(0).to(dev))
+                       for k in range(N)]
+                res[f"n{N}"].append(sum(ces) / N)
+                if N == 8:
+                    res["n8_old"].append(ces[0])
+                    res["n8_new"].append(ces[-1])
+                    res["foreign"].append(addr_ce(bank, labs[8],
+                                          group[8][1][:DL].unsqueeze(0).to(dev)))
+            res["reset"].append(sum(addr_ce(None, labs[k],
+                                    group[k][1][:DL].unsqueeze(0).to(dev))
+                                    for k in range(2)) / 2)
+        print(f"\n[{nm}] CAPACITY/INTERFERENCE (n={len(res['n1'])}, N labelled "
+              f"1-chunk threads in one bank, label-cued recall of each)")
+        _report(res, len(res["n1"]), [
+            ("n1", "reset", "1 thread vs reset (addressed bank value)"),
+            ("n2", "n1", "interference cost at N=2"),
+            ("n4", "n1", "interference cost at N=4"),
+            ("n8", "n1", "interference cost at N=8 (bank full)"),
+            ("n8_old", "n8_new", "oldest vs newest thread at N=8 (recency tilt)"),
+            ("foreign", "reset", "unwritten label vs reset (no hallucinated address)")])
+
+
+def probe_longlife(raw, tok, model, dev, n_files):
+    """Long-life health (350M validation plan, 2026-07-13): no run ever wrote
+    more than ~30 times into one carried bank; the cascade promises thousands.
+    Stream files through ONE never-reset bank; at write-count checkpoints
+    measure slot-norm drift and recall of the two JUST-WRITTEN files (their
+    chunks still inside the 8-slot FIFO window) vs reset. Slow saturation or
+    norm blow-up would be invisible in every previous probe."""
+    think_id = tok.convert_tokens_to_ids("<think>")
+    write_seq, defer_ce = _mk_ops(model, tok, dev)
+    CKPT = (8, 32, 128, 512, 1024)
+    R = max(2, min(12, n_files // 4))   # streams indépendants (n = 2R par ckpt)
+    stream = _stream(raw, tok, seed=444)
+    pools = _pools(stream)
+    for si, nm in enumerate(stream.src_names):
+        fs = pools[si]
+        pool_n = min(len(fs), 400)
+        res = {k: [] for W in CKPT for k in (f"car_{W}", f"res_{W}")}
+        norms = {W: [] for W in CKPT}
+        for rep in range(R):
+            bank, w, fi = None, 0, rep * (pool_n // R)
+            todo = list(CKPT)
+            while todo:
+                f = fs[fi % pool_n]
+                fi += 1
+                for c in (f[0], f[1], f[2]):
+                    x = torch.cat([c.unsqueeze(0).to(dev),
+                                   torch.full((1, 1), think_id, dtype=torch.long, device=dev)], 1)
+                    with torch.no_grad():
+                        bank = model(x, init_mem=bank)["mem_bank"]
+                    w += 1
+                if w >= todo[0]:
+                    W = todo.pop(0)
+                    norms[W].append(float(bank.norm(dim=-1).mean()))
+                    for g in (f, fs[(fi - 2) % pool_n]):
+                        gt = g[3][:DL].unsqueeze(0).to(dev)
+                        res[f"car_{W}"].append(defer_ce(bank, gt))
+                        res[f"res_{W}"].append(defer_ce(None, gt))
+        n = len(res[f"car_{CKPT[0]}"])
+        print(f"\n[{nm}] LONG LIFE (R={R} carried streams, recall of in-window "
+              f"files at write checkpoints; n={n} per ckpt)")
+        for W in CKPT:
+            print(f"    slot-norm mean @W={W}: {sum(norms[W]) / len(norms[W]):.3f}")
+        _report(res, n, [
+            (f"car_{W}", f"res_{W}", f"carried vs reset @ {W} writes") for W in CKPT])
+
+
+def probe_page(raw, tok, model, dev, n_files):
+    """v3 verdict d'émergence (option 1, décision user 2026-07-13) : le read des
+    couches page (entraîné SANS reach-back supervisé) tire-t-il du signal de la
+    page ? Reconstruit la cascade à l'inférence EXACTEMENT comme le trainer
+    (capture FIFO du slot évincé, seeds sautés), écrit 8 fichiers (24 chunks) —
+    les premiers ne vivent plus QUE dans la page — puis defer sur la cible d'un
+    fichier ANCIEN (reach-back) et d'un fichier RÉCENT, page réelle vs page
+    ablatée (None). Ne juge que les ckpts cascade-entraînés (cascade_depth>0)."""
+    from deepseek_v4_mini.cascade import CascadeMemory
+    t = raw.get("training", raw.get("train", {}))
+    depth = int(t.get("cascade_depth", 1) or 1)
+    cmap = t.get("cascade_map")
+    cmap = ([int(v) for v in cmap] if cmap else
+            [0] * (model.cfg.n_layers - depth) + list(range(1, depth + 1)))
+    think_id = tok.convert_tokens_to_ids("<think>")
+    blank_id = tok.convert_tokens_to_ids("<blank>")
+    seed_slots = int(getattr(model.cfg, "mem_seed_slots", model.cfg.max_mem))
+    max_mem = int(model.cfg.max_mem)
+    dt = next(model.parameters()).dtype
+
+    def write_casc(files):
+        bank = model.thought_stream.seed_bank(1, dev, dt)
+        casc, nev = CascadeMemory(depth, max_mem), 0
+        for f in files:
+            for c in (f[0], f[1], f[2]):
+                x = torch.cat([c.unsqueeze(0).to(dev),
+                               torch.full((1, 1), think_id, dtype=torch.long, device=dev)], 1)
+                pre0 = bank[:, 0].detach() if bank.size(1) >= max_mem else None
+                with torch.no_grad():
+                    bank = model(x, init_mem=bank,
+                                 layer_banks=casc.layer_banks(bank, cmap))["mem_bank"]
+                if pre0 is not None:
+                    nev += 1
+                    if nev > seed_slots:
+                        casc.push_slot(pre0)
+        return bank, casc
+
+    def page_defer(bank, casc, gt, ablate):
+        lb = casc.layer_banks(bank, cmap)
+        if ablate:
+            lb = [bank if lvl == 0 else None for lvl in cmap]
+        di = torch.full((1, DL), blank_id, dtype=torch.long, device=dev)
+        with torch.no_grad():
+            lg = model(di, init_mem=bank, layer_banks=lb)["logits"].float()
+        return float(F.cross_entropy(lg.reshape(-1, lg.size(-1)), gt.reshape(-1)))
+
+    stream = _stream(raw, tok, seed=333)
+    pools = _pools(stream)
+    for si, nm in enumerate(stream.src_names):
+        fs = pools[si]
+        pool_n = min(len(fs), 200)
+        res = {k: [] for k in ("early_on", "early_off", "early_reset",
+                               "recent_on", "recent_off")}
+        for i in range(n_files):
+            grp = [fs[(i * 8 + k) % pool_n] for k in range(8)]
+            bank, casc = write_casc(grp)
+            gt_e = grp[0][3][:DL].unsqueeze(0).to(dev)   # fichier 0 : page seulement
+            gt_r = grp[-1][3][:DL].unsqueeze(0).to(dev)  # fichier 7 : banque vive
+            res["early_on"].append(page_defer(bank, casc, gt_e, False))
+            res["early_off"].append(page_defer(bank, casc, gt_e, True))
+            di = torch.full((1, DL), blank_id, dtype=torch.long, device=dev)
+            with torch.no_grad():
+                lg = model(di, init_mem=None)["logits"].float()
+            res["early_reset"].append(float(F.cross_entropy(
+                lg.reshape(-1, lg.size(-1)), gt_e.reshape(-1))))
+            res["recent_on"].append(page_defer(bank, casc, gt_r, False))
+            res["recent_off"].append(page_defer(bank, casc, gt_r, True))
+        print(f"\n[{nm}] PAGE ABLATION (n={n_files}, 8 fichiers écrits, cible "
+              f"early = fichier 0 évincé de la banque vive, map {cmap})")
+        _report(res, n_files, [
+            ("early_on", "early_off", "EMERGENCE: page réelle vs ablatée (cible paginée)"),
+            ("early_on", "early_reset", "reach-back vs reset (la page vaut-elle qqch ?)"),
+            ("recent_on", "recent_off", "coût de la page sur le récent (doit être ~0)")])
+
+
 PROBES = {"swap": probe_swap, "dup": probe_dup, "distractor": probe_distractor,
           "order": probe_order, "eviction": probe_eviction,
           "cohab": probe_cohab, "reflect": probe_reflect, "invar": probe_invar,
-          "cued": probe_cued, "merge": probe_merge}
+          "cued": probe_cued, "merge": probe_merge,
+          "capacity": probe_capacity, "longlife": probe_longlife,
+          "page": probe_page}
 
 
 def main():

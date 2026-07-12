@@ -32,6 +32,7 @@ from .config import ThoughtBankConfig
 from .model import ThoughtBankLM
 from .train import Muon, _split_muon_params
 from .code_data import CodeChunkStream
+from .cascade import CascadeMemory
 
 
 def _fill(x_ref, tok_id, width):
@@ -43,11 +44,11 @@ def _append(x, tok_id):
     return torch.cat([x, _fill(x, tok_id, 1)], dim=1)
 
 
-def _ic_loss(model, xt, bank, balw, amp):
+def _ic_loss(model, xt, bank, balw, amp, layer_banks=None):
     """In-context next-token CE on xt (=[chunk, <think>]) + MoE balance. Returns
     (loss, new_bank, ce_detached)."""
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-        o = model(xt, init_mem=bank)
+        o = model(xt, init_mem=bank, layer_banks=layer_banks)
     lg = o["logits"].float()
     ce = F.cross_entropy(lg[:, :-1].reshape(-1, lg.size(-1)), xt[:, 1:].reshape(-1))
     loss = ce + balw * o["balance_loss"].float()
@@ -300,6 +301,22 @@ def main(cfg_path: str, resume: bool = False) -> None:
     #                                         read graph held until backward (8 GB!)
     if addr_prob > 0 or addr_label:
         assert ilv_on, "addr_prob/addr_label require interleave_files (multi-thread bank)"
+    # Cascade v3 (spec user 2026-07-12, débordement en 2 temps × fractale max_mem) :
+    # cascade_depth = nombre de niveaux au-dessus de la banque vive (0 = off,
+    # 1 = v3-lite page, 4 = complet). cascade_map[i] = niveau lu par la couche i
+    # (0 = banque vive) ; défaut : les `depth` dernières couches lisent 1..depth.
+    cascade_depth = int(t.get("cascade_depth", 0) or 0)
+    cascade_map = None
+    if cascade_depth > 0:
+        _cmap = t.get("cascade_map")
+        cascade_map = ([int(v) for v in _cmap] if _cmap else
+                       [0] * (cfg.n_layers - cascade_depth)
+                       + list(range(1, cascade_depth + 1)))
+        assert len(cascade_map) == cfg.n_layers and max(cascade_map) <= cascade_depth
+        assert not bool(getattr(cfg, "mem_write_gate_merge", False)), \
+            "cascade: gate_merge réordonne les slots, la capture d'éviction suppose FIFO pur"
+        assert train_stream.B == 1, "cascade v1 = mode ragged batch=1 (alignement conv)"
+        _seed_slots = int(getattr(cfg, "mem_seed_slots", cfg.max_mem))
     lam = float(t.get("defer_weight", 1.0))
     wsd = bool(t.get("wsd_decay", True)); wsd_floor = float(t.get("wsd_floor", 0.0))
     decay_start = int(t.get("wsd_decay_start", int(steps * 0.66)))
@@ -397,6 +414,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
         # between them) summed into one optimizer step => effective batch = G files,
         # variance reduced without padding/GPU-batching the ragged chunks.
         bank_carry = None
+        casc_carry, nev_carry = None, 0
         for _g in range(grad_accum):
             segs = (train_stream.next_conv_batch(defer_len) if train_stream.B > 1
                     else train_stream.next_conv_interleaved(
@@ -405,13 +423,31 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     if ilv_on else train_stream.next_conv())
             if no_reset_files > 1 and _g % no_reset_files != 0:
                 bank = bank_carry                     # dirty start: previous file's gists
+                casc, n_evict = casc_carry, nev_carry
             else:
                 bank = None
+                casc = CascadeMemory(cascade_depth, cfg.max_mem) if cascade_depth else None
+                n_evict = 0
             total = 0.0
             for i, s in enumerate(segs):
                 x = s["input_ids"].to(device)
                 xt = _append(x, think_id)
-                loss, bank, ce = _ic_loss(model, xt, bank, balw, amp)
+                if casc is not None and bank is None:
+                    # seed explicite : les niveaux profonds lisent None (vide),
+                    # jamais la banque vive par accident au premier chunk
+                    bank = model.thought_stream.seed_bank(
+                        x.size(0), device, next(model.parameters()).dtype)
+                # capture d'éviction AVANT le write : FIFO pur => le slot 0 de la
+                # banque pleine est celui qui déborde vers la page (grain slot,
+                # spec « débordement en 2 temps » — les seeds ne descendent pas)
+                pre0 = (bank[:, 0].detach()
+                        if casc is not None and bank.size(1) >= cfg.max_mem else None)
+                lb = casc.layer_banks(bank, cascade_map) if casc is not None else None
+                loss, bank, ce = _ic_loss(model, xt, bank, balw, amp, lb)
+                if pre0 is not None:
+                    n_evict += 1
+                    if n_evict > _seed_slots:
+                        casc.push_slot(pre0)
                 total = total + loss; ic_v += ce; ic_cnt += 1
                 # deferred target: batched segs carry their own defer_tgt (incl. the
                 # LAST turn's external successor, -100-padded); batch=1 derives it
@@ -435,7 +471,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         bank = torch.cat([bank[:, :-1], blended], dim=1)
                     di = _fill(x, blank_id, dl)
                     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-                        od = model(di, init_mem=bank)
+                        od = model(di, init_mem=bank,
+                                   layer_banks=casc.layer_banks(bank, cascade_map)
+                                   if casc is not None else None)
                     lg = od["logits"].float()
                     dloss = F.cross_entropy(lg.reshape(-1, lg.size(-1)), nxt.reshape(-1),
                                             ignore_index=-100)
@@ -448,7 +486,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     ac, at = ac.to(device), at.to(device)
                     di = torch.cat([ac, _fill(ac, blank_id, at.size(1))], dim=1)
                     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-                        oa = model(di, init_mem=bank)
+                        oa = model(di, init_mem=bank,
+                                   layer_banks=casc.layer_banks(bank, cascade_map)
+                                   if casc is not None else None)
                     lga = oa["logits"].float()[:, ac.size(1):]
                     aloss = F.cross_entropy(lga.reshape(-1, lga.size(-1)),
                                             at.reshape(-1), ignore_index=-100)
@@ -459,6 +499,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
             if no_reset_files > 1:
                 # graph freed per file; the carried bank is data, not gradient path
                 bank_carry = bank.detach() if bank is not None else None
+                casc_carry, nev_carry = casc, n_evict
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(t.get("grad_clip", 1.0)))
         opt.step()
         ic_v /= max(ic_cnt, 1); d_v /= max(d_cnt, 1)
@@ -483,6 +524,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 if distill_n:
                     writer.add_scalar("train/distill", distill_v / distill_n, step)
         if step % eval_every == 0 or step == steps:
+            if cascade_depth and casc is not None:
+                print(f"[cascade @{step}] {casc.stats()} (dernière conv du step)")
             for src_name, es in eval_views:
                 tag = f" [{src_name}]" if src_name else ""
                 pfx = f"{src_name}/" if src_name else ""
