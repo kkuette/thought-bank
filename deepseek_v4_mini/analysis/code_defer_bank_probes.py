@@ -238,7 +238,7 @@ def probe_cued(raw, tok, model, dev, n_files):
     CUE = 16
 
     def cued_ce(bank, cue, gt):
-        di = torch.cat([cue.unsqueeze(0), gt], dim=1).to(dev)   # [1, CUE+DL]
+        di = torch.cat([cue.unsqueeze(0).to(dev), gt], dim=1)   # [1, CUE+DL]
         with torch.no_grad():
             lg = model(di, init_mem=bank)["logits"].float()
         # standard shift: logits at CUE-1 .. CUE+DL-2 predict gt[0..DL-1]
@@ -246,34 +246,48 @@ def probe_cued(raw, tok, model, dev, n_files):
         return float(F.cross_entropy(pred.reshape(-1, pred.size(-1)),
                                      gt.reshape(-1)))
 
+    # Two cue types, two questions:
+    #   cont  = last CUE tokens of a2 (target continues it) — usage realism.
+    #     Finding on v2e: local context makes the bank marginal (~0.016 nat),
+    #     so junk costs nothing but nothing is proven about SELECTION.
+    #   id    = CUE tokens from a1's interior (identifies the thread, target is
+    #     NOT its continuation) — the bank must supply the content; clean_id vs
+    #     reset_id shows whether the read is used, junk/thread_id whether the
+    #     selection survives a foreign LAST write.
     stream = _stream(raw, tok, seed=888)
     pools = _pools(stream)
     for si, nm in enumerate(stream.src_names):
         fs, other = pools[si], pools[1 - si] if len(pools) > 1 else pools[si]
-        res = {k: [] for k in ("clean_blank", "junk_blank", "clean_cued",
-                               "junk_cued", "thread_cued", "reset_cued")}
+        res = {k: [] for k in ("clean_blank", "junk_blank",
+                               "clean_cont", "junk_cont", "thread_cont", "reset_cont",
+                               "clean_id", "junk_id", "thread_id", "reset_id")}
         for i, f in enumerate(fs[:n_files]):
             B = fs[(i + 2) % min(len(fs), 200)]
             Dx = other[i % min(len(other), 200)][0]
             a0, a1, a2 = f[0], f[1], f[2]
             gt = f[3][:DL].unsqueeze(0).to(dev)
-            cue = a2[-CUE:]
+            cue_cont = a2[-CUE:]
+            mid = max(0, a1.numel() // 2 - CUE // 2)
+            cue_id = a1[mid:mid + CUE]
             bank_clean = write_seq([a0, a1, a2])
             bank_junk = write_seq([a0, a1, a2, Dx])
             bank_thread = write_seq([a0, a1, a2, B[0], B[1]])
             res["clean_blank"].append(defer_ce(bank_clean, gt))
             res["junk_blank"].append(defer_ce(bank_junk, gt))
-            res["clean_cued"].append(cued_ce(bank_clean, cue, gt))
-            res["junk_cued"].append(cued_ce(bank_junk, cue, gt))
-            res["thread_cued"].append(cued_ce(bank_thread, cue, gt))
-            res["reset_cued"].append(cued_ce(None, cue, gt))
+            for tag, cue in (("cont", cue_cont), ("id", cue_id)):
+                res[f"clean_{tag}"].append(cued_ce(bank_clean, cue, gt))
+                res[f"junk_{tag}"].append(cued_ce(bank_junk, cue, gt))
+                res[f"thread_{tag}"].append(cued_ce(bank_thread, cue, gt))
+                res[f"reset_{tag}"].append(cued_ce(None, cue, gt))
         print(f"\n[{nm}] CUED thread selection (n={len(res['clean_blank'])}, "
-              f"target = A's c3 opening, cue = last {CUE} tokens of a2)")
+              f"target = A's c3 opening, cont = a2 tail / id = a1 interior, {CUE} tokens)")
         _report(res, len(res["clean_blank"]), [
             ("junk_blank", "clean_blank", "JUNK-LAST cost, blank query (recency trap)"),
-            ("junk_cued", "clean_cued", "JUNK-LAST cost, cued query (cue rescue?)"),
-            ("thread_cued", "clean_cued", "LIVE-THREAD-LAST cost, cued query"),
-            ("junk_cued", "reset_cued", "cued worst case vs cued reset (thread survives?)")])
+            ("junk_cont", "clean_cont", "JUNK-LAST cost, cont-cued (usage realism)"),
+            ("clean_id", "reset_id", "BANK VALUE under id-cue (read used at all?)"),
+            ("junk_id", "clean_id", "JUNK-LAST cost, id-cued (selection survives?)"),
+            ("thread_id", "clean_id", "LIVE-THREAD-LAST cost, id-cued"),
+            ("junk_id", "reset_id", "id-cued worst case vs id-cued reset")])
 
 
 def probe_order(raw, tok, model, dev, n_files):
