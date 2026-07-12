@@ -1,0 +1,97 @@
+# v2f — G2 : defer ADRESSÉ sur régime entrelacé (user 2026-07-12).
+# v2e a le filtre (MID nul) mais la sélection de fil n'est jamais exercée :
+# requête vide => récence ; avec contexte => banque plus lue (~0.03 nat).
+# G2 la crée : chaque chunk écrit porte son label synthétique stable
+# (<<FILE:xxxxxx>>, hash arithmétique — pas le vrai chemin, zéro fuite
+# sémantique) ; après un seg, p=0.5 d'un defer ADRESSÉ vers un fil NON-dernier
+# (indice = label 50% / ouverture du dernier chunk du fil 50%, cible = son
+# successeur ~500 tokens plus loin => le gist est le seul pont).
+# {dataset} exclu du label (2 valeurs = prior domaine, raccourci) — l'étage
+# domaine attend une structure hiérarchique (pages/strates).
+# Départ v2c final, 800 steps, budget apparié v2e => la diff probes isole
+# l'adressage. Verdict : probe cued conditions open/lbl (BANK VALUE >> 0.03,
+# junk/thread-last ~0) + GAP standard >= v2e ; puis GRPO phase 2 = politique
+# (quel fil au tour blanc, labels choisis par le modèle).
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  cache_dir: /mnt/tb/data_cache
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 8
+  amp: true
+  init_from: /mnt/tb/checkpoints/code_defer_native_v2c_varlen/final.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 20
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  log_every: 10
+  eval_every: 100
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  save_every: 400
+  save_dir: /mnt/tb/checkpoints/farm/v2f_addr
+  metrics_file: /mnt/tb/runs/farm_v2f_addr/metrics.jsonl
+  interleave_files:
+  - 2
+  - 4
+  addr_prob: 0.5
+  addr_label: true
+teacher:
+  enabled: false

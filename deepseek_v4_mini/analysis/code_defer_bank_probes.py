@@ -238,13 +238,27 @@ def probe_cued(raw, tok, model, dev, n_files):
     CUE = 16
 
     def cued_ce(bank, cue, gt):
-        di = torch.cat([cue.unsqueeze(0).to(dev), gt], dim=1)   # [1, CUE+DL]
+        C = cue.numel()                                     # cue length may vary (labels)
+        di = torch.cat([cue.unsqueeze(0).to(dev), gt], dim=1)   # [1, C+DL]
         with torch.no_grad():
             lg = model(di, init_mem=bank)["logits"].float()
-        # standard shift: logits at CUE-1 .. CUE+DL-2 predict gt[0..DL-1]
-        pred = lg[:, CUE - 1:CUE + DL - 1]
+        # standard shift: logits at C-1 .. C+DL-2 predict gt[0..DL-1]
+        pred = lg[:, C - 1:C + DL - 1]
         return float(F.cross_entropy(pred.reshape(-1, pred.size(-1)),
                                      gt.reshape(-1)))
+
+    blank_id = tok.convert_tokens_to_ids("<blank>")
+
+    def addr_ce(bank, cue, gt):
+        """G2's TRAINED format: [cue, <blank>*DL], loss at blank positions
+        (blank C+i predicts gt[i]) — the defer mode, where the bank is the
+        only bridge; cued_ce's teacher-forced IC mode is NOT this mode."""
+        C = cue.numel()
+        di = torch.cat([cue.unsqueeze(0).to(dev),
+                        torch.full((1, DL), blank_id, dtype=torch.long, device=dev)], 1)
+        with torch.no_grad():
+            lg = model(di, init_mem=bank)["logits"].float()[:, C:]
+        return float(F.cross_entropy(lg.reshape(-1, lg.size(-1)), gt.reshape(-1)))
 
     # Two cue types, two questions:
     #   cont  = last CUE tokens of a2 (target continues it) — usage realism.
@@ -254,13 +268,20 @@ def probe_cued(raw, tok, model, dev, n_files):
     #     NOT its continuation) — the bank must supply the content; clean_id vs
     #     reset_id shows whether the read is used, junk/thread_id whether the
     #     selection survives a foreign LAST write.
+    # lbl = G2 addressing (2026-07-12): banks written with each chunk PREFIXED by
+    # its file's stable synthetic label (code_data.file_label_ids), query = A's
+    # label. Only meaningful on addr_label-trained ckpts; earlier ckpts serve as
+    # the untrained control (labelled writes are mildly OOD for them).
+    from deepseek_v4_mini.code_data import file_label_ids
     stream = _stream(raw, tok, seed=888)
     pools = _pools(stream)
     for si, nm in enumerate(stream.src_names):
         fs, other = pools[si], pools[1 - si] if len(pools) > 1 else pools[si]
         res = {k: [] for k in ("clean_blank", "junk_blank",
                                "clean_cont", "junk_cont", "thread_cont", "reset_cont",
-                               "clean_id", "junk_id", "thread_id", "reset_id")}
+                               "clean_id", "junk_id", "thread_id", "reset_id",
+                               "clean_open", "junk_open", "thread_open", "reset_open",
+                               "clean_lbl", "junk_lbl", "thread_lbl", "reset_lbl")}
         for i, f in enumerate(fs[:n_files]):
             B = fs[(i + 2) % min(len(fs), 200)]
             Dx = other[i % min(len(other), 200)][0]
@@ -279,15 +300,39 @@ def probe_cued(raw, tok, model, dev, n_files):
                 res[f"junk_{tag}"].append(cued_ce(bank_junk, cue, gt))
                 res[f"thread_{tag}"].append(cued_ce(bank_thread, cue, gt))
                 res[f"reset_{tag}"].append(cued_ce(None, cue, gt))
+            # open = G2's semantic-address task VERBATIM: cue = a2's opening,
+            # target = c3's opening, defer mode — unlabelled banks
+            cue_open = a2[:CUE]
+            res["clean_open"].append(addr_ce(bank_clean, cue_open, gt))
+            res["junk_open"].append(addr_ce(bank_junk, cue_open, gt))
+            res["thread_open"].append(addr_ce(bank_thread, cue_open, gt))
+            res["reset_open"].append(addr_ce(None, cue_open, gt))
+            # labelled writes + label query, defer mode
+            la, lb_, lx = (file_label_ids(tok, x) for x in (f, B, [Dx]))
+            L = lambda lab, c: torch.cat([lab, c])
+            bank_clean_l = write_seq([L(la, a0), L(la, a1), L(la, a2)])
+            bank_junk_l = write_seq([L(la, a0), L(la, a1), L(la, a2), L(lx, Dx)])
+            bank_thread_l = write_seq([L(la, a0), L(la, a1), L(la, a2),
+                                       L(lb_, B[0]), L(lb_, B[1])])
+            res["clean_lbl"].append(addr_ce(bank_clean_l, la, gt))
+            res["junk_lbl"].append(addr_ce(bank_junk_l, la, gt))
+            res["thread_lbl"].append(addr_ce(bank_thread_l, la, gt))
+            res["reset_lbl"].append(addr_ce(None, la, gt))
         print(f"\n[{nm}] CUED thread selection (n={len(res['clean_blank'])}, "
-              f"target = A's c3 opening, cont = a2 tail / id = a1 interior, {CUE} tokens)")
+              f"target = A's c3 opening, cont = a2 tail / id = a1 interior / "
+              f"lbl = file label, {CUE} tokens)")
         _report(res, len(res["clean_blank"]), [
             ("junk_blank", "clean_blank", "JUNK-LAST cost, blank query (recency trap)"),
             ("junk_cont", "clean_cont", "JUNK-LAST cost, cont-cued (usage realism)"),
             ("clean_id", "reset_id", "BANK VALUE under id-cue (read used at all?)"),
             ("junk_id", "clean_id", "JUNK-LAST cost, id-cued (selection survives?)"),
             ("thread_id", "clean_id", "LIVE-THREAD-LAST cost, id-cued"),
-            ("junk_id", "reset_id", "id-cued worst case vs id-cued reset")])
+            ("clean_open", "reset_open", "BANK VALUE, open-cue defer (G2 semantic task)"),
+            ("junk_open", "clean_open", "JUNK-LAST cost, open-cue defer"),
+            ("thread_open", "clean_open", "LIVE-THREAD-LAST cost, open-cue defer"),
+            ("clean_lbl", "reset_lbl", "BANK VALUE, label-cue defer (G2 addressing)"),
+            ("junk_lbl", "clean_lbl", "JUNK-LAST cost, label-cued"),
+            ("thread_lbl", "clean_lbl", "LIVE-THREAD-LAST cost, label-cued")])
 
 
 def probe_order(raw, tok, model, dev, n_files):

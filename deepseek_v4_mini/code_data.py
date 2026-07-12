@@ -133,6 +133,17 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
     return files
 
 
+def file_label_ids(tok, f, n_digits=6):
+    """Stable synthetic address for a file (idea G2, 2026-07-12): a determinist
+    arithmetic hash of its opening tokens rendered as '<<FILE:483920>>' token
+    ids. Same file => same label across convs, processes and probes; synthetic
+    (not the real path) so addressing is measured without semantic leakage."""
+    ts = f[0][:16].tolist()
+    h = sum((i + 1) * int(t) for i, t in enumerate(ts)) % 10 ** n_digits
+    return torch.tensor(tok(f"<<FILE:{h:0{n_digits}d}>>")["input_ids"],
+                        dtype=torch.long)
+
+
 class CodeChunkStream:
     def __init__(self, tokenizer, *, seq_len: int = 2048, chunks_per_conv: int = 3,
                  batch: int = 1, n_files: int = 800, split: str = "train",
@@ -314,7 +325,9 @@ class CodeChunkStream:
                          "defer_tgt": tgt})
         return segs
 
-    def next_conv_interleaved(self, n_streams: int, defer_len: int = 16) -> list[dict]:
+    def next_conv_interleaved(self, n_streams: int, defer_len: int = 16,
+                              label: bool = False, addr_prob: float = 0.0,
+                              addr_cue_len: int = 16) -> list[dict]:
         """Idea G (2026-07-11): ONE bank lifetime holds n_streams files whose chunks
         are randomly interleaved (within-file order preserved) — school-style spaced
         practice instead of sequential no-reset chains. The total chunk budget matches
@@ -326,7 +339,18 @@ class CodeChunkStream:
         read must select by content, not by a recency/boundary heuristic.
         n_streams: int = fixed F; (lo, hi) = F ~ U[lo, hi] SAMPLED per conv (like
         depth): some convs are 2 deep subjects, some are hi brief ones. F is then
-        capped by m_total, so shallow convs stay naturally less fragmented."""
+        capped by m_total, so shallow convs stay naturally less fragmented.
+
+        G2 extensions (2026-07-12, both OFF by default):
+          label      prepend the file's stable synthetic address (file_label_ids)
+                     to every chunk at WRITE time — the gist must encode it.
+          addr_prob  after a seg, with this probability attach an ADDRESSED defer
+                     toward a random OTHER live stream: cue = that stream's label
+                     (50%) or the raw opening of its last written chunk (50%),
+                     target = its next chunk's opening. The cue identifies the
+                     thread but sits ~a chunk away from the target, so the gist
+                     is the only bridge — trains content/label-addressed reads
+                     that the blank defer (recency convention) never exercises."""
         assert self.B == 1, "interleave: ragged variable-depth streams require batch=1"
         dl = int(defer_len)
         m_total = self.rng.randint(2, self.K)
@@ -336,25 +360,50 @@ class CodeChunkStream:
         cuts = sorted(self.rng.sample(range(1, m_total), F - 1)) if F > 1 else []
         parts = [b - a for a, b in zip([0] + cuts, cuts + [m_total])]
         streams: list[list[dict]] = []
+        files: list[list[torch.Tensor]] = []
+        lbl_ids: list[torch.Tensor | None] = []
         for m in parts:
             f = self._pick_file()
             if self.var_chunk:
                 f = self._reslice(f)
             m = min(m, len(f))
             st = self.rng.randrange(0, len(f) - m + 1)
+            lb = file_label_ids(self.tok, f) if label else None
             q = []
             for j in range(st, st + m):
                 ids = f[j].unsqueeze(0)                     # [1, Lj]
+                if lb is not None:                          # write carries its address
+                    ids = torch.cat([lb.unsqueeze(0), ids], dim=1)
                 tgt = torch.full((1, dl), -100, dtype=torch.long)
                 if j + 1 < len(f):                          # same-file successor
                     nx = f[j + 1][:dl]                      # (ragged tail ok)
                     tgt[0, :nx.numel()] = nx
                 q.append({"input_ids": ids, "attention_mask": torch.ones_like(ids),
-                          "defer_tgt": tgt})
-            streams.append(q)
-        labels = [i for i, q in enumerate(streams) for _ in q]
-        self.rng.shuffle(labels)                            # uniform random merge
-        return [streams[i].pop(0) for i in labels]
+                          "defer_tgt": tgt, "_j": j})
+            streams.append(q); files.append(f); lbl_ids.append(lb)
+        order = [i for i, q in enumerate(streams) for _ in q]
+        self.rng.shuffle(order)                             # uniform random merge
+        segs, last_j = [], {}                               # sid -> last written j
+        for sid in order:
+            seg = streams[sid].pop(0)
+            last_j[sid] = seg.pop("_j")
+            # addressed defer toward a random OTHER live stream with a successor
+            cands = [s for s, j in last_j.items()
+                     if s != sid and j + 1 < len(files[s])]
+            if cands and addr_prob > 0 and self.rng.random() < addr_prob:
+                t = self.rng.choice(cands)
+                f_t, j_t = files[t], last_j[t]
+                if lbl_ids[t] is not None and self.rng.random() < 0.5:
+                    cue = lbl_ids[t]                        # explicit address
+                else:
+                    cue = f_t[j_t][:addr_cue_len]           # semantic address (raw)
+                at = torch.full((1, dl), -100, dtype=torch.long)
+                nx = f_t[j_t + 1][:dl]
+                at[0, :nx.numel()] = nx
+                seg["addr_cue"] = cue.unsqueeze(0)
+                seg["addr_tgt"] = at
+            segs.append(seg)
+        return segs
 
     def _pick_source(self) -> int:
         if len(self.src_files) == 1:

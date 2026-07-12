@@ -286,6 +286,13 @@ def main(cfg_path: str, resume: bool = False) -> None:
     if ilv_on:
         assert int(d["batch_size"]) == 1, "interleave_files requires batch_size 1 (ragged mode)"
         assert no_reset_files == 1, "interleave_files and no_reset_files are exclusive arms"
+    # G2 (2026-07-12): addressed defers — cue (file label 50% / raw chunk opening
+    # 50%) + blanks toward a NON-last live stream; trains the content/label-
+    # addressed read that the blank defer's recency convention never exercises.
+    addr_prob = float(t.get("addr_prob", 0.0))
+    addr_label = bool(t.get("addr_label", False))
+    if addr_prob > 0 or addr_label:
+        assert ilv_on, "addr_prob/addr_label require interleave_files (multi-thread bank)"
     lam = float(t.get("defer_weight", 1.0))
     wsd = bool(t.get("wsd_decay", True)); wsd_floor = float(t.get("wsd_floor", 0.0))
     decay_start = int(t.get("wsd_decay_start", int(steps * 0.66)))
@@ -343,7 +350,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     "rng_eval_stream": eval_stream.rng.getstate()}, tmp)
         os.replace(tmp, path)                        # atomic: no torn file on preemption
 
-    start_step = 0; ema_ic = ema_d = None
+    start_step = 0; ema_ic = ema_d = ema_a = None
     if resume:
         import glob, re
         cks = {}
@@ -378,14 +385,16 @@ def main(cfg_path: str, resume: bool = False) -> None:
     for step in range(start_step + 1, steps + 1):
         lr_now = set_lr(step)
         opt.zero_grad(set_to_none=True)
-        ic_v = d_v = 0.0; ic_cnt = d_cnt = 0; distill_v = 0.0; distill_n = 0
+        ic_v = d_v = a_v = 0.0; ic_cnt = d_cnt = a_cnt = 0; distill_v = 0.0; distill_n = 0
         # gradient accumulation: G independent conversations (batch=1 each, bank reset
         # between them) summed into one optimizer step => effective batch = G files,
         # variance reduced without padding/GPU-batching the ragged chunks.
         bank_carry = None
         for _g in range(grad_accum):
             segs = (train_stream.next_conv_batch(defer_len) if train_stream.B > 1
-                    else train_stream.next_conv_interleaved(interleave_files, defer_len)
+                    else train_stream.next_conv_interleaved(
+                        interleave_files, defer_len,
+                        label=addr_label, addr_prob=addr_prob)
                     if ilv_on else train_stream.next_conv())
             if no_reset_files > 1 and _g % no_reset_files != 0:
                 bank = bank_carry                     # dirty start: previous file's gists
@@ -425,6 +434,20 @@ def main(cfg_path: str, resume: bool = False) -> None:
                                             ignore_index=-100)
                     total = total + lam * dloss; d_v += float(dloss.detach()); d_cnt += 1
                     # deferred forward's own write is discarded (do NOT carry od bank)
+                # G2 addressed defer: [cue, blanks] toward a NON-last stream; loss
+                # only on the blank positions (cue is context, not supervision)
+                ac, at = s.get("addr_cue"), s.get("addr_tgt")
+                if ac is not None and bool((at != -100).any()):
+                    ac, at = ac.to(device), at.to(device)
+                    di = torch.cat([ac, _fill(ac, blank_id, at.size(1))], dim=1)
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+                        oa = model(di, init_mem=bank)
+                    lga = oa["logits"].float()[:, ac.size(1):]
+                    aloss = F.cross_entropy(lga.reshape(-1, lga.size(-1)),
+                                            at.reshape(-1), ignore_index=-100)
+                    total = total + lam * aloss
+                    a_v += float(aloss.detach()); a_cnt += 1
+                    # addressed forward's write is discarded too
             (total / grad_accum).backward()          # mean over the G accumulated convs
             if no_reset_files > 1:
                 # graph freed per file; the carried bank is data, not gradient path
@@ -434,14 +457,20 @@ def main(cfg_path: str, resume: bool = False) -> None:
         ic_v /= max(ic_cnt, 1); d_v /= max(d_cnt, 1)
         ema_ic = ic_v if ema_ic is None else 0.95 * ema_ic + 0.05 * ic_v
         ema_d  = d_v  if ema_d  is None else 0.95 * ema_d  + 0.05 * d_v
+        if a_cnt:
+            a_v /= a_cnt
+            ema_a = a_v if ema_a is None else 0.95 * ema_a + 0.05 * a_v
         if step % log_every == 0:
+            addr_s = f"addr {ema_a:.3f}  " if ema_a is not None else ""
             print(f"step {step:5d}  ic {ema_ic:.3f} (ppl {math.exp(ema_ic):.1f})  defer {ema_d:.3f}  "
-                  f"β {_beta(step):.2f}  lr {lr_now:.2e}  "
+                  f"{addr_s}β {_beta(step):.2f}  lr {lr_now:.2e}  "
                   f"{(time.time()-t0)/max(step - start_step, 1):.2f}s/step", flush=True)
             if writer is not None:
                 writer.add_scalar("train/ic_loss", ema_ic, step)
                 writer.add_scalar("train/ic_ppl", math.exp(ema_ic), step)
                 writer.add_scalar("train/defer_loss", ema_d, step)
+                if ema_a is not None:
+                    writer.add_scalar("train/addr_loss", ema_a, step)
                 writer.add_scalar("sched/lr", lr_now, step)
                 writer.add_scalar("sched/beta", _beta(step), step)
                 if distill_n:
