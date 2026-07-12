@@ -37,6 +37,61 @@ test this — before scale.
 
 ---
 
+## 2026-07-12 — Merge-by-average: the tensor-cascade brick costs almost nothing at read time
+
+**TL;DR.** The v3 memory design under consideration is a tensor cascade
+across blocks: the bank matrix, once full, is demoted into a stack of
+matrices that the read consumes **merged into one** (v1 merge = plain
+average); full stacks demote one level deeper, doubling capacity per level
+(8 × (1+2+4+8+16) = 248 chunks ≈ 127k tokens of lifetime), with per-block
+reads of the *same shape* but *different weights*. Zero-shot probe of the
+brick (`--probes merge`, n=48): write K banks **separately**, average them
+element-wise, decode A's continuation from the averaged matrix with the
+existing read. Cost is **logarithmic, saturating** — each doubling costs
+less than the last:
+
+| simulated unit | code | web | marginal cost of the doubling (code) |
+|---|---|---|---|
+| avg2 (block-1) | +0.21 | +0.12 | 0.21 |
+| avg4 (block-2) | +0.36 | +0.17 | 0.15 |
+| avg8 (block-3) | +0.43 | +0.19 | 0.07 |
+| avg16 (block-4) | **+0.47** | **+0.21** | **0.04** |
+
+A 16-chapter average — the deepest cascade unit — keeps A's recall **1.28
+nat above reset** (0.70 web), read by a machinery never trained on
+averages. v2c gives near-identical numbers: this is an *intrinsic* property
+of the write/read geometry (the slot-level "superposition ≈ recency-weighted
+average" finding of 2026-07-09, now confirmed at whole-bank level), not
+something interleaved training bought.
+
+**Storage-separate + merge-at-read beats sharing the bank at write time.**
+The same wave's cohab probes on the three v2e seeds (written cohabitation:
+two files interleaved into ONE bank of 6 writes): the recent thread is free
+(+0.06) but the older thread pays **+0.72–0.78** — vs **+0.21** for the
+post-hoc average of two separately-written banks. Not perfectly matched
+(written cohab also carries eviction pressure), but the direction is 3.5×
+and it is precisely the cascade's core bet: don't make threads share a
+matrix at write time; give each its matrix and superpose at read.
+
+Caveats, honestly held: seed slots are averaged along with content
+(variance halves — the real implementation should merge written slots
+only); slot-index alignment across chapters is arbitrary (fallback: merge
+chapters to one μ each, the moments route); and nothing here tests
+*addressing into* an averaged bank (that is the v2f/G2 arm, training now) or
+the demotion cascade itself. In flight on the farm: v2f (addressed defers +
+file labels, 2 seeds), v2g (D+G: the bank carried across 4 interleaved
+groups — the mechanical prerequisite that fills a cascade), and the
+mem_dim grid's seed-4 pairs (the taper argument for small deep-block reads).
+
+```bash
+PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
+  deepseek_v4_mini/configs/farm/v2e_interleave.yaml \
+  /mnt/tb/checkpoints/farm/v2e_interleave/final.pt \
+  --probes merge --n-files 48
+```
+
+---
+
 ## 2026-07-12 — Life without resets: no-reset learns a boundary heuristic, interleaving learns the filter, and selection is the missing third piece
 
 **TL;DR.** Three regimes for a bank that lives across files, judged by the
