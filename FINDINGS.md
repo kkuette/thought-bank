@@ -37,6 +37,60 @@ test this — before scale.
 
 ---
 
+## 2026-07-13 — Addressed defers (G2): 800 SFT steps create the selection mechanism that free training never built
+
+**TL;DR.** The cued probe of 2026-07-12 showed selection was *never
+exercised*: with any context present the bank is barely read (BANK VALUE
+~0.03 nat), and a blank query collapses to recency. v2f trains exactly the
+missing behavior — during interleaved training (v2e regime, from v2c final,
+800 steps, budget-matched), each written chunk carries a synthetic stable
+label `<<FILE:xxxxxx>>` (arithmetic hash, no semantic leakage), and with
+p=0.5 per segment the model gets an **addressed defer**: a cue (label 50% /
+chunk opening 50%) pointing at a *non-last* thread, target = that thread's
+successor ~500 tokens away, reachable only through the bank. Dated
+prediction in the config header: BANK VALUE >> 0.03 on open/lbl cues,
+junk/thread-last leaks ~0, standard GAP ≥ v2e. Verdict, 2 seeds × 2
+datasets (`--probes cued`, n=48):
+
+| cue condition (defer mode) | s1 code | s2 code | s1 web | s2 web |
+|---|---|---|---|---|
+| BANK VALUE, label cue | **−1.29** | **−1.15** | −0.37 | −0.71 |
+| BANK VALUE, opening cue | −0.25 | −0.32 | −0.13 | −0.21 |
+| JUNK-LAST leak, label-cued | −0.00 | +0.03 | +0.01 | +0.03 |
+| LIVE-THREAD-LAST leak, label-cued | +0.16 | +0.18 | +0.04 | +0.04 |
+
+All |t| between 3 and 14. Three reference points: the unaddressed read used
+the bank at **0.03** nat under the same cues (40× less than the label cue
+now); v2c's cue-prefixed defer read the bank at −0.8/−0.9 but leaked +0.4
+on live-thread-last — v2f cuts the leak to +0.16 while reading *deeper*;
+and the junk filter is exact (~0). **Addressing is a trainable mechanism,
+and 800 SFT steps suffice to create it.** Capacity is intact: carried CE
+6.54/6.49 vs v2e's 6.58 (the GAP headline drops to +1.18 vs +1.61 only
+because v2f's *reset baseline* improved — per the house rule, compare
+carried, never GAP, across arms).
+
+What SFT did **not** buy, exactly as designed: with a full in-context
+prefix the bank is still barely read (id-cue BANK VALUE −0.02..−0.06) —
+choosing *when* to consult memory under context is the GRPO-phase policy
+question, not a mechanism question; and the blank-query recency convention
+is untouched (+2.1/+1.3). The extended battery on the same checkpoints
+(`92/93_probes`): the **merge brick survives addressed training** (avg16
+floor −0.63 code / −1.02 web above reset; same saturating shape, marginal
+doubling cost 0.03-0.14), cohabitation is preserved (A/B GAPs survive at
++0.48/+0.94), rename invariance still partial (+0.30 cost, swap ceiling
++0.89). G2 phase 2 (GRPO: the model *chooses* the label) now has a
+mechanism to amplify — the dsv4 lesson ("RL on zero capability has no
+reward signal") is why SFT came first.
+
+```bash
+PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
+  deepseek_v4_mini/configs/farm/v2f_addr.yaml \
+  /mnt/tb/checkpoints/farm/v2f_addr/final.pt \
+  --probes cued,merge,cohab,invar --n-files 48
+```
+
+---
+
 ## 2026-07-12 — Merge-by-average: the tensor-cascade brick costs almost nothing at read time
 
 **TL;DR.** The v3 memory design under consideration is a tensor cascade
