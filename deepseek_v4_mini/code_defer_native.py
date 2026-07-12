@@ -291,6 +291,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # addressed read that the blank defer's recency convention never exercises.
     addr_prob = float(t.get("addr_prob", 0.0))
     addr_label = bool(t.get("addr_label", False))
+    addr_max = int(t.get("addr_max", 2))    # cap/conv: each addr forward = a full
+    #                                         read graph held until backward (8 GB!)
     if addr_prob > 0 or addr_label:
         assert ilv_on, "addr_prob/addr_label require interleave_files (multi-thread bank)"
     lam = float(t.get("defer_weight", 1.0))
@@ -394,7 +396,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
             segs = (train_stream.next_conv_batch(defer_len) if train_stream.B > 1
                     else train_stream.next_conv_interleaved(
                         interleave_files, defer_len,
-                        label=addr_label, addr_prob=addr_prob)
+                        label=addr_label, addr_prob=addr_prob, addr_max=addr_max)
                     if ilv_on else train_stream.next_conv())
             if no_reset_files > 1 and _g % no_reset_files != 0:
                 bank = bank_carry                     # dirty start: previous file's gists

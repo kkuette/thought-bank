@@ -327,7 +327,7 @@ class CodeChunkStream:
 
     def next_conv_interleaved(self, n_streams: int, defer_len: int = 16,
                               label: bool = False, addr_prob: float = 0.0,
-                              addr_cue_len: int = 16) -> list[dict]:
+                              addr_cue_len: int = 16, addr_max: int = 2) -> list[dict]:
         """Idea G (2026-07-11): ONE bank lifetime holds n_streams files whose chunks
         are randomly interleaved (within-file order preserved) — school-style spaced
         practice instead of sequential no-reset chains. The total chunk budget matches
@@ -383,16 +383,27 @@ class CodeChunkStream:
             streams.append(q); files.append(f); lbl_ids.append(lb)
         order = [i for i, q in enumerate(streams) for _ in q]
         self.rng.shuffle(order)                             # uniform random merge
-        segs, last_j = [], {}                               # sid -> last written j
+        segs, last_j, elig = [], {}, []                     # sid -> last written j
         for sid in order:
             seg = streams[sid].pop(0)
             last_j[sid] = seg.pop("_j")
-            # addressed defer toward a random OTHER live stream with a successor
+            # eligible: some OTHER live stream still has a successor here
             cands = [s for s, j in last_j.items()
                      if s != sid and j + 1 < len(files[s])]
-            if cands and addr_prob > 0 and self.rng.random() < addr_prob:
+            if cands:
+                elig.append((len(segs), list(cands), dict(last_j)))
+            segs.append(seg)
+        # addressed defers: prob-gated then CAPPED at addr_max per conv (each
+        # extra forward pays a full fast-weight-read graph until the conv's
+        # backward — uncapped p=0.5 OOMs the 8 GB rigs, post-mortem 2026-07-12);
+        # sampled over ALL eligible positions so late/full banks stay represented
+        if addr_prob > 0 and elig:
+            picked = [e for e in elig if self.rng.random() < addr_prob]
+            if len(picked) > addr_max:
+                picked = self.rng.sample(picked, addr_max)
+            for pos, cands, lj in picked:
                 t = self.rng.choice(cands)
-                f_t, j_t = files[t], last_j[t]
+                f_t, j_t = files[t], lj[t]
                 if lbl_ids[t] is not None and self.rng.random() < 0.5:
                     cue = lbl_ids[t]                        # explicit address
                 else:
@@ -400,9 +411,8 @@ class CodeChunkStream:
                 at = torch.full((1, dl), -100, dtype=torch.long)
                 nx = f_t[j_t + 1][:dl]
                 at[0, :nx.numel()] = nx
-                seg["addr_cue"] = cue.unsqueeze(0)
-                seg["addr_tgt"] = at
-            segs.append(seg)
+                segs[pos]["addr_cue"] = cue.unsqueeze(0)
+                segs[pos]["addr_tgt"] = at
         return segs
 
     def _pick_source(self) -> int:
