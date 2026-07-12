@@ -285,7 +285,12 @@ def main(cfg_path: str, resume: bool = False) -> None:
               else interleave_files) > 1
     if ilv_on:
         assert int(d["batch_size"]) == 1, "interleave_files requires batch_size 1 (ragged mode)"
-        assert no_reset_files == 1, "interleave_files and no_reset_files are exclusive arms"
+        # D+G (2026-07-12): no_reset_files>1 + interleave = the carry is INTERLEAVED
+        # — bank lives across groups of mixed-thread convs. The carry/init logic is
+        # sampler-independent, so the combination is free; boundary defers stay
+        # within-file (per-seg defer_tgt). Probes must check whether the v2d
+        # boundary heuristic partially returns (group boundaries correlate with
+        # "all previous threads dead" until pages make old threads resumable).
     # G2 (2026-07-12): addressed defers — cue (file label 50% / raw chunk opening
     # 50%) + blanks toward a NON-last live stream; trains the content/label-
     # addressed read that the blank defer's recency convention never exercises.
