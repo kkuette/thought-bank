@@ -144,6 +144,32 @@ def file_label_ids(tok, f, n_digits=6):
                         dtype=torch.long)
 
 
+def docstring_pairs(text, tok, min_doc=8, min_body=32, max_pairs=4):
+    """B3 (backlog 2026-07-13) : paires (docstring, corps) extraites d'un source
+    Python — niveau REGEX (le corps court jusqu'au prochain def/class en début
+    de ligne, les méthodes imbriquées débordent dedans ; docstrings triple-quote
+    seulement). Suffisant pour la probe cross-modale docstring↔code ; le mode
+    d'entraînement (defer corps depuis write doc-only) réutilisera ce helper si
+    le zero-shot montre un signal. Retourne [(doc_ids, body_ids)] tokenisés."""
+    import re
+    out = []
+    pat = re.compile(
+        r"def\s+\w+\s*\([^)]*\)[^:\n]*:\s*\n\s+[rbuRBU]*(\"\"\"|''')(.*?)\1[ \t]*\n"
+        r"(.*?)(?=\ndef\s|\nclass\s|\Z)", re.DOTALL)
+    for m in pat.finditer(text):
+        doc, body = m.group(2).strip(), m.group(3).strip("\n")
+        if not doc or not body.strip():
+            continue
+        di = tok.encode(doc, add_special_tokens=False)
+        bi = tok.encode(body, add_special_tokens=False)
+        if len(di) >= min_doc and len(bi) >= min_body:
+            out.append((torch.tensor(di, dtype=torch.long),
+                        torch.tensor(bi, dtype=torch.long)))
+        if len(out) >= max_pairs:
+            break
+    return out
+
+
 class CodeChunkStream:
     def __init__(self, tokenizer, *, seq_len: int = 2048, chunks_per_conv: int = 3,
                  batch: int = 1, n_files: int = 800, split: str = "train",

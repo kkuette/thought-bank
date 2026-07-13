@@ -56,8 +56,10 @@ def _ic_loss(model, xt, bank, balw, amp, layer_banks=None):
 
 
 @torch.no_grad()
-def evaluate(model, stream, device, think_id, blank_id, defer_len, n_conv, balw, amp):
+def evaluate(model, stream, device, think_id, blank_id, defer_len, n_conv, balw, amp,
+             delta=None):
     model.eval()
+    mdt = next(model.parameters()).dtype
     ic_loss = ic_n = 0.0
     d_car = d_res = d_car0 = d_res0 = dn = 0.0
     cont = cont0 = 0.0
@@ -66,6 +68,7 @@ def evaluate(model, stream, device, think_id, blank_id, defer_len, n_conv, balw,
     cd = rd = nd_deep = 0.0
     for _ in range(n_conv):
         segs = stream.next_conv(); bank = None
+        dstate = delta.init_state(1, device) if delta is not None else None
         for i, s in enumerate(segs):
             x = s["input_ids"].to(device)
             bank_in = bank                                # carried bank BEFORE this chunk's write
@@ -73,6 +76,9 @@ def evaluate(model, stream, device, think_id, blank_id, defer_len, n_conv, balw,
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                 o = model(xt, init_mem=bank)
             bank = o["mem_bank"]
+            if delta is not None:                         # B4: carry = delta state
+                dstate = delta.update(dstate, model.embed.weight[x])
+                bank = delta.to_bank(dstate, mdt)
             lg = o["logits"].float()
             ic_loss += float(F.cross_entropy(lg[:, :-1].reshape(-1, lg.size(-1)),
                                              xt[:, 1:].reshape(-1))); ic_n += 1
@@ -122,7 +128,7 @@ def evaluate(model, stream, device, think_id, blank_id, defer_len, n_conv, balw,
 
 @torch.no_grad()
 def evaluate_by_depth(model, stream, device, think_id, blank_id, defer_len,
-                      depths, n_per, amp):
+                      depths, n_per, amp, delta=None):
     """GAP as a function of conversation DEPTH d = #chunks written into the bank
     before the deferred prediction. For each d: write d chunks (carry the bank),
     then predict the (d+1)-th chunk's opening from the bank ALONE (carried) vs reset
@@ -138,12 +144,16 @@ def evaluate_by_depth(model, stream, device, think_id, blank_id, defer_len,
             if segs is None:
                 break
             bank = None
+            dstate = delta.init_state(1, device) if delta is not None else None
             for j in range(d):
                 x = segs[j]["input_ids"].to(device)
                 xt = _append(x, think_id)
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                     o = model(xt, init_mem=bank)
                 bank = o["mem_bank"]
+                if delta is not None:
+                    dstate = delta.update(dstate, model.embed.weight[x])
+                    bank = delta.to_bank(dstate, next(model.parameters()).dtype)
             nxt = segs[d]["input_ids"][:, :defer_len].to(device)
             dl = nxt.size(1)
             di = _fill(nxt, blank_id, dl)
@@ -190,6 +200,20 @@ def main(cfg_path: str, resume: bool = False) -> None:
         print(f"init_from: model weights <- {init_from} (step {ck0.get('step', '?')})",
               flush=True)
 
+    # B4 (backlog 2026-07-13) : canal DeltaNet inter-tours À LA PLACE du carry
+    # de banque — modèle strictement inchangé, seul le canal inter-chunks change
+    # (o["mem_bank"] ignoré, l'état delta est porté et présenté en pseudo-banque).
+    # Config : delta_channel: {d_k: 64}. Voir delta_channel.py.
+    dc_cfg = t.get("delta_channel")
+    delta = None
+    if dc_cfg:
+        from .delta_channel import DeltaChannel
+        _dk = int(dc_cfg.get("d_k", 64)) if isinstance(dc_cfg, dict) else 64
+        delta = DeltaChannel(cfg.d_model, cfg.max_mem, cfg.mem_dim, d_k=_dk).to(device)
+        print(f"delta channel ON: d_k {_dk} d_v {delta.d_v} "
+              f"({sum(p.numel() for p in delta.parameters()):,} params) — "
+              f"carry inter-chunks = état delta, o['mem_bank'] ignoré", flush=True)
+
     # teacher: distill the last bank slot toward a fixed random projection of the
     # mean-pooled chunk gist (a target the write CAN produce), β anneals 1->0.
     tf_cfg = raw.get("teacher", {}) or {}
@@ -235,6 +259,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
     lr = float(t.get("lr", 3e-4)); muon_lr = float(t.get("muon_lr", 3e-3))
     wd = float(t.get("weight_decay", 0.01)); balw = float(cfg.balance_loss_weight)
     muon_p, adam_p = _split_muon_params(model)
+    if delta is not None:
+        # B4 : les ~50k params du canal delta vont dans le bundle AdamW (module
+        # neuf, pas de piège √cols Muon à gérer) ; état optimiseur sauvé avec.
+        adam_p = adam_p + list(delta.parameters())
     # Per-module lr_scale: legacy Muon scaling (update * √cols) ties the per-matrix
     # update RMS to SHAPE (≈ √(cols/rows)), so changing mem_dim silently rescales the
     # effective lr of every mem_dim-shaped matrix: 64→512 made the read hypernet
@@ -301,6 +329,17 @@ def main(cfg_path: str, resume: bool = False) -> None:
     #                                         read graph held until backward (8 GB!)
     if addr_prob > 0 or addr_label:
         assert ilv_on, "addr_prob/addr_label require interleave_files (multi-thread bank)"
+    # B2 (backlog 2026-07-13) : resets ANNONCÉS — un marqueur tokenisé
+    # <<RESET:SOON>> (pattern file_label_ids : texte, pas de token spécial,
+    # vocab inchangé) est préfixé aux `reset_announce_chunks` derniers chunks
+    # d'une VIE de banque avec prob `reset_announce` (0.5 = 50/50 annoncé/
+    # surprise). On MESURE seulement (probe resetcue : la politique d'écriture
+    # bouge-t-elle quand la mort est annoncée ?) — standing warning : aucune
+    # perte/reward attachée à l'annonce.
+    ra_prob = float(t.get("reset_announce", 0.0))
+    ra_chunks = int(t.get("reset_announce_chunks", 3))
+    ra_ids = (torch.tensor(tok("<<RESET:SOON>>")["input_ids"], dtype=torch.long)
+              if ra_prob > 0 else None)
     # Cascade v3 (spec user 2026-07-12, débordement en 2 temps × fractale max_mem) :
     # cascade_depth = nombre de niveaux au-dessus de la banque vive (0 = off,
     # 1 = v3-lite page, 4 = complet). cascade_map[i] = niveau lu par la couche i
@@ -317,6 +356,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
             "cascade: gate_merge réordonne les slots, la capture d'éviction suppose FIFO pur"
         assert train_stream.B == 1, "cascade v1 = mode ragged batch=1 (alignement conv)"
         _seed_slots = int(getattr(cfg, "mem_seed_slots", cfg.max_mem))
+    if delta is not None:
+        assert cascade_depth == 0, "delta_channel remplace le canal — pas de cascade"
+        assert not tf_on, "delta_channel: teacher incompatible (manipule les slots)"
     lam = float(t.get("defer_weight", 1.0))
     wsd = bool(t.get("wsd_decay", True)); wsd_floor = float(t.get("wsd_floor", 0.0))
     decay_start = int(t.get("wsd_decay_start", int(steps * 0.66)))
@@ -366,6 +408,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
         torch.save({"step": step, "model": model.state_dict(), "cfg": cfg.__dict__,
                     "opt": opt.state_dict(),
                     "adam": opt._adam.state_dict() if opt._adam else None,
+                    "delta": delta.state_dict() if delta is not None else None,
                     "ema_ic": ema_ic, "ema_d": ema_d,
                     "rng_torch": torch.get_rng_state(),
                     "rng_cuda": (torch.cuda.get_rng_state_all()
@@ -392,6 +435,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
             if ck.get("opt") is not None: opt.load_state_dict(ck["opt"])
             if ck.get("adam") is not None and opt._adam is not None:
                 opt._adam.load_state_dict(ck["adam"])
+            if ck.get("delta") is not None and delta is not None:
+                delta.load_state_dict(ck["delta"])
             ema_ic, ema_d = ck.get("ema_ic"), ck.get("ema_d")
             if ck.get("rng_torch") is not None: torch.set_rng_state(ck["rng_torch"])
             if ck.get("rng_cuda") is not None and torch.cuda.is_available():
@@ -415,19 +460,29 @@ def main(cfg_path: str, resume: bool = False) -> None:
         # variance reduced without padding/GPU-batching the ragged chunks.
         bank_carry = None
         casc_carry, nev_carry = None, 0
+        dstate_carry = None
         for _g in range(grad_accum):
             segs = (train_stream.next_conv_batch(defer_len) if train_stream.B > 1
                     else train_stream.next_conv_interleaved(
                         interleave_files, defer_len,
                         label=addr_label, addr_prob=addr_prob, addr_max=addr_max)
                     if ilv_on else train_stream.next_conv())
+            # B2 : la vie se termine à la fin de la DERNIÈRE conv du groupe
+            # no_reset ((_g+1) % nrf == 0 ; nrf=1 => chaque conv est une vie).
+            if (ra_ids is not None and (_g + 1) % no_reset_files == 0
+                    and train_stream.rng.random() < ra_prob):
+                for s_ in segs[-ra_chunks:]:
+                    s_["input_ids"] = torch.cat(
+                        [ra_ids.unsqueeze(0), s_["input_ids"]], dim=1)
             if no_reset_files > 1 and _g % no_reset_files != 0:
                 bank = bank_carry                     # dirty start: previous file's gists
                 casc, n_evict = casc_carry, nev_carry
+                dstate = dstate_carry
             else:
                 bank = None
                 casc = CascadeMemory(cascade_depth, cfg.max_mem) if cascade_depth else None
                 n_evict = 0
+                dstate = delta.init_state(_B, device) if delta is not None else None
             total = 0.0
             for i, s in enumerate(segs):
                 x = s["input_ids"].to(device)
@@ -444,6 +499,11 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         if casc is not None and bank.size(1) >= cfg.max_mem else None)
                 lb = casc.layer_banks(bank, cascade_map) if casc is not None else None
                 loss, bank, ce = _ic_loss(model, xt, bank, balw, amp, lb)
+                if delta is not None:
+                    # B4 : le write du modèle reste actif DANS le chunk (même
+                    # forward), mais le carry inter-chunks = l'état delta
+                    dstate = delta.update(dstate, model.embed.weight[x])
+                    bank = delta.to_bank(dstate, next(model.parameters()).dtype)
                 if pre0 is not None:
                     n_evict += 1
                     if n_evict > _seed_slots:
@@ -500,6 +560,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 # graph freed per file; the carried bank is data, not gradient path
                 bank_carry = bank.detach() if bank is not None else None
                 casc_carry, nev_carry = casc, n_evict
+                if delta is not None:
+                    dstate_carry = dstate.detach()
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(t.get("grad_clip", 1.0)))
         opt.step()
         ic_v /= max(ic_cnt, 1); d_v /= max(d_cnt, 1)
@@ -530,7 +592,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 tag = f" [{src_name}]" if src_name else ""
                 pfx = f"{src_name}/" if src_name else ""
                 m = evaluate(model, es, device, think_id, blank_id, defer_len,
-                             int(t.get("eval_convs", 8)), balw, amp)
+                             int(t.get("eval_convs", 8)), balw, amp, delta=delta)
                 print(f"[eval @{step}]{tag} ic_ppl {m['ic_ppl']:.1f} | defer car {m['defer_car']:.3f} "
                       f"res {m['defer_res']:.3f} GAP {m['defer_gap']:+.3f} GAP0 {m['defer_gap0']:+.3f} "
                       f"| ceil(t0) {m['cont']:.3f} headroom {m['headroom']:+.3f} "
@@ -544,7 +606,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         writer.add_scalar(f"eval/{pfx}{k}", v, step)
                 if eval_depths:
                     bd = evaluate_by_depth(model, es, device, think_id, blank_id,
-                                           defer_len, eval_depths, eval_depth_convs, amp)
+                                           defer_len, eval_depths, eval_depth_convs, amp,
+                                           delta=delta)
                     curve = "  ".join(f"d{d}:{bd[d]['gap']:+.3f}(n{bd[d]['n']})" for d in eval_depths)
                     print(f"[eval @{step}]{tag} GAP by depth (writes→predict next): {curve}", flush=True)
                     if metrics_file:
