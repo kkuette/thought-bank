@@ -741,6 +741,145 @@ def probe_capacity_curve(raw, tok, model, dev, n_files):
         _report(res, n_files, pairs)
 
 
+def probe_capacity_deep(raw, tok, model, dev, n_files):
+    """Extension de capacity_curve à la SATURATION (2026-07-14, décision user) :
+    capacity_curve s'arrête à N=16, pile avant la zone où le registre en
+    superposition doit mourir (interférence saturante ~1024 writes, longlife).
+    Ici : UNE vie cumulative de ~8192 fils étiquetés 1-chunk (fil = paire
+    (chunk_j, chunk_j+1) intra-fichier, label = hash arithmétique du chunk,
+    dédupliqué), rappel label-cued mesuré à des checkpoints log-espacés,
+    stratifié par octave d'âge d'éviction. Par fil échantillonné, trois deltas :
+      own−reset   = valeur totale portée (registre + adresse + page) ;
+      own−foreign = spécificité d'adresse (même banque, même cible, label
+                    jamais écrit — le contrôle qui a tué le 109) ;
+      own−ablated = contribution de la page (ckpts cascade seulement).
+    Prédictions datées (job 113) : own−foreign des évincés ≈ 0 aux petits W
+    (réplique 109) ; own−reset décroît vers 0 au-delà de W~1024 (saturation
+    longlife) ; LE verdict = own−ablated s'allume-t-il précisément dans les
+    bins où le registre meurt mais où le merge de page reste ≤ avg64 ?
+    Env : CAPDEEP_CKPT (défaut 16,64,256,1024,4096,8192), CAPDEEP_SAMPLES (8),
+    CAPDEEP_REPS (3). N clippe au pool held disponible."""
+    from deepseek_v4_mini.code_data import file_label_ids
+    t = raw.get("training", raw.get("train", {}))
+    depth = int(t.get("cascade_depth", 0) or 0)
+    casc_on = depth > 0
+    if casc_on:
+        from deepseek_v4_mini.cascade import CascadeMemory
+        cmap = t.get("cascade_map")
+        cmap = ([int(v) for v in cmap] if cmap else
+                [0] * (model.cfg.n_layers - depth) + list(range(1, depth + 1)))
+    think_id = tok.convert_tokens_to_ids("<think>")
+    blank_id = tok.convert_tokens_to_ids("<blank>")
+    seed_slots = int(getattr(model.cfg, "mem_seed_slots", model.cfg.max_mem))
+    max_mem = int(model.cfg.max_mem)
+    dt = next(model.parameters()).dtype
+    CKPT = tuple(int(x) for x in
+                 os.environ.get("CAPDEEP_CKPT", "16,64,256,1024,4096,8192").split(","))
+    K = int(os.environ.get("CAPDEEP_SAMPLES", "8"))
+    R = int(os.environ.get("CAPDEEP_REPS", "3"))
+    BINS = ((1, 8), (9, 32), (33, 128), (129, 512), (513, 2048), (2049, 10 ** 9))
+
+    def addr_ce(bank, casc, cue, gt, ablate=False):
+        lb = None
+        if casc is not None:
+            lb = casc.layer_banks(bank, cmap)
+            if ablate:
+                lb = [bank if lvl == 0 else None for lvl in cmap]
+        C = cue.numel()
+        di = torch.cat([cue.unsqueeze(0).to(dev),
+                        torch.full((1, DL), blank_id, dtype=torch.long, device=dev)], 1)
+        with torch.no_grad():
+            lg = model(di, init_mem=bank, layer_banks=lb)["logits"].float()[:, C:]
+        return float(F.cross_entropy(lg.reshape(-1, lg.size(-1)), gt.reshape(-1)))
+
+    stream = _stream(raw, tok, seed=555)
+    pools = _pools(stream)
+    for si, nm in enumerate(stream.src_names):
+        # fils = paires (chunk_j, chunk_j+1) intra-fichier ; labels dédupliqués
+        threads, seen = [], set()
+        for f in pools[si]:
+            for j in range(len(f) - 1):
+                if f[j + 1].numel() < DL:
+                    continue
+                lab = file_label_ids(tok, [f[j]])
+                key = tuple(lab.tolist())
+                if key in seen:
+                    continue
+                seen.add(key)
+                threads.append((lab, f[j], f[j + 1][:DL]))
+        nmax = min(max(CKPT), len(threads) - K)  # K labels réservés jamais écrits
+        ckpts = [W for W in CKPT if W <= nmax]
+        foreign_labs = [threads[nmax + k][0] for k in range(K)]
+        print(f"\n[{nm}] CAPACITY DEEP (vie cumulative {nmax} writes, ckpts {ckpts}, "
+              f"{R} reps x {K} fils/bin, max_mem={max_mem}, "
+              f"cascade={'on' if casc_on else 'off'})", flush=True)
+        res, order0 = {}, []
+
+        def add(key, v):
+            if key not in res:
+                res[key] = []
+                order0.append(key)
+            res[key].append(v)
+
+        for rep in range(R):
+            rng = random.Random(1000 + rep)
+            order = list(range(nmax))
+            rng.shuffle(order)
+            bank = model.thought_stream.seed_bank(1, dev, dt) if casc_on else None
+            casc = CascadeMemory(depth, max_mem) if casc_on else None
+            nev = 0
+            todo = list(ckpts)
+            for w in range(nmax):
+                lab, c, _ = threads[order[w]]
+                s = torch.cat([lab, c])
+                x = torch.cat([s.unsqueeze(0).to(dev),
+                               torch.full((1, 1), think_id, dtype=torch.long, device=dev)], 1)
+                pre0 = (bank[:, 0].detach()
+                        if casc_on and bank.size(1) >= max_mem else None)
+                with torch.no_grad():
+                    bank = model(x, init_mem=bank,
+                                 layer_banks=casc.layer_banks(bank, cmap)
+                                 if casc_on else None)["mem_bank"]
+                if pre0 is not None:
+                    nev += 1
+                    if nev > seed_slots:
+                        casc.push_slot(pre0)
+                W = w + 1
+                if not (todo and W >= todo[0]):
+                    continue
+                todo.pop(0)
+                resid = [order[i] for i in range(max(0, W - max_mem), W)]
+                for ti in rng.sample(resid, min(K, len(resid))):
+                    lab_t, _, gt = threads[ti]
+                    gt = gt.unsqueeze(0).to(dev)
+                    own = addr_ce(bank, casc, lab_t, gt)
+                    add(f"W{W} res own-reset", own - addr_ce(None, None, lab_t, gt))
+                for lo, hi in BINS:
+                    ages = range(lo, min(hi, W - max_mem) + 1)
+                    idx = [order[W - max_mem - a] for a in ages]
+                    if not idx:
+                        continue
+                    bl = f"ev{lo}-{hi}" if hi < 10 ** 9 else f"ev{lo}+"
+                    for ti in rng.sample(idx, min(K, len(idx))):
+                        lab_t, _, gt = threads[ti]
+                        gt = gt.unsqueeze(0).to(dev)
+                        own = addr_ce(bank, casc, lab_t, gt)
+                        add(f"W{W} {bl} own-reset",
+                            own - addr_ce(None, None, lab_t, gt))
+                        add(f"W{W} {bl} own-foreign",
+                            own - addr_ce(bank, casc, rng.choice(foreign_labs), gt))
+                        if casc_on:
+                            add(f"W{W} {bl} own-ablated",
+                                own - addr_ce(bank, casc, lab_t, gt, ablate=True))
+                print(f"  [rep {rep}] W={W} mesuré", flush=True)
+        for k in order0:
+            v = res[k]
+            n = len(v)
+            md = st.mean(v)
+            se = st.stdev(v) / n ** 0.5 if n > 1 else 0.0
+            print(f"  d {k}: {md:+.3f} +- {se:.3f}  n={n}  |t|~{abs(md) / max(se, 1e-9):.1f}")
+
+
 def probe_longlife(raw, tok, model, dev, n_files):
     """Long-life health (350M validation plan, 2026-07-13): no run ever wrote
     more than ~30 times into one carried bank; the cascade promises thousands.
@@ -957,6 +1096,7 @@ PROBES = {"swap": probe_swap, "dup": probe_dup, "distractor": probe_distractor,
           "cohab": probe_cohab, "reflect": probe_reflect, "invar": probe_invar,
           "cued": probe_cued, "merge": probe_merge,
           "capacity": probe_capacity, "capacity_curve": probe_capacity_curve,
+          "capacity_deep": probe_capacity_deep,
           "longlife": probe_longlife,
           "page": probe_page, "resetcue": probe_resetcue, "xmodal": probe_xmodal}
 
