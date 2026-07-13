@@ -37,6 +37,73 @@ test this — before scale.
 
 ---
 
+## 2026-07-14 — Divmix GREEN on 14 sources; the DeltaNet steelman carries but cannot address; reach-back SFT: the page stays dead (3rd strike)
+
+Three verdicts from jobs 106/107/108 (+ the chained 109 arm), all at 97M.
+
+**Job 107 — divmix trained: GREEN, this is the official 350M mix.** v2e
+recipe from v2c final, 800 steps on the 14-source mix. GAP @800 **positive
+on all 14 sources**: codeparrot +1.23, stack_c +1.46, rust +1.17, js +1.43,
+sql +1.96, html +1.68, css +1.63, fineweb +1.41, fineweb_edu +1.54,
+wikipedia +1.43, finemath +1.28, khanacademy +1.15, openstax +1.46, arxiv
++1.87. Depth-flat (code d2 +1.13 → d8 +1.24; web d2 +1.60 → d8 +1.58). The
+invariance battery closes the surface-reuse confound left open by the
+zero-shot smoke: **resegmentation cost ≈ 0 on all 14 sources** (|d| ≤ 0.05,
+all |t| ≤ 1.6), swap distance positive everywhere (+0.29 arxiv … +2.63
+khanacademy; on the never-trained-before languages: stack_c +1.01, js
++1.11, sql +0.92, rust +0.67), and full renaming (codeparrot) costs +0.30
+of a +0.83 swap ceiling — ~2/3 of the gist survives total surface
+replacement. The bank content is file-specific abstraction, not surface
+reuse. **Consequence: the 14-source mix + anchors is frozen as the 350M
+data recipe.**
+
+**Job 106 — B4 internal DeltaNet steelman: the delta channel carries gist,
+but cannot address.** A 49,923-param gated delta-rule state replaces the
+bank as inter-chunk carry (`o['mem_bank']` ignored), init v2c, same recipe
+and budget. It *does* carry: GAP @800 **+0.92 code / +1.22 web** — same
+order of magnitude as the bank arms. But the cued battery is unambiguous:
+JUNK-LAST cost label-cued **+2.07 code / +1.26 web** (trained bank v2f:
+−0.00/+0.03), open-cue +1.93/+1.14, live-thread-last +0.74/+0.30 (v2f
++0.16). The value it shows under a label cue (−0.87/−1.22) exists only
+while the target is the most recent write — one junk write later it is
+gone. Cross-modal doc→body: +0.26, under the +0.3 grid (v2e bank: +1.17).
+**Verdict: a single compressed recurrent state can carry the gist; it
+cannot *select*. Addressed recall — the G2 mechanism — requires slot
+structure. The bank's niche is the addressing, not the carry.** (Public
+DeltaNet commitment at target scale stands; this is the internal science
+point at 97M.)
+
+**Job 108 — reach-back SFT (option 2): the behavior trains, the page stays
+dead — 3rd strike.** SFT with eviction-age-stratified reach-back targets on
+v3 (cascade map [0,0,0,0,1,1]). Addressing strengthens as designed
+(label-cue BANK VALUE −0.81 code / −0.48 web on the final ckpt; reach-back
+vs reset −0.29/−1.10). But the PAGE ABLATION — pre-registered as THE
+verdict — does not separate: real vs ablated page **+0.020 code (wrong
+sign, |t|~2.1) / −0.002 web**. Even when SFT'd *directly on evicted
+targets*, the model routes all reach-back value through live-bank
+superposition and never learns to read the page (the user's reservation
+about the deepest block, confirmed). The chained capacity arm (job 109,
+v3_lite, cascade=on) agrees and adds the killer control: evicted N=12/16 vs
+reset −0.84/−0.87 *but an unwritten label scores −0.843* — evicted recall
+is generic register value, address-specificity past eviction ≈ 0; page
+contribution −0.004 nat (v2h cascade=off shows the same profile: evicted
+−0.75/−0.77, unwritten −0.69). **Consequence: the cascade remains a free
+deployment flag (v3_deep GREEN holds), but no paged-retrieval claim at 97M.
+Page-read drops off the 350M critical path; it becomes a scale/capacity
+question, revisited only if the 350M superposition register saturates.**
+
+Repro:
+```
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2e_divmix.yaml --resume
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2e_delta.yaml --resume
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v3_reach.yaml --resume
+PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
+  deepseek_v4_mini/configs/farm/<cfg>.yaml /mnt/tb/checkpoints/farm/<run>/final.pt \
+  --probes invar|cued,xmodal|page,capacity_curve --n-files 48
+```
+
+---
+
 ## 2026-07-13 (6) — Announced resets are neutral: no defensive rehearsal under task loss (B2 GREEN)
 
 The standing note (top of this file) made quantitative. Job 104, config
