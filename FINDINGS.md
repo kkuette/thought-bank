@@ -37,6 +37,58 @@ test this — before scale.
 
 ---
 
+## 2026-07-13 (5) — Trained taper is free; capacity curve; REGISTER seed #3 (jobs 101/102/109)
+
+Three finished jobs, one dépouillement.
+
+**B1 trained taper (job 102, `v2e_md256.yaml`) — GREEN.** Pre-registered grid:
+carried md256 ≈ md512 within ±0.15 nat @800. Result (carried CE @800, rule 4):
+codeparrot **6.561 vs 6.575** (Δ −0.014), fineweb **7.311 vs 7.269**
+(Δ +0.042). A read trained at mem_dim 256 matches 512 when everything else is
+matched ⇒ **the v3 deep-block taper 512→256 is free; 350M VRAM budgets with
+512/256/128 stand**. Probes on the md256 ckpt are healthy (specific +0.84 code,
+worst-case survival +1.49, label-cue bank value −1.47 code / −0.55 web).
+Caveat (in the config header): init v2b_md256_s4 vs v2e's v2c init — equal
+post-init budget, seed noise on this point uncontrolled; md128 arm now
+promotable, same recipe.
+
+**Capacity curve across eviction (job 109, probe `capacity_curve`, n=48,
+N ∈ {2,4,8,12,16} labelled 1-chunk threads, funding figure).** On code:
+- **v2h**: addressed recall at N=2 = **−1.11** vs reset; gentle interference
+  (+0.26 at N=8); residents are *immune* to eviction pressure (+0.005 at
+  N=12/16, |t|~0.1); evicted threads recall −0.75/−0.77 vs reset **but the
+  foreign-label control is −0.69** ⇒ recall of evicted content is almost
+  entirely the register effect (thread-specific ≤ ~0.08 nat past eviction).
+- **v3_lite (cascade on)**: same shape, and the **page contributes −0.004 nat
+  (|t|~6.6) to evicted recall** — statistically nonzero, practically nothing:
+  4th replication of the page-emergence null, this time as a magnitude.
+  Oddity: n2 (7.43) worse than n4 (7.16) on code — small-N regime interacts
+  with seed slots/cascade; don't read the v3_lite low-N points as capacity.
+- **fineweb**: everything compressed (N=2 = −0.23 v2h / −0.08 v3_lite, evicted
+  ≈ foreign ≈ 0) — same code≫web asymmetry as reach-back targets.
+The missing arm is v3_reach (trained page read), chained to job 108's verdict;
+the figure caption must decompose specific vs register (established 07-13 (2)).
+
+**REGISTER seed #3 (job 101, `v2g_carry_s3.yaml`).** swap-vs-reset:
+**+0.53 code / +0.41 web** (|t| ~5). Across seeds the register term now spans
+{+0.44, +0.11, +0.53} on code (and +1.38 on the v3_deep config) —
+confirms: volatile, usually positive, never load-bearing for the specificity
+claims (d SPECIFIC +0.82 here, stable across seeds). Rest of the battery
+replicates v2g: addressing present (label-cue −0.58/−0.61), id-cued bank value
+~0 (the bank still isn't read under live context — GRPO phase 2's job),
+recall-by-lag flat through eviction, cohabitation costs asymmetric (A pays,
+B ~free).
+
+Repro:
+```
+PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
+  deepseek_v4_mini/configs/farm/v2h_stack.yaml \
+  /mnt/tb/checkpoints/farm/v2h_stack/final.pt --probes capacity_curve --n-files 48
+# logs: /mnt/tb/runs/GPUrig0-gpu{2,3}__10{1,2,9}_*.workerlog
+```
+
+---
+
 ## 2026-07-13 (4) — Cascade depth is a pure deployment flag (v3_deep GREEN)
 
 Pre-registered blocking point for the 350M plan (job 100, config
