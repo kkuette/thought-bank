@@ -757,8 +757,12 @@ def probe_capacity_deep(raw, tok, model, dev, n_files):
     (réplique 109) ; own−reset décroît vers 0 au-delà de W~1024 (saturation
     longlife) ; LE verdict = own−ablated s'allume-t-il précisément dans les
     bins où le registre meurt mais où le merge de page reste ≤ avg64 ?
-    Env : CAPDEEP_CKPT (défaut 16,64,256,1024,4096,8192), CAPDEEP_SAMPLES (8),
-    CAPDEEP_REPS (3). N clippe au pool held disponible."""
+    Checkpoints par défaut ALIGNÉS SUR FILL (formule user 2026-07-14) : la 1re
+    destruction du fond arrive à M + 2·M^depth writes (d2=136, d3=1032,
+    d4=8200) — comparer d2/d3 à fill égal, pas à writes égaux. Env :
+    CAPDEEP_FILLS (défaut 0.25..64 × 1re destruction), CAPDEEP_CKPT (writes
+    absolus, prioritaire), CAPDEEP_SAMPLES (8), CAPDEEP_REPS (3). N clippe au
+    pool held disponible."""
     from deepseek_v4_mini.code_data import file_label_ids
     t = raw.get("training", raw.get("train", {}))
     depth = int(t.get("cascade_depth", 0) or 0)
@@ -773,8 +777,26 @@ def probe_capacity_deep(raw, tok, model, dev, n_files):
     seed_slots = int(getattr(model.cfg, "mem_seed_slots", model.cfg.max_mem))
     max_mem = int(model.cfg.max_mem)
     dt = next(model.parameters()).dtype
-    CKPT = tuple(int(x) for x in
-                 os.environ.get("CAPDEEP_CKPT", "16,64,256,1024,4096,8192").split(","))
+    # Capacité théorique (formule user 2026-07-14, vérifiée sur cascade.py :
+    # 2 positions × M^k tranches par niveau) : 1re destruction à M + 2·M^depth
+    # writes (d2=136, d3=1032, d4=8200) ; rétention totale M + 2·Σ M^k (d4=9368
+    # = la spec). Le paramètre naturel = fill (cycles du niveau profond) ; les
+    # checkpoints par défaut sont alignés sur fill pour comparer d2/d3 à
+    # capacité égale, pas à writes égaux.
+    if casc_on:
+        first_destroy = max_mem + 2 * max_mem ** depth
+        retention = max_mem + 2 * sum(max_mem ** k for k in range(1, depth + 1))
+    else:
+        first_destroy = retention = max_mem
+    env = os.environ.get("CAPDEEP_CKPT", "")
+    if env:
+        CKPT = tuple(int(x) for x in env.split(","))
+    elif casc_on:
+        fills = tuple(float(x) for x in os.environ.get(
+            "CAPDEEP_FILLS", "0.25,0.5,1,2,4,8,16,32,64").split(","))
+        CKPT = tuple(sorted({16} | {int(round(f * first_destroy)) for f in fills}))
+    else:
+        CKPT = (16, 64, 256, 1024, 4096, 8192)
     K = int(os.environ.get("CAPDEEP_SAMPLES", "8"))
     R = int(os.environ.get("CAPDEEP_REPS", "3"))
     BINS = ((1, 8), (9, 32), (33, 128), (129, 512), (513, 2048), (2049, 10 ** 9))
@@ -810,9 +832,12 @@ def probe_capacity_deep(raw, tok, model, dev, n_files):
         nmax = min(max(CKPT), len(threads) - K)  # K labels réservés jamais écrits
         ckpts = [W for W in CKPT if W <= nmax]
         foreign_labs = [threads[nmax + k][0] for k in range(K)]
-        print(f"\n[{nm}] CAPACITY DEEP (vie cumulative {nmax} writes, ckpts {ckpts}, "
+        fills_str = ", ".join(f"W{W}=f{W / first_destroy:.2g}" for W in ckpts)
+        print(f"\n[{nm}] CAPACITY DEEP (vie cumulative {nmax} writes, "
+              f"1re destruction @{first_destroy}, rétention max {retention}, "
               f"{R} reps x {K} fils/bin, max_mem={max_mem}, "
-              f"cascade={'on' if casc_on else 'off'})", flush=True)
+              f"cascade={'on' if casc_on else 'off'})\n  ckpts: {fills_str}",
+              flush=True)
         res, order0 = {}, []
 
         def add(key, v):
