@@ -57,6 +57,7 @@ Usage (repo root):
 Stream seeds are fixed per probe (same file sampling as the published numbers).
 """
 import argparse
+import os
 import random
 import statistics as st
 
@@ -618,7 +619,8 @@ def probe_longlife(raw, tok, model, dev, n_files):
     norm blow-up would be invisible in every previous probe."""
     think_id = tok.convert_tokens_to_ids("<think>")
     write_seq, defer_ce = _mk_ops(model, tok, dev)
-    CKPT = (8, 32, 128, 512, 1024)
+    CKPT = tuple(int(x) for x in
+                 os.environ.get("LONGLIFE_CKPT", "8,32,128,512,1024").split(","))
     R = max(2, min(12, n_files // 4))   # streams indépendants (n = 2R par ckpt)
     stream = _stream(raw, tok, seed=444)
     pools = _pools(stream)
