@@ -17,7 +17,10 @@ STEP_RE = re.compile(r"^step\s+(\d+)\s+ic ([\d.]+) \(ppl ([\d.]+)\).*?([\d.]+)s/
 EVAL_RE = re.compile(r"^\[eval @(\d+)\] \[(\w+)\].*GAP ([+\-][\d.]+)")
 
 
-def tail(path, nbytes=6000):
+def tail(path, nbytes=48000):
+    # 48 Ko : un bloc d'éval multi-domaine (v2e_divmix = 13 sources × 2 lignes
+    # ~250 chars) fait ~6,5 Ko à lui seul — l'ancien tail de 6 Ko tronquait
+    # silencieusement les premières sources du bloc.
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
@@ -84,6 +87,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>ferme tb</titl
  th{color:#67707a;font-weight:normal} .ok{color:#7ec8a8} .warn{color:#e0b060} .bad{color:#e07070}
  .dim{color:#5a636d} .bar{display:inline-block;height:9px;background:#2e6e54;vertical-align:middle;border-radius:2px}
  .barbox{display:inline-block;width:90px;height:9px;background:#20262c;border-radius:2px;margin-right:6px}
+ .chip{display:inline-block;background:#1a2027;border-radius:3px;padding:0 6px;margin:1px 4px 1px 0;white-space:nowrap}
 </style></head><body>
 <h1>ferme thought-bank</h1><div id="c">chargement…</div>
 <script>
@@ -98,11 +102,14 @@ async function r(){
   h+='<table><tr><th>gpu</th><th>util</th><th>vram</th><th>W</th><th>°C</th></tr>';
   for(const g of n.gpus||[]) h+=`<tr><td>${g.i}</td><td>${bar(g.util,100)}</td><td>${bar(g.vram,g.vram_tot)} <span class=dim>${g.vram} Mo</span></td><td>${g.w}</td><td class="${g.temp>80?'bad':g.temp>70?'warn':''}">${g.temp}</td></tr>`;
   h+='</table>';}
- h+=`<h2>jobs actifs (${d.running.length})</h2><table><tr><th>job</th><th>step</th><th>ic</th><th>s/step</th><th>dernier GAP</th><th>log il y a</th></tr>`;
+ h+=`<h2>jobs actifs (${d.running.length})</h2><table><tr><th>job</th><th>step</th><th>ic</th><th>s/step</th><th>dernier GAP par domaine</th><th>log il y a</th></tr>`;
  for(const j of d.running){
-  const s=j.step, e=(j.evals||[]).map(x=>`${x.src}@${x.at}: <b>${x.gap>0?'+':''}${x.gap}</b>`).join(' · ');
+  // GAP par domaine en chips (mix divmix = 13 sources) : vert/rouge par signe,
+  // @step affiché seulement si la source est en retard sur l'éval la plus récente.
+  const s=j.step, at=(j.evals&&j.evals.length)?Math.max(...j.evals.map(x=>x.at)):0;
+  const e=(j.evals||[]).map(x=>`<span class="chip ${x.gap>0?'ok':'bad'}">${x.src} <b>${x.gap>0?'+':''}${x.gap.toFixed(2)}</b>${x.at<at?` <span class=dim>@${x.at}</span>`:''}</span>`).join('');
   const age=j.log_age_s==null?'?':(j.log_age_s>300?`<span class=bad>${Math.round(j.log_age_s/60)} min</span>`:`${j.log_age_s} s`);
-  h+=`<tr><td>${j.job}</td><td>${s?s.n:'<span class=dim>init…</span>'}</td><td>${s?s.ic:''}</td><td>${s?s.sps:''}</td><td>${e||'<span class=dim>—</span>'}</td><td>${age}</td></tr>`;}
+  h+=`<tr><td>${j.job}</td><td>${s?s.n:'<span class=dim>init…</span>'}</td><td>${s?s.ic:''}</td><td>${s?s.sps:''}</td><td>${e?`<span class=dim>@${at}</span> ${e}`:'<span class=dim>—</span>'}</td><td>${age}</td></tr>`;}
  h+='</table>';
  h+=`<h2>file (${d.queued.length})</h2><div class=dim>${d.queued.join('<br>')||'vide'}</div>`;
  h+=`<h2>terminés (${d.done.length}) — <span class=bad>échecs (${d.failed.length})</span></h2>`;

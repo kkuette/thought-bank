@@ -586,6 +586,12 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 if distill_n:
                     writer.add_scalar("train/distill", distill_v / distill_n, step)
         if step % eval_every == 0 or step == steps:
+            # eval_depth_sources (mix large, ex. divmix 13 sources) : la courbe
+            # par profondeur coûte 4x le GAP top-level (eval_depths x
+            # eval_depth_convs convs PAR source) et ne sert de comparaison que
+            # sur les ancres — la restreindre à cette liste ramène l'éval de
+            # 13x40 à 13x8 + 2x32 convs. None (défaut) = toutes les sources.
+            depth_srcs = t.get("eval_depth_sources")
             if cascade_depth and casc is not None:
                 print(f"[cascade @{step}] {casc.stats()} (dernière conv du step)")
             for src_name, es in eval_views:
@@ -604,7 +610,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 if writer is not None:
                     for k, v in m.items():
                         writer.add_scalar(f"eval/{pfx}{k}", v, step)
-                if eval_depths:
+                if eval_depths and (depth_srcs is None or not src_name
+                                    or src_name in depth_srcs):
                     bd = evaluate_by_depth(model, es, device, think_id, blank_id,
                                            defer_len, eval_depths, eval_depth_convs, amp,
                                            delta=delta)
