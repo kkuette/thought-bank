@@ -359,6 +359,30 @@ def main(cfg_path: str, resume: bool = False) -> None:
     if delta is not None:
         assert cascade_depth == 0, "delta_channel remplace le canal — pas de cascade"
         assert not tf_on, "delta_channel: teacher incompatible (manipule les slots)"
+    # OPTION 2 (verdict page 2026-07-13, FINDINGS d70b595) : reach-back
+    # SUPERVISÉ. L'émergence est réfutée (2 seeds : ablater la page ne change
+    # rien) mais la cible existe (early évincé −0.37..−0.72 vs reset via
+    # résidus de superposition) et la page est gratuite quand non lue —
+    # recette v2f : créer le mécanisme par SFT. Un POOL de cibles est porté à
+    # travers la vie carried : chaque seg écrit y dépose (cue = ouverture du
+    # chunk, label compris si addr_label ; tgt = son defer_tgt même-fichier) ;
+    # dans les convs SUIVANTES, avec prob reach_prob, un defer adressé vise
+    # une entrée dont les slots ont quitté la banque vive (âge >= max_mem
+    # writes) — la seule route vers la cible est la page (ou les résidus).
+    # STRATIFICATION par âge (réserve user 2026-07-13 : les cibles du bloc le
+    # plus mergé pourraient ne pas apprendre) : perte loggée par strate
+    #   s1 [M, 2M)  ~ page p0 fraîche      s2 [2M, 4M) ~ page mergée (p1)
+    #   s3 [4M, ∞)  ~ au-delà de la page à depth 1 = DÉTRUIT (contrôle
+    #                 négatif : ne DOIT pas s'améliorer si le read lit la page)
+    # Même garde VRAM que G2 : chaque forward reach = un graphe de read complet
+    # jusqu'au backward => cap reach_max par conv.
+    reach_prob = float(t.get("reach_prob", 0.0))
+    reach_max = int(t.get("reach_max", 2))
+    reach_cue_len = int(t.get("reach_cue_len", 16))
+    if reach_prob > 0:
+        assert cascade_depth > 0, "reach_prob: il faut une page (cascade_depth >= 1)"
+        assert int(t.get("no_reset_files", 1)) > 1, \
+            "reach_prob: le pool vit dans le carry (no_reset_files > 1)"
     lam = float(t.get("defer_weight", 1.0))
     wsd = bool(t.get("wsd_decay", True)); wsd_floor = float(t.get("wsd_floor", 0.0))
     decay_start = int(t.get("wsd_decay_start", int(steps * 0.66)))
@@ -418,6 +442,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
         os.replace(tmp, path)                        # atomic: no torn file on preemption
 
     start_step = 0; ema_ic = ema_d = ema_a = None
+    ema_reach = [None, None, None]              # EMA de perte par strate d'âge
     if resume:
         import glob, re
         cks = {}
@@ -455,12 +480,14 @@ def main(cfg_path: str, resume: bool = False) -> None:
         lr_now = set_lr(step)
         opt.zero_grad(set_to_none=True)
         ic_v = d_v = a_v = 0.0; ic_cnt = d_cnt = a_cnt = 0; distill_v = 0.0; distill_n = 0
+        reach_v = [0.0, 0.0, 0.0]; reach_cnt = [0, 0, 0]
         # gradient accumulation: G independent conversations (batch=1 each, bank reset
         # between them) summed into one optimizer step => effective batch = G files,
         # variance reduced without padding/GPU-batching the ragged chunks.
         bank_carry = None
         casc_carry, nev_carry = None, 0
         dstate_carry = None
+        rpool_carry, wt_carry = [], 0
         for _g in range(grad_accum):
             segs = (train_stream.next_conv_batch(defer_len) if train_stream.B > 1
                     else train_stream.next_conv_interleaved(
@@ -478,12 +505,15 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 bank = bank_carry                     # dirty start: previous file's gists
                 casc, n_evict = casc_carry, nev_carry
                 dstate = dstate_carry
+                reach_pool, w_total = rpool_carry, wt_carry
             else:
                 bank = None
                 casc = CascadeMemory(cascade_depth, cfg.max_mem) if cascade_depth else None
                 n_evict = 0
                 dstate = delta.init_state(_B, device) if delta is not None else None
+                reach_pool, w_total = [], 0           # le pool meurt avec la vie
             total = 0.0
+            reach_n = 0                               # cap VRAM par conv
             for i, s in enumerate(segs):
                 x = s["input_ids"].to(device)
                 xt = _append(x, think_id)
@@ -555,6 +585,41 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     total = total + lam * aloss
                     a_v += float(aloss.detach()); a_cnt += 1
                     # addressed forward's write is discarded too
+                # OPTION 2 : defer reach-back vers une entrée du pool dont les
+                # slots ont quitté la banque vive (âge >= max_mem writes) —
+                # même format que l'addr defer ([cue, blanks], perte sur les
+                # blanks, write jeté), mais la cible vient d'une conv PASSÉE
+                # de la vie : la page (ou ses résidus) est le seul pont.
+                if reach_prob > 0 and reach_n < reach_max:
+                    M_ = cfg.max_mem
+                    elig = [e for e in reach_pool if w_total - e["w"] >= M_]
+                    if elig and train_stream.rng.random() < reach_prob:
+                        e = train_stream.rng.choice(elig)
+                        age = w_total - e["w"]
+                        sb = 0 if age < 2 * M_ else (1 if age < 4 * M_ else 2)
+                        rc = e["cue"].to(device)
+                        rt = e["tgt"].to(device)
+                        di = torch.cat([rc, _fill(rc, blank_id, rt.size(1))], dim=1)
+                        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+                            orr = model(di, init_mem=bank,
+                                        layer_banks=casc.layer_banks(bank, cascade_map)
+                                        if casc is not None else None)
+                        lgr = orr["logits"].float()[:, rc.size(1):]
+                        rloss = F.cross_entropy(lgr.reshape(-1, lgr.size(-1)),
+                                                rt.reshape(-1), ignore_index=-100)
+                        total = total + lam * rloss
+                        reach_v[sb] += float(rloss.detach()); reach_cnt[sb] += 1
+                        reach_n += 1
+                # dépôt au pool APRÈS usage (une entrée n'est jamais éligible
+                # dans sa propre conv : âge < M garanti par m_total <= K = M)
+                if reach_prob > 0:
+                    w_total += 1                      # ce seg vient d'écrire 1 gist
+                    tg = s.get("defer_tgt")
+                    if tg is not None and bool((tg != -100).any()):
+                        reach_pool.append({"cue": s["input_ids"][:, :reach_cue_len],
+                                           "tgt": tg, "w": w_total})
+                        if len(reach_pool) > 64:      # borne mémoire (tenseurs CPU 16+16 tok)
+                            reach_pool.pop(0)
             (total / grad_accum).backward()          # mean over the G accumulated convs
             if no_reset_files > 1:
                 # graph freed per file; the carried bank is data, not gradient path
@@ -562,6 +627,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 casc_carry, nev_carry = casc, n_evict
                 if delta is not None:
                     dstate_carry = dstate.detach()
+                if reach_prob > 0:
+                    rpool_carry, wt_carry = reach_pool, w_total
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(t.get("grad_clip", 1.0)))
         opt.step()
         ic_v /= max(ic_cnt, 1); d_v /= max(d_cnt, 1)
@@ -570,8 +637,18 @@ def main(cfg_path: str, resume: bool = False) -> None:
         if a_cnt:
             a_v /= a_cnt
             ema_a = a_v if ema_a is None else 0.95 * ema_a + 0.05 * a_v
+        for _s in range(3):
+            if reach_cnt[_s]:
+                rv = reach_v[_s] / reach_cnt[_s]
+                ema_reach[_s] = (rv if ema_reach[_s] is None
+                                 else 0.9 * ema_reach[_s] + 0.1 * rv)
         if step % log_every == 0:
             addr_s = f"addr {ema_a:.3f}  " if ema_a is not None else ""
+            if reach_prob > 0 and any(v is not None for v in ema_reach):
+                # s1 ~ page p0, s2 ~ page mergée, s3 ~ détruit (contrôle : ne
+                # doit PAS baisser si c'est bien la page qui est lue)
+                addr_s += "reach " + "/".join(
+                    "—" if v is None else f"{v:.2f}" for v in ema_reach) + "  "
             print(f"step {step:5d}  ic {ema_ic:.3f} (ppl {math.exp(ema_ic):.1f})  defer {ema_d:.3f}  "
                   f"{addr_s}β {_beta(step):.2f}  lr {lr_now:.2e}  "
                   f"{(time.time()-t0)/max(step - start_step, 1):.2f}s/step", flush=True)
@@ -581,6 +658,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 writer.add_scalar("train/defer_loss", ema_d, step)
                 if ema_a is not None:
                     writer.add_scalar("train/addr_loss", ema_a, step)
+                for _s, _v in enumerate(ema_reach):
+                    if _v is not None:
+                        writer.add_scalar(f"train/reach_s{_s + 1}", _v, step)
                 writer.add_scalar("sched/lr", lr_now, step)
                 writer.add_scalar("sched/beta", _beta(step), step)
                 if distill_n:
