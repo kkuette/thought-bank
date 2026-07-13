@@ -37,6 +37,70 @@ test this — before scale.
 
 ---
 
+## 2026-07-13 (2) — The full stack composes; bank health holds to 4096 writes; the fractal merge floor holds at 64 units
+
+Six runs land together and close most of the pre-cascade checklist.
+
+**v2h (D+G+G2 stacked, 2 seeds): POSITIVE — the pieces don't cancel.**
+Interleaving (G), inter-group carry (D-as-carry) and addressed defers (G2)
+trained jointly, 800 steps from v2c final. Everything each ingredient bought
+separately survives the composition, at ~zero carried cost:
+
+| metric (code, s1 / s2) | v2h | solo reference |
+|---|---|---|
+| carried defer CE | 6.60 / 6.62 | v2e 6.58 (rule 4: compare carried) |
+| BANK VALUE, label cue | −1.28 / −1.63 | v2f −1.29 / −1.15 |
+| LIVE-THREAD-LAST leak, label-cued | +0.14 / +0.13 | v2f +0.16, v2c +0.4 |
+| MID distractor cost | −0.01 / +0.00 | v2e ~0.0 |
+| addr train loss (end) | 7.32 / 7.21 | < defer-reset ~7.9 ✓ |
+
+Known weakness unchanged, as expected: **blank-query recency** (junk-last
++2.16, worst-case vs reset +0.92 — the empty query still means "continue the
+last thing"). Under any cue the same banks select correctly (junk cost
++0.01). REGISTER stays seed-volatile (+0.44 s1 / +0.11 s2), consistent with
+v2g — the boundary heuristic is accessible, not re-created; the structural
+answer remains pages (v3). GRPO phase 2 owns the blank-query policy.
+
+**v2e_long: the regime is not saturated.** 800 further steps on v2e (1600
+total): carried 6.47 code (−0.11 vs 800), GAP +1.71. Continued pretraining
+still pays at this scale — good news for the 350M budget.
+
+**mem_dim grid, seed 4 @2000 (v2b regime)**: carried code 5.83 (512) →
+6.15 (256) → 6.14 (128). The 512→256 step costs +0.31 nat carried;
+256→128 costs ~nothing. Relative GAP 100/82/64 % code, 100/94/68 % web.
+No cliff anywhere — the deep-block taper (B1) is viable; the trained-taper
+arm at matched budget is job 102 (v2e_md256).
+
+**Merge-by-average plateau confirmed at n=48 (job 96, v2e AND v2f ckpts):**
+avg32→avg64 adds +0.005..+0.03 nat (nothing); avg64 still beats reset by
+−1.27 (v2e code) / −0.58 (v2f code) / −0.67..−1.00 (web). The fractal
+cascade's deep accumulator keeps 0.6–1.3 nat of value at 64 merged units.
+
+**Long-life health: 3 orders of magnitude, zero drift.** n=24/ckpt at
+8→1024 writes on v2f AND v2g (job 98): slot norms flat (20.17→20.17,
+21.38→21.26), carried-vs-reset stable (code −0.44..−0.72, web
+−0.85..−1.05). Extended to **4096 writes** (job 103, v2f): norms +0.4 %,
+web carried −0.94 (|t|~7.8), gentle erosion ~0.13 nat/decade, no collapse.
+The dated ±0.15-vs-@1024 criterion is marginally exceeded on web (+0.16) —
+recorded as a soft refutation; the health claim (no saturation, no norm
+blow-up) stands. Validation-plan point (d): done zero-shot.
+
+**Capacity n=48 (v2f) — one nuance vs the smoke.** Addressed value n1
+−1.31, interference saturating (+0.18/+0.30/+0.48 at N=2/4/8 code), no
+recency tilt at N=8 (+0.00). BUT `foreign` (cueing an *unwritten* label)
+lands 0.56 nat BELOW reset on code (|t|~4.0) — the smoke's "lookup fails
+cleanly at ~reset" only half-replicates. No foreign *content* is decoded;
+a populated bank plus the label format helps generically (register). The
+thread-specific component of addressed recall is therefore ≈ −0.75, not
+−1.31. Funding-figure caption must say so.
+
+Repro: `--probes cued,swap,distractor` on
+`checkpoints/farm/v2h_stack{,_s2}/final.pt`; `--probes merge` on v2e/v2f
+finals; `--probes longlife,capacity --n-files 48` (job 98) and
+`LONGLIFE_CKPT=8,128,1024,4096 --probes longlife --n-files 16` (job 103).
+
+---
+
 ## 2026-07-13 — Addressed defers (G2): 800 SFT steps create the selection mechanism that free training never built
 
 **TL;DR.** The cued probe of 2026-07-12 showed selection was *never
