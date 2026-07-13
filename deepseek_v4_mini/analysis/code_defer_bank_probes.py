@@ -631,6 +631,116 @@ def probe_capacity(raw, tok, model, dev, n_files):
             ("foreign", "reset", "unwritten label vs reset (no hallucinated address)")])
 
 
+def probe_capacity_curve(raw, tok, model, dev, n_files):
+    """(e) du plan 350M (2026-07-13) — LA figure du dossier : rappel adressé(N)
+    À TRAVERS la frontière d'éviction. Étend `capacity` (N <= max_mem) : N fils
+    étiquetés (1 chunk chacun, format identique) écrits dans la banque, N
+    jusqu'à 2×max_mem — pour N > max_mem les fils les plus anciens ne vivent
+    plus QUE dans la page (ckpt cascade, capture FIFO comme probe_page) ou dans
+    les résidus de superposition (ckpt banque seule). Rappel label-cued par
+    groupe d'âge : résidents (derniers max_mem) vs évincés ; sur ckpt cascade
+    les évincés sont aussi mesurés page ABLATÉE (la contribution de la page à
+    la traversée = le chiffre v3). Ne juge que les ckpts addr_label (v2f+).
+    Prédictions datées : voir le job 109."""
+    from deepseek_v4_mini.code_data import file_label_ids
+    t = raw.get("training", raw.get("train", {}))
+    depth = int(t.get("cascade_depth", 0) or 0)
+    casc_on = depth > 0
+    if casc_on:
+        from deepseek_v4_mini.cascade import CascadeMemory
+        cmap = t.get("cascade_map")
+        cmap = ([int(v) for v in cmap] if cmap else
+                [0] * (model.cfg.n_layers - depth) + list(range(1, depth + 1)))
+    think_id = tok.convert_tokens_to_ids("<think>")
+    blank_id = tok.convert_tokens_to_ids("<blank>")
+    seed_slots = int(getattr(model.cfg, "mem_seed_slots", model.cfg.max_mem))
+    max_mem = int(model.cfg.max_mem)
+    dt = next(model.parameters()).dtype
+    Ns = (2, 4, 8, 12, 16)
+
+    def write_threads(seqs):
+        """1 write par fil (label+chunk), capture d'éviction si cascade."""
+        bank = model.thought_stream.seed_bank(1, dev, dt) if casc_on else None
+        casc = CascadeMemory(depth, max_mem) if casc_on else None
+        nev = 0
+        for s in seqs:
+            x = torch.cat([s.unsqueeze(0).to(dev),
+                           torch.full((1, 1), think_id, dtype=torch.long, device=dev)], 1)
+            pre0 = (bank[:, 0].detach()
+                    if casc_on and bank.size(1) >= max_mem else None)
+            with torch.no_grad():
+                bank = model(x, init_mem=bank,
+                             layer_banks=casc.layer_banks(bank, cmap)
+                             if casc_on else None)["mem_bank"]
+            if pre0 is not None:
+                nev += 1
+                if nev > seed_slots:
+                    casc.push_slot(pre0)
+        return bank, casc
+
+    def addr_ce(bank, casc, cue, gt, ablate=False):
+        lb = None
+        if casc is not None:
+            lb = casc.layer_banks(bank, cmap)
+            if ablate:
+                lb = [bank if lvl == 0 else None for lvl in cmap]
+        C = cue.numel()
+        di = torch.cat([cue.unsqueeze(0).to(dev),
+                        torch.full((1, DL), blank_id, dtype=torch.long, device=dev)], 1)
+        with torch.no_grad():
+            lg = model(di, init_mem=bank, layer_banks=lb)["logits"].float()[:, C:]
+        return float(F.cross_entropy(lg.reshape(-1, lg.size(-1)), gt.reshape(-1)))
+
+    stream = _stream(raw, tok, seed=555)  # même seed que capacity
+    pools = _pools(stream)
+    G = max(Ns) + 1  # fils + 1 non-écrit (foreign)
+    for si, nm in enumerate(stream.src_names):
+        fs = pools[si]
+        pool_n = min(len(fs), 200)
+        keys = [f"n{N}" for N in Ns]
+        keys += [f"n{N}_res" for N in Ns if N > max_mem]
+        keys += [f"n{N}_ev" for N in Ns if N > max_mem]
+        if casc_on:
+            keys += [f"n{N}_ev_off" for N in Ns if N > max_mem]
+        keys += ["foreign", "reset"]
+        res = {k: [] for k in keys}
+        for i in range(n_files):
+            group = [fs[(i * G + k) % pool_n] for k in range(G)]
+            labs = [file_label_ids(tok, g) for g in group]
+            gts = [g[1][:DL].unsqueeze(0).to(dev) for g in group]
+            for N in Ns:
+                bank, casc = write_threads(
+                    [torch.cat([labs[k], group[k][0]]) for k in range(N)])
+                ces = [addr_ce(bank, casc, labs[k], gts[k]) for k in range(N)]
+                res[f"n{N}"].append(sum(ces) / N)
+                if N > max_mem:
+                    ev = list(range(N - max_mem))       # fils sortis de la banque vive
+                    rs = list(range(N - max_mem, N))    # résidents
+                    res[f"n{N}_ev"].append(sum(ces[k] for k in ev) / len(ev))
+                    res[f"n{N}_res"].append(sum(ces[k] for k in rs) / len(rs))
+                    if casc_on:
+                        off = [addr_ce(bank, casc, labs[k], gts[k], ablate=True)
+                               for k in ev]
+                        res[f"n{N}_ev_off"].append(sum(off) / len(off))
+                if N == max(Ns):
+                    res["foreign"].append(addr_ce(bank, casc, labs[G - 1], gts[G - 1]))
+            res["reset"].append(sum(addr_ce(None, None, labs[k], gts[k])
+                                    for k in range(2)) / 2)
+        print(f"\n[{nm}] CAPACITY CURVE (n={n_files}, N fils étiquetés 1-chunk, "
+              f"rappel label-cued, max_mem={max_mem}, cascade={'on' if casc_on else 'off'})")
+        pairs = [("n2", "reset", "valeur adressée à N=2"),
+                 ("n8", "n2", "coût d'interférence N=8 (banque pleine)"),
+                 ("n12_res", "n8", "résidents sous pression d'éviction (N=12)"),
+                 ("n16_res", "n8", "résidents sous pression d'éviction (N=16)"),
+                 ("n12_ev", "reset", "évincés N=12 vs reset (traversée ?)"),
+                 ("n16_ev", "reset", "évincés N=16 vs reset (traversée ?)"),
+                 ("foreign", "reset", "label non écrit vs reset (pas d'adresse hallucinée)")]
+        if casc_on:
+            pairs += [("n12_ev", "n12_ev_off", "contribution PAGE aux évincés (N=12)"),
+                      ("n16_ev", "n16_ev_off", "contribution PAGE aux évincés (N=16)")]
+        _report(res, n_files, pairs)
+
+
 def probe_longlife(raw, tok, model, dev, n_files):
     """Long-life health (350M validation plan, 2026-07-13): no run ever wrote
     more than ~30 times into one carried bank; the cascade promises thousands.
@@ -846,7 +956,8 @@ PROBES = {"swap": probe_swap, "dup": probe_dup, "distractor": probe_distractor,
           "order": probe_order, "eviction": probe_eviction,
           "cohab": probe_cohab, "reflect": probe_reflect, "invar": probe_invar,
           "cued": probe_cued, "merge": probe_merge,
-          "capacity": probe_capacity, "longlife": probe_longlife,
+          "capacity": probe_capacity, "capacity_curve": probe_capacity_curve,
+          "longlife": probe_longlife,
           "page": probe_page, "resetcue": probe_resetcue, "xmodal": probe_xmodal}
 
 
