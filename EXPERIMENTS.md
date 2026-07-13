@@ -86,6 +86,7 @@ verdicts gate everything after.
 | divmix zero-shot (smoke 2026-07-13) | does the v2c bank transfer to unseen languages/domains? | ✅ GAP positive on all 14 sources incl. never-seen C/Rust/JS/SQL (+1.2..+1.7), arXiv grows with depth | **surface-reuse confound open**: invar on unseen languages (in job 107) is the discriminating test — do not claim "abstraction" yet |
 | v2e_divmix trained (job 107) | 14-source diversity at constant recipe: anchors hold? new-domain GAP? | 🟡 staged (anchors codeparrot/fineweb kept comparable to v2e) | GREEN ⇒ official 350M mix |
 | reach-back SFT (option 2, v3_reach, job 108) | can the page read be *created* like addressing was? | 🟡 queued — targets stratified by eviction age (user reservation: deepest-block targets may not learn → stratum s2 is the sub-verdict; s3 "destroyed" = negative control) | verdict = page probe on final ckpt (early_on vs early_off must separate) |
+| capacity curve across eviction (job 109) | addressed recall(N) for N up to 2×max_mem: residents vs evicted, page contribution by ablation | 🟡 queued (probe capacity_curve on v2h + v3_lite; the arm that should separate page on/off is v3_reach, rerun chained to job 108's verdict) | plan point (e) — THE funding figure |
 | 350M validated run | the funded/self-funded scale point | pending full validation arc | plan in passation §2bis |
 
 ---
