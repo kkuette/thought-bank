@@ -37,6 +37,42 @@ test this — before scale.
 
 ---
 
+## 2026-07-13 (4) — Cascade depth is a pure deployment flag (v3_deep GREEN)
+
+Pre-registered blocking point for the 350M plan (job 100, config
+`v3_deep.yaml`, sole diff vs `v3_lite`: `cascade_map [0,0,0,0,1,2]` → level 2
+attached to the last layer — first level-2 matrix would only appear at the
+16th descent, so at the training regime (~8–20 descents/life) the level stays
+essentially empty; exactly the situation of depth 4 at 350M).
+
+**Grid: carried CE @800 within ±0.15 nat of v3_lite ⇒ GREEN.** Result:
+codeparrot 6.600 vs 6.604 (Δ **−0.004**), fineweb 7.368 vs 7.336
+(Δ **+0.032**). A layer wired to a level that never fills costs nothing —
+**the 350M can ship depth 4 without waiting for lives long enough to fill it.**
+
+Side replications, all consistent with the (3) entry below:
+- **Page verdict, 3rd config**: emergence null (page on vs ablated −0.022 ±
+  0.017 code / −0.009 ± 0.007 web, |t| ≤ 1.3), reach-back target real
+  (−1.419 |t|~12 code — the largest seen yet — vs −0.088 |t|~2.4 web),
+  page cost on recent ≈ 0 (+0.04/+0.02). Strengthens option 2 (v3_reach,
+  job 108, now running).
+- **REGISTER volatility again**: swap-vs-reset +1.38 on code, −0.08 on web —
+  same per-seed/per-domain instability as v2g.
+- **Addressing intact under depth-2 wiring**: label-cue −1.267 |t|~15.4.
+
+Not established: neutrality of a **filled** level 2 (no life here was long
+enough); the web-side reach-back is much weaker than code (−0.09 vs −1.42) —
+domain asymmetry unexplained.
+
+Repro: `python -m deepseek_v4_mini.code_defer_native
+deepseek_v4_mini/configs/farm/v3_deep.yaml --resume` puis
+`PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py
+deepseek_v4_mini/configs/farm/v3_deep.yaml
+/mnt/tb/checkpoints/farm/v3_deep/final.pt --probes page,swap,distractor,cued
+--n-files 48`.
+
+---
+
 ## 2026-07-13 (3) — Page verdict: reach-back does not emerge (2× RED) but the target is real; cross-modal transfer is GREEN zero-shot
 
 Two pre-registered verdicts land, one refutation and one win — both redirect
