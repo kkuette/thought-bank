@@ -37,6 +37,65 @@ test this — before scale.
 
 ---
 
+## 2026-07-13 (3) — Page verdict: reach-back does not emerge (2× RED) but the target is real; cross-modal transfer is GREEN zero-shot
+
+Two pre-registered verdicts land, one refutation and one win — both redirect
+the roadmap exactly as their decision rules said they would.
+
+**Cascade page (v3_lite, 2 seeds × 2 domains, n=48): the model does NOT read
+the page zero-shot.** The probe writes 8 files, lets the live bank evict
+file 0 into the level-1 page (map `[0,0,0,0,1,1]`), then asks for file 0's
+continuation with the page real vs ablated. Ablation changes nothing:
+d = −0.008/−0.000 (s1), −0.006/+0.007 (s2), no |t| above 2.4 and the signs
+disagree across seeds. Emergence: **refuted on both seeds** — the
+pre-registered option 2 applies (train the page read by SFT, the v2f recipe
+that created addressing from an equally null zero-shot).
+
+Two facts in the same tables make option 2 well-posed rather than hopeful:
+
+1. **The reach-back target exists.** The evicted file stays recoverable at
+   −0.37 to −0.72 nat below reset (|t| 4.7–12.6, all 4 cells) — but
+   `early_on ≈ early_off` shows this comes from *superposition residue in the
+   live bank* (the redundancy that carried past FIFO eviction in the horizon
+   run), not from the page. There is measurable signal for a trained read to
+   improve on.
+2. **The page costs nothing when unread** (d on recent targets ≤ 0.004, all
+   cells). The cascade is a neutral substrate — training a read into it risks
+   nothing acquired.
+
+Reservation registered for the option-2 arm (user, 2026-07-13): targets whose
+content sits in the *deepest, most-merged block* may not learn. The arm will
+stratify its supervised reach-back targets by eviction age and log the loss
+per stratum — the reservation becomes a sub-verdict instead of an unknown.
+
+**Cross-modal docstring↔body (B3, zero-shot, n=48, Python): GREEN.** Writing
+*only the docstring* into the bank helps generate the function body:
++1.17 nat over an empty bank on v2e_interleave (|t| 14.1), *specific* (the
+right docstring beats a foreign one by +0.21), and only 0.31 nat short of the
+ceiling where the body itself was written. This is the first direct evidence
+for the bank-as-cross-register-CoT vision: cohabitation was already known,
+this is *transfer*. Surprise worth keeping: v2f_addr transfers much less
+(+0.26, just under the +0.3 bar) — addressing training may bind gists closer
+to surface form. Decision rule says GREEN ⇒ the doc-only training mode
+(defer body from docstring-only writes, p~0.3) is now codable; the asymmetry
+says measure it on both recipes.
+
+Also from the divmix smoke (zero-shot, 14-source mix): the v2c bank transfers
+to never-seen languages at full strength (C +1.24, Rust +1.26, JS +1.40,
+SQL +1.24, HTML +1.67 — Rust with in-context ppl 928, i.e. the bank helps
+*more* where the LM is most lost). Deliberately NOT claimed as abstraction:
+same-file identifier reuse would produce the same numbers, and invar measured
+only ~47 % renaming-survival at 135M. The discriminating test (invar on
+unseen languages) is in job 107's battery.
+
+Repro: `queue` jobs 97/099 (page), 105 (xmodal); probes `page`, `xmodal` in
+`deepseek_v4_mini/analysis/code_defer_bank_probes.py`; divmix config
+`deepseek_v4_mini/configs/farm/v2e_divmix.yaml` (commit ce4a755). Experiment
+map: `EXPERIMENTS.md` (new — one row per test, the "not established" column
+is mandatory).
+
+---
+
 ## 2026-07-13 (2) — The full stack composes; bank health holds to 4096 writes; the fractal merge floor holds at 64 units
 
 Six runs land together and close most of the pre-cascade checklist.
