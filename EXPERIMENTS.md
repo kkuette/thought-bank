@@ -87,6 +87,7 @@ verdicts gate everything after.
 | v2e_divmix trained (job 107) | 14-source diversity at constant recipe: anchors hold? new-domain GAP? | 🟡 staged (anchors codeparrot/fineweb kept comparable to v2e) | GREEN ⇒ official 350M mix |
 | reach-back SFT (option 2, v3_reach, job 108) | can the page read be *created* like addressing was? | 🟡 queued — targets stratified by eviction age (user reservation: deepest-block targets may not learn → stratum s2 is the sub-verdict; s3 "destroyed" = negative control) | verdict = page probe on final ckpt (early_on vs early_off must separate) |
 | capacity curve across eviction (job 109) | addressed recall(N) for N up to 2×max_mem: residents vs evicted, page contribution by ablation | 🟡 queued (probe capacity_curve on v2h + v3_lite; the arm that should separate page on/off is v3_reach, rerun chained to job 108's verdict) | plan point (e) — THE funding figure |
+| v350_rehearsal (job 110) | dress rehearsal: the FULL 350M recipe (divmix + D+G+G2 + cascade + reach + bf16) trained from scratch at 97M — do the SFT-created mechanisms appear under joint training? | 🟡 queued (2000 steps ~26h; guard: NaN before 200 ⇒ rerun fp32 = a bf16 verdict) | mechanisms missing ⇒ 350M needs a curriculum (pretrain → SFT), to know before paying |
 | 350M validated run | the funded/self-funded scale point | pending full validation arc | plan in passation §2bis |
 
 ---
