@@ -1,3 +1,20 @@
+# v350_rehearsal_d3 — BRAS CONTRÔLÉ DEPTH 3 du rehearsal (décision user
+# 2026-07-13 soir). UNE SEULE variable vs v350_rehearsal : cascade_map
+# [0,0,0,1,2,3] (depth 3) au lieu de [0,0,0,0,1,2] (depth 2). Pourquoi depth 3
+# compte : une vie de 8 fichiers ~ 64 writes = 56 évictions ; couverture
+# niveau 1 = 8, niveau 2 = 16, niveau 3 = 32 => 56 : depth 3 = RÉTENTION
+# TOTALE de la vie (depth 2 détruit encore la moitié la plus vieille). Le prix
+# à payer : 3 couches seulement sur la banque vive (jamais testé — v3_lite en
+# gardait 4) alors que le 350M en gardera proportionnellement bien plus. Donc :
+#   carried d3 vs d2 = le prix des couches vives (si d3 le paye, la proportion
+#     de couches vives est LE paramètre à protéger à l'échelle) ;
+#   reach s3 = vraiment apprenable ici (rien n'est détruit), vs d2 où s3
+#     couvre en partie du contenu perdu.
+# PRÉDICTION (2026-07-13, Fable) : carried d3 <= d2 + 0.3 nat (le passage 4->3
+# couches vives coûte mais pas un effondrement) ; reach s3 descend SOUS son
+# niveau d2 en fin de run. VERDICT dossier : d3 ~ d2 => la profondeur est
+# gratuite même REMPLIE ; d3 >> d2 => 350M garde la fraction vive haute.
+# (Héritage v350_rehearsal ci-dessous :)
 # v350_rehearsal — RÉPÉTITION GÉNÉRALE DU 350M À 97M (demande user 2026-07-13) :
 # un run de validation COMPLET from scratch qui réplique à petite échelle
 # exactement ce que fera le 350M — tout est ce que le grand run utilisera,
@@ -195,16 +212,16 @@ training:
   - codeparrot
   - fineweb
   save_every: 500
-  save_dir: /mnt/tb/checkpoints/farm/v350_rehearsal
-  metrics_file: /mnt/tb/runs/farm_v350_rehearsal/metrics.jsonl
+  save_dir: /mnt/tb/checkpoints/farm/v350_rehearsal_d3
+  metrics_file: /mnt/tb/runs/farm_v350_rehearsal_d3/metrics.jsonl
   interleave_files:
   - 2
   - 4
   addr_prob: 0.5
   addr_label: true
   no_reset_files: 8
-  cascade_depth: 2
-  cascade_map: [0, 0, 0, 0, 1, 2]
+  cascade_depth: 3
+  cascade_map: [0, 0, 0, 1, 2, 3]
   reach_prob: 0.35
   reach_max: 2
 teacher:
