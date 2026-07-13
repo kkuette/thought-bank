@@ -10,7 +10,7 @@ set -uo pipefail
 WORK=/workspace
 REPO_URL=${REPO_URL:-https://github.com/kkuette/thought-bank.git}
 BRANCH=${BRANCH:-claude/status-check-2fa903}
-BASECFG=deepseek_v4_mini/configs/v350_bringup.yaml
+BASECFG=${BASECFG:-deepseek_v4_mini/configs/v350_bringup.yaml}
 SUMMARY=$WORK/sweep_summary.txt
 
 mkdir -p $WORK && cd $WORK
