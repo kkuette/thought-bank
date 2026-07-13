@@ -44,6 +44,7 @@ class ThoughtBankConfig:
     mem_dim: int = 64          # thought-vector dimension (= fast-weight code size)
     max_mem: int = 32          # max bank size (FIFO-evict the oldest beyond this)
     mem_seed_slots: int = 4    # random-uniform[0,1] slots seeding a fresh bank
+    mem_seed_init: str = "uniform01"  # "uniform01" | "pm1" (uniform[-1,1]) | "zeros" — ablation idée E
     mem_read_rank: int = 16    # bottleneck rank of each per-slot fast-weight layer
     mem_read_dropout: float = 0.0  # dropout inside the fast-weight MLP layers
 

@@ -25,7 +25,8 @@ apt-get install -y nvidia-driver firmware-misc-nonfree
 echo "== Montage NFS =="
 mkdir -p "$MNT"
 # NFSv3 : server0/Unraid a refuse le v4 lors de la mise en place (2026-07-10)
-FSTAB_LINE="${NFS_HOST}:/mnt/user/${NFS_SHARE} ${MNT} nfs vers=3,nolock,hard,noatime,_netdev 0 0"
+# automount : évite la course au boot quand le réseau (pont wifi) est lent à monter
+FSTAB_LINE="${NFS_HOST}:/mnt/user/${NFS_SHARE} ${MNT} nfs vers=3,nolock,hard,noatime,_netdev,x-systemd.automount,x-systemd.mount-timeout=90 0 0"
 grep -qF "$FSTAB_LINE" /etc/fstab || echo "$FSTAB_LINE" >> /etc/fstab
 mount -a
 mountpoint -q "$MNT" && echo "NFS OK: $MNT" || { echo "ECHEC montage NFS"; exit 1; }
@@ -33,17 +34,19 @@ mountpoint -q "$MNT" && echo "NFS OK: $MNT" || { echo "ECHEC montage NFS"; exit 
 echo "== Arborescence partagée (no-op si déjà là) =="
 mkdir -p "$MNT"/{data,checkpoints,runs,queue,queue/running,queue/done,queue/failed}
 
-echo "== Env Python =="
-if [ ! -d /opt/tb-venv ]; then
-  python3 -m venv /opt/tb-venv
-  /opt/tb-venv/bin/pip install --upgrade pip
-  /opt/tb-venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu121
-  /opt/tb-venv/bin/pip install numpy pyyaml tokenizers datasets safetensors
-fi
-
 echo "== Repo =="
 if [ ! -d /opt/thought-bank ]; then
   git clone https://github.com/kkuette/thought-bank /opt/thought-bank
+fi
+
+echo "== Env Python =="
+if [ ! -d /opt/tb-venv ]; then
+  python3 -m venv /opt/tb-venv
+  # TMPDIR : /tmp est un tmpfs limité par la RAM (trixie) — le wheel torch (780 Mo) le remplit
+  export TMPDIR=/var/tmp
+  /opt/tb-venv/bin/pip install --upgrade pip
+  /opt/tb-venv/bin/pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121
+  /opt/tb-venv/bin/pip install --no-cache-dir -r /opt/thought-bank/requirements.txt
 fi
 
 echo "== Power limit au boot =="
@@ -53,6 +56,11 @@ Description=Power-limit GPUs a ${POWER_LIMIT}W
 After=multi-user.target
 [Service]
 Type=oneshot
+# post-mortem 2026-07-12 : au boot le driver peut ne pas etre pret — sans
+# retry le oneshot echoue et les GPU restent a 310W (suspect n°1 de la coupure)
+RemainAfterExit=yes
+TimeoutStartSec=600
+ExecStartPre=/bin/sh -c 'until /usr/bin/nvidia-smi >/dev/null 2>&1; do sleep 5; done'
 ExecStart=/usr/bin/nvidia-smi -pm 1
 ExecStart=/usr/bin/nvidia-smi -pl ${POWER_LIMIT}
 [Install]
@@ -67,6 +75,9 @@ cat > /etc/systemd/system/tb-worker@.service <<'EOF'
 Description=thought-bank GPU worker %i
 After=gpu-powerlimit.service remote-fs.target
 Requires=remote-fs.target
+# post-mortem 2026-07-12 : NFS pas pret au boot => crash-loop rapide => la
+# rate-limit systemd abandonne le worker pour de bon (gpu1 mort au redemarrage)
+StartLimitIntervalSec=0
 [Service]
 Environment=GPU_ID=%i
 Environment=TB_MNT=/mnt/tb

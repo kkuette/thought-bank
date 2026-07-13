@@ -1,0 +1,104 @@
+# v2e_delta — B4 : canal DeltaNet INTERNE (backlog 2026-07-13 ; steelman
+# linear-attention à 97M, science interne — l'engagement public r/LocalLLaMA
+# reste « à l'échelle cible dans la run financée »).
+# MODÈLE strictement identique à v2e (read fast-weight, write intra-chunk,
+# model.py intouché) ; seul le CANAL INTER-CHUNKS change : le carry de banque
+# (o["mem_bank"]) est remplacé par un état gated delta-rule S [64×64] mis à
+# jour token par token sur les embeddings du chunk, présenté au read comme
+# pseudo-banque [8×512] (reshape exact + RMS-norm par slot + gain appris).
+# ~50k params ajoutés (AdamW). Voir delta_channel.py.
+# PRÉDICTION (datée 2026-07-13, Fable) : le canal delta porte un GAP réel
+# (> +0.3 carried vs reset — le read sait consommer une superposition, probes
+# merge) mais NETTEMENT sous la banque (GAP final < v2e −0.5 nat, surtout en
+# profondeur d6-d8 : état rang ≤ 64 sans éviction structurée vs 8 slots ×
+# 512 dims écrits par une tête entraînée). Les DEUX issues sont informatives
+# (memoire dsv4mini-baseline-deltanet-steelman) : si delta ≈ banque, la banque
+# n'est qu'un canal linéaire de plus ; si delta << banque, le write appris est
+# le mécanisme. Verdict = eval du trainer (GAP + par profondeur, règle 4 :
+# comparer CARRIED) + probes swap/cued/xmodal (write_seq delta exact, les
+# probes détectent le canal dans le ckpt). VRAM ≈ v2e (état 16 Ko) ; coût =
+# boucle séquentielle 512 pas/chunk, s/step attendu +30-60 % vs v2e (~19-20 s)
+# => ~7-9 h. Si > 40 s/step au smoke : tuer, chunker la boucle avant de queuer.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  cache_dir: /mnt/tb/data_cache
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 8
+  amp: true
+  init_from: /mnt/tb/checkpoints/code_defer_native_v2c_varlen/final.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 20
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  log_every: 10
+  eval_every: 100
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  save_every: 400
+  save_dir: /mnt/tb/checkpoints/farm/v2e_delta
+  metrics_file: /mnt/tb/runs/farm_v2e_delta/metrics.jsonl
+  interleave_files:
+  - 2
+  - 4
+  delta_channel:
+    d_k: 64
+teacher:
+  enabled: false

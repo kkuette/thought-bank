@@ -133,6 +133,43 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
     return files
 
 
+def file_label_ids(tok, f, n_digits=6):
+    """Stable synthetic address for a file (idea G2, 2026-07-12): a determinist
+    arithmetic hash of its opening tokens rendered as '<<FILE:483920>>' token
+    ids. Same file => same label across convs, processes and probes; synthetic
+    (not the real path) so addressing is measured without semantic leakage."""
+    ts = f[0][:16].tolist()
+    h = sum((i + 1) * int(t) for i, t in enumerate(ts)) % 10 ** n_digits
+    return torch.tensor(tok(f"<<FILE:{h:0{n_digits}d}>>")["input_ids"],
+                        dtype=torch.long)
+
+
+def docstring_pairs(text, tok, min_doc=8, min_body=32, max_pairs=4):
+    """B3 (backlog 2026-07-13) : paires (docstring, corps) extraites d'un source
+    Python — niveau REGEX (le corps court jusqu'au prochain def/class en début
+    de ligne, les méthodes imbriquées débordent dedans ; docstrings triple-quote
+    seulement). Suffisant pour la probe cross-modale docstring↔code ; le mode
+    d'entraînement (defer corps depuis write doc-only) réutilisera ce helper si
+    le zero-shot montre un signal. Retourne [(doc_ids, body_ids)] tokenisés."""
+    import re
+    out = []
+    pat = re.compile(
+        r"def\s+\w+\s*\([^)]*\)[^:\n]*:\s*\n\s+[rbuRBU]*(\"\"\"|''')(.*?)\1[ \t]*\n"
+        r"(.*?)(?=\ndef\s|\nclass\s|\Z)", re.DOTALL)
+    for m in pat.finditer(text):
+        doc, body = m.group(2).strip(), m.group(3).strip("\n")
+        if not doc or not body.strip():
+            continue
+        di = tok.encode(doc, add_special_tokens=False)
+        bi = tok.encode(body, add_special_tokens=False)
+        if len(di) >= min_doc and len(bi) >= min_body:
+            out.append((torch.tensor(di, dtype=torch.long),
+                        torch.tensor(bi, dtype=torch.long)))
+        if len(out) >= max_pairs:
+            break
+    return out
+
+
 class CodeChunkStream:
     def __init__(self, tokenizer, *, seq_len: int = 2048, chunks_per_conv: int = 3,
                  batch: int = 1, n_files: int = 800, split: str = "train",
@@ -312,6 +349,96 @@ class CodeChunkStream:
                     tgt[b, :nx.numel()] = nx
             segs.append({"input_ids": ids, "attention_mask": torch.ones_like(ids),
                          "defer_tgt": tgt})
+        return segs
+
+    def next_conv_interleaved(self, n_streams: int, defer_len: int = 16,
+                              label: bool = False, addr_prob: float = 0.0,
+                              addr_cue_len: int = 16, addr_max: int = 2) -> list[dict]:
+        """Idea G (2026-07-11): ONE bank lifetime holds n_streams files whose chunks
+        are randomly interleaved (within-file order preserved) — school-style spaced
+        practice instead of sequential no-reset chains. The total chunk budget matches
+        next_conv (m ~ U[2, K]) split across the streams, so VRAM/compute are unchanged
+        vs v2c; only the STRUCTURE differs. Each seg carries its own defer_tgt (the
+        SAME file's successor chunk, -100-padded) because the next seg in the flat
+        list usually belongs to another file. Kills the no-reset boundary confound:
+        an off-topic LAST write no longer implies the current thread is dead — the
+        read must select by content, not by a recency/boundary heuristic.
+        n_streams: int = fixed F; (lo, hi) = F ~ U[lo, hi] SAMPLED per conv (like
+        depth): some convs are 2 deep subjects, some are hi brief ones. F is then
+        capped by m_total, so shallow convs stay naturally less fragmented.
+
+        G2 extensions (2026-07-12, both OFF by default):
+          label      prepend the file's stable synthetic address (file_label_ids)
+                     to every chunk at WRITE time — the gist must encode it.
+          addr_prob  after a seg, with this probability attach an ADDRESSED defer
+                     toward a random OTHER live stream: cue = that stream's label
+                     (50%) or the raw opening of its last written chunk (50%),
+                     target = its next chunk's opening. The cue identifies the
+                     thread but sits ~a chunk away from the target, so the gist
+                     is the only bridge — trains content/label-addressed reads
+                     that the blank defer (recency convention) never exercises."""
+        assert self.B == 1, "interleave: ragged variable-depth streams require batch=1"
+        dl = int(defer_len)
+        m_total = self.rng.randint(2, self.K)
+        if isinstance(n_streams, (list, tuple)):
+            n_streams = self.rng.randint(int(n_streams[0]), int(n_streams[1]))
+        F = min(int(n_streams), m_total)
+        cuts = sorted(self.rng.sample(range(1, m_total), F - 1)) if F > 1 else []
+        parts = [b - a for a, b in zip([0] + cuts, cuts + [m_total])]
+        streams: list[list[dict]] = []
+        files: list[list[torch.Tensor]] = []
+        lbl_ids: list[torch.Tensor | None] = []
+        for m in parts:
+            f = self._pick_file()
+            if self.var_chunk:
+                f = self._reslice(f)
+            m = min(m, len(f))
+            st = self.rng.randrange(0, len(f) - m + 1)
+            lb = file_label_ids(self.tok, f) if label else None
+            q = []
+            for j in range(st, st + m):
+                ids = f[j].unsqueeze(0)                     # [1, Lj]
+                if lb is not None:                          # write carries its address
+                    ids = torch.cat([lb.unsqueeze(0), ids], dim=1)
+                tgt = torch.full((1, dl), -100, dtype=torch.long)
+                if j + 1 < len(f):                          # same-file successor
+                    nx = f[j + 1][:dl]                      # (ragged tail ok)
+                    tgt[0, :nx.numel()] = nx
+                q.append({"input_ids": ids, "attention_mask": torch.ones_like(ids),
+                          "defer_tgt": tgt, "_j": j})
+            streams.append(q); files.append(f); lbl_ids.append(lb)
+        order = [i for i, q in enumerate(streams) for _ in q]
+        self.rng.shuffle(order)                             # uniform random merge
+        segs, last_j, elig = [], {}, []                     # sid -> last written j
+        for sid in order:
+            seg = streams[sid].pop(0)
+            last_j[sid] = seg.pop("_j")
+            # eligible: some OTHER live stream still has a successor here
+            cands = [s for s, j in last_j.items()
+                     if s != sid and j + 1 < len(files[s])]
+            if cands:
+                elig.append((len(segs), list(cands), dict(last_j)))
+            segs.append(seg)
+        # addressed defers: prob-gated then CAPPED at addr_max per conv (each
+        # extra forward pays a full fast-weight-read graph until the conv's
+        # backward — uncapped p=0.5 OOMs the 8 GB rigs, post-mortem 2026-07-12);
+        # sampled over ALL eligible positions so late/full banks stay represented
+        if addr_prob > 0 and elig:
+            picked = [e for e in elig if self.rng.random() < addr_prob]
+            if len(picked) > addr_max:
+                picked = self.rng.sample(picked, addr_max)
+            for pos, cands, lj in picked:
+                t = self.rng.choice(cands)
+                f_t, j_t = files[t], lj[t]
+                if lbl_ids[t] is not None and self.rng.random() < 0.5:
+                    cue = lbl_ids[t]                        # explicit address
+                else:
+                    cue = f_t[j_t][:addr_cue_len]           # semantic address (raw)
+                at = torch.full((1, dl), -100, dtype=torch.long)
+                nx = f_t[j_t + 1][:dl]
+                at[0, :nx.numel()] = nx
+                segs[pos]["addr_cue"] = cue.unsqueeze(0)
+                segs[pos]["addr_tgt"] = at
         return segs
 
     def _pick_source(self) -> int:

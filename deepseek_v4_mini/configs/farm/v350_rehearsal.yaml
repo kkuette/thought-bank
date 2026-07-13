@@ -1,0 +1,211 @@
+# v350_rehearsal — RÉPÉTITION GÉNÉRALE DU 350M À 97M (demande user 2026-07-13) :
+# un run de validation COMPLET from scratch qui réplique à petite échelle
+# exactement ce que fera le 350M — tout est ce que le grand run utilisera,
+# rien n'est hérité d'un checkpoint.
+#   data     = mix divmix 14 sources (le candidat mix officiel, cache partagé
+#              avec le job 107)
+#   schedule = la recette from-scratch VALIDÉE de v2b_mix (muon_lr 7.5e-4,
+#              warmup 100, step decay à 700, 2000 steps) + var_chunk
+#   stack    = D+G+G2 dès le step 0 (entrelacement, vies no-reset 8 fichiers,
+#              defers adressés + labels) + cascade depth 2 + perte reach-back
+#              stratifiée (option 2) — map [0,0,0,0,1,2] (câblage
+#              v3_deep) : avec des vies de 8 fichiers le niveau 1 DÉBORDE
+#              (~28 unités / 8 places), à depth 2 le débordement rétrograde au
+#              niveau 2 au lieu d'être détruit => s3 cesse d'être un contrôle
+#              négatif et devient le test du bloc profond (réserve user) dans
+#              la composition complète (correction user 2026-07-13)
+#   amp      = bf16 (le 350M ne tiendra pas en fp32 — le bf16 from-scratch est
+#              UN DES risques que cette répétition teste ; validé jusqu'ici en
+#              continued seulement)
+# CE QUE ÇA TESTE (et que rien n'a encore testé) : la COMPOSITION from scratch.
+# Tous les mécanismes (adressage v2f, stack v2h, reach v3) ont été créés par
+# SFT sur modèle chaud ; le 350M les entraînera conjointement depuis zéro. Si
+# un mécanisme n'apparaît pas dans ce régime, le 350M aura besoin d'un
+# curriculum (pretrain → SFT mécanismes), ce qu'il faut savoir AVANT de payer.
+# PRÉDICTIONS (2026-07-13, Fable, avant lancement) :
+#   1. pas de NaN (recette v2b validée fp32 ; le bf16 est le risque surveillé —
+#      garde job : NaN avant step 200 => relancer amp false, c'est un verdict) ;
+#   2. ic anchors sur la trajectoire v2b (~ppl 100-200 @2000 code) ;
+#   3. GAP ancres positif dès ~400-600 (post-warmup, avant même le decay) ;
+#   4. addr apprend PLUS LENTEMENT qu'en SFT chaud (v2f : 800 steps) mais finit
+#      < ~7.0 — c'est la prédiction la plus incertaine ;
+#   5. reach s1/s2 vs s3 : séparation visible seulement dans les ~500 derniers
+#      steps (tout s'apprend en même temps) ;
+#   6. probes finales : label-cue NÉGATIF (adressage présent), page probe =
+#      LE test d'émergence from-scratch du read de page sous perte reach.
+# VERDICT : VERT (pas de NaN + GAP > 0 partout + adressage présent aux probes)
+# => la recette 350M part TELLE QUELLE ; mécanisme manquant => curriculum
+# (pretrain puis SFT mécanismes) ; NaN bf16 => fp32/mixed à revoir AVANT devis.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  cache_dir: /mnt/tb/data_cache
+  sources:
+  # --- identique à v2e_divmix (cache hit garanti avec le job 107)
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.20
+    stream_cap: 90000
+  - name: stack_c
+    dataset: bigcode/the-stack-smol
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_rust
+    dataset: bigcode/the-stack-smol
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_js
+    dataset: bigcode/the-stack-smol
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_sql
+    dataset: bigcode/the-stack-smol
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_html
+    dataset: bigcode/the-stack-smol
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_css
+    dataset: bigcode/the-stack-smol
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.10
+    stream_cap: 250000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 60000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    stream_cap: 60000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 2000
+  grad_accum: 8
+  amp: true
+  # PAS d'init_from : from scratch, c'est le point.
+  lr: 0.0003
+  muon_lr: 0.00075
+  muon_ref_mem_dim: 64
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_start: 700
+  wsd_decay_shape: step
+  log_every: 10
+  eval_every: 200
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 500
+  save_dir: /mnt/tb/checkpoints/farm/v350_rehearsal
+  metrics_file: /mnt/tb/runs/farm_v350_rehearsal/metrics.jsonl
+  interleave_files:
+  - 2
+  - 4
+  addr_prob: 0.5
+  addr_label: true
+  no_reset_files: 8
+  cascade_depth: 2
+  cascade_map: [0, 0, 0, 0, 1, 2]
+  reach_prob: 0.35
+  reach_max: 2
+teacher:
+  enabled: false

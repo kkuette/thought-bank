@@ -1,0 +1,91 @@
+# FARM VALIDATION: 135M @ L=1024 batch 1 bf16 sur 3070Ti 8GB — pire cas VRAM du
+# programme 135M (8 chunks x 1024 tok). 100 steps, verdict = tient/tient pas + s/step.
+# Derive de code_defer_native_135m_L1024.yaml (continued-pretrain, sans teacher).
+# (2 tokens/float per gist vs 1 at L=512; bank horizon 8x1024=8k tokens).
+# v2c pattern: init_from the 135M final, no teacher, constant post-decay-plateau LR,
+# 2000 steps (~9-10h, 65k tokens/step). RoPE is computed on the fly => no positional surgery needed.
+# GATE: depth-GAP eval stays positive at L=1024. The GAP is NOT comparable to the
+# L=512 curve (more in-context => easier task); the quantity of interest is
+# GAP x compression ratio, and the depth profile shape.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 512
+  n_layers: 6
+  n_heads: 8
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 1152
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1024
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 12
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 1024
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  n_files: 24000                           # ~70M tokens a L=1024 = ~2 epoques pour 2000 steps (6000 => 7 epoques, piege data-bound du 135m)
+  stream_cap: 90000
+  cache_dir: /mnt/tb/data_cache
+training:
+  seed: 0
+  steps: 100
+  grad_accum: 8
+  amp: true                                # gate bf16 passe (courbe n=48 du 2026-07-10) ; activations x2 de L=1024 = le cas payant
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 20
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  wsd_floor: 0.0
+  wsd_decay_start: 700
+  wsd_decay_shape: step
+  log_every: 20
+  eval_every: 200
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  save_every: 500
+  save_dir: /mnt/tb/checkpoints/farm/validate_135m_L1024
+  metrics_file: /mnt/tb/runs/farm_validate_135m_L1024/metrics.jsonl
+  init_from: /mnt/tb/checkpoints/code_defer_native_135m_mix/final.pt
+teacher:
+  enabled: false                           # scaffold dismantled, v2c pattern
+  distill_weight: 2.0
+  anneal:
+  - 300
+  - 450

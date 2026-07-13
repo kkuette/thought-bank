@@ -1,0 +1,92 @@
+# v2h — LE STACK COMPLET D+G+G2 : entrelacement + carry (banque vit 4 groupes)
+# + defers adressés + labels. Le régime d'entraînement cible de la cascade v3 :
+# vies longues, fils mélangés, mémoire adressable. Départ v2c final, 800 steps.
+# GRILLE DE VERDICT (sans Fable) : (1) GAP standard >= v2e (~+1.6/+0.9) sinon le
+# stack coûte ; (2) probes cued open/lbl BANK VALUE et junk/thread-last vs v2f
+# seul (l'adressage survit-il aux vies longues ?) ; (3) last_xdom vs v2g seul
+# (le carry + labels attenue-t-il la convention récence ?) ; (4) loss addr du
+# log train doit finir sous ~7.0 comme v2f, sinon le carry noie l'adressage.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  cache_dir: /mnt/tb/data_cache
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 2
+  steps: 800
+  grad_accum: 8
+  amp: true
+  init_from: /mnt/tb/checkpoints/code_defer_native_v2c_varlen/final.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 20
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  log_every: 10
+  eval_every: 100
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  save_every: 400
+  save_dir: /mnt/tb/checkpoints/farm/v2h_stack_s2
+  metrics_file: /mnt/tb/runs/farm_v2h_stack_s2/metrics.jsonl
+  interleave_files:
+  - 2
+  - 4
+  addr_prob: 0.5
+  no_reset_files: 4
+  addr_label: true
+teacher:
+  enabled: false

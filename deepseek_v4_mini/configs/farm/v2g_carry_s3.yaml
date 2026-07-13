@@ -1,0 +1,89 @@
+# v2g_carry_s3 — 3e SEED du carry entrelacé (décidé 2026-07-13). Verdict à
+# 2 seeds non interprétable : s1 = REGISTER collapse (code +0.08, sous v2d
+# 0.50), s2 = sain (+0.77, niveau v2e). s3 tranche : collapse = exception ou
+# règle ? Ça calibre l'urgence du remède pages dans le récit du dossier.
+# PRÉDICTION (datée 2026-07-13, Fable) : pas de prédiction directionnelle —
+# c'est précisément ce qu'on mesure. Prior faible : 50/50. Carried et GAP
+# standard doivent tenir dans tous les cas (règle 4 : comparer carried).
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  cache_dir: /mnt/tb/data_cache
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 3
+  steps: 800
+  grad_accum: 8
+  amp: true
+  init_from: /mnt/tb/checkpoints/code_defer_native_v2c_varlen/final.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 20
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  log_every: 10
+  eval_every: 100
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  save_every: 400
+  save_dir: /mnt/tb/checkpoints/farm/v2g_carry_s3
+  metrics_file: /mnt/tb/runs/farm_v2g_carry_s3/metrics.jsonl
+  interleave_files:
+  - 2
+  - 4
+  no_reset_files: 4
+teacher:
+  enabled: false

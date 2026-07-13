@@ -1,0 +1,99 @@
+# v3_lite — CASCADE BLOCS 0-1 sur le stack complet D+G+G2 (v2h + page).
+# Spec user 2026-07-12 (débordement en 2 temps × fractale max_mem) : le slot
+# évincé de la banque vive DÉBORDE vers la page (niveau 1, 2 positions de 8),
+# les couches 4-5 lisent la page mergée (poids de read PROPRES, déjà per-layer),
+# niveaux détachés du graphe (le read apprend, le write non — pattern G2).
+# PRÉDICTION (datée 2026-07-13, Fable) : (1) GAP standard tient (carried ~6.5-6.6,
+# règle 4 : comparer carried pas GAP) ; (2) le régime v2g (~20 chunks/vie, ~12
+# slots réels descendus) forme la pos 1 de la page => probe page-ablation à
+# venir : defer avec page réelle vs page à None — VERT si d > 0.05 nat (le read
+# 4-5 tire du signal de la page = OPTION 1 émergence, sans reach-back supervisé) ;
+# (3) addr loss finit < 7.2 (l adressage survit à la page). Si (2) ROUGE =>
+# option 2 : reach-back supervisé (cibles = successeurs de fils paginés, recette
+# v2f). VRAM : lecture page = 1 banque de plus par forward, pic attendu ~6.5 GiB.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  cache_dir: /mnt/tb/data_cache
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 8
+  amp: true
+  init_from: /mnt/tb/checkpoints/code_defer_native_v2c_varlen/final.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 20
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  log_every: 10
+  eval_every: 100
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  save_every: 400
+  save_dir: /mnt/tb/checkpoints/farm/v3_lite
+  metrics_file: /mnt/tb/runs/farm_v3_lite/metrics.jsonl
+  interleave_files:
+  - 2
+  - 4
+  addr_prob: 0.5
+  no_reset_files: 4
+  cascade_depth: 1
+  cascade_map: [0, 0, 0, 0, 1, 1]
+  addr_label: true
+teacher:
+  enabled: false

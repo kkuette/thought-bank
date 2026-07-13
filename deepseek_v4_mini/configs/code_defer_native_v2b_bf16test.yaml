@@ -1,0 +1,85 @@
+# bf16 VALIDATION (gate for 1B/pods/cost figures): v2b_mix verbatim but amp: true,
+# 800 steps (covers teacher anneal [300,450] + first evals of the consolidated GAP).
+# Verdict = eval GAPs @600/800 vs the fp32 v2b_mix run at the same steps
+# (fp32 reference: GAP ~+0.6-1.0 by step 600-800). amp was never validated on the
+# GAP at any scale (it shipped inside the 386M config that spilled).
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 4
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 2
+  amp: true
+  lr: 0.0003
+  muon_lr: 0.00075
+  muon_ref_mem_dim: 64
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_start: 700
+  wsd_decay_shape: step
+  log_every: 20
+  eval_every: 200
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  save_every: 800
+  save_dir: checkpoints/code_defer_native_v2b_bf16test
+  metrics_file: runs/code_defer_native_v2b_bf16test/metrics.jsonl
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal:
+  - 300
+  - 450
