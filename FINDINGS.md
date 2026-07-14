@@ -37,6 +37,53 @@ test this — before scale.
 
 ---
 
+## 2026-07-14 (3) — Saturation scan (capacity_deep, jobs 113/114/115) : le registre ne meurt JAMAIS (jusqu'à 64× la capacité), la page contribue partout en milli-nats (↑ avec la profondeur, ↑ sources structurées) mais ne devient jamais adressée
+
+**Setup.** Probe `capacity_deep` sur 3 checkpoints : v3_reach (d1, job 113, 2 sources,
+fills 0.25×→64×), v350_rehearsal (d2, job 114, 14 sources, fills 0.12×→16×),
+v350_rehearsal_d3 (d3, job 115, 14 sources, fills 0.015×→2×). Vie cumulative unique
+par fil, checkpoints alignés sur le fill (1re destruction @24/@136/@1032 selon la
+profondeur), 3 reps × 8 fils/bin, bins d'âge en octaves. Trois deltas par bin :
+own−reset (valeur), own−foreign (spécificité d'adresse), own−ablated (contribution page).
+Grille pré-enregistrée : (a) la page s'allume où le registre meurt ⇒ « jamais nécessaire
+tant que non saturé » ; (b) tout meurt ⇒ structurel ; (c) le registre tient ⇒ capacité
+sous-estimée.
+
+**Verdict : branche (c), et plus fort que prévu.**
+
+1. **Le registre (own−reset) ne meurt jamais.** Aucune falaise à aucun fill, sur les
+   3 profondeurs et les 14 sources. d1 codeparrot : −0.53 @0.25× → −0.48 @**64×**
+   (pire point −0.35). d2 codeparrot : −1.03 @0.12× → −0.90 @**16×** (W2176 writes).
+   d3 : −0.44 → −0.42 @2×. La « capacité » nominale (M + 2·ΣM^k) n'est pas un mur de
+   valeur : la superposition + cascade continuent de porter un registre utile à 64×
+   le point de première destruction.
+
+2. **La page n'est PAS morte comme canal de valeur — elle est morte comme adressage.**
+   own−ablated significatif (|t|≥2.5) : 10 lignes @d1 → 76 @d2 → 69 @d3 (à fills max
+   plus petits). Amplitude milli→centi-nat, structurée par source : arxiv d2
+   −0.05..−0.09 (|t| jusqu'à 13.6, TOUS les fills, TOUS les âges y compris ev2049+),
+   stack_css −0.02..−0.045, stack_sql d3 −0.03..−0.077, stack_js/html pareil. Présente
+   dès W16 (pas besoin de saturation), croît avec la profondeur de cascade et la
+   structure de la source (formel > prose). Cohérent avec le signal ×10 du job 111.
+
+3. **Aucune spécificité d'adresse, à aucun fill.** own−foreign ≈ 0 partout (seule
+   exception : d1 fineweb W384, −0.10 ev1-8 / −0.055 ev33-128, non répliquée aux W
+   voisins). La saturation ne force PAS la spécificité : la valeur retenue reste un
+   registre générique, même à 64×.
+
+**Lecture.** L'hypothèse « la page deviendra nécessaire quand le registre saturera »
+est éliminée : le registre ne sature pas dans le régime accessible. La page contribue
+déjà (faiblement, en aveugle, proportionnellement à la profondeur), mais rien dans la
+pression de perplexité ne la rendra *adressée* — la spécificité devra venir de
+l'entraînement de politique (SFT reach-back stratifié / GRPO token d'adresse, OPTION 2
+déjà validée). Pour le 350M : la profondeur de cascade est un multiplicateur de
+contribution page quasi gratuit (d3 = même coût, job 111), et aucun risque de falaise
+de capacité en vie longue.
+
+Repro : `python -m deepseek_v4_mini.analysis.code_defer_bank_probes deepseek_v4_mini/configs/farm/v3_deep.yaml --ckpt <final.pt> --probes capacity_deep --n-files 48` (jobs 113/114/115, logs `GPUrig0-gpu{3,2,4}__11{3,4,5}_capdeep_*.workerlog`).
+
+---
+
 ## 2026-07-14 (2) — 350M dress rehearsal from scratch: the full stack emerges jointly (no curriculum needed); depth 3 is free; the page stays dead (4th strike) but its capacity-curve trace grows with depth; md128 GREEN
 
 **Setup.** Jobs 110/111 = the 350M recipe at 97M, from scratch, everything at
