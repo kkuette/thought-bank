@@ -37,6 +37,76 @@ test this — before scale.
 
 ---
 
+## 2026-07-14 (2) — 350M dress rehearsal from scratch: the full stack emerges jointly (no curriculum needed); depth 3 is free; the page stays dead (4th strike) but its capacity-curve trace grows with depth; md128 GREEN
+
+**Setup.** Jobs 110/111 = the 350M recipe at 97M, from scratch, everything at
+once: divmix 14 sources + v2b schedule (muon 7.5e-4, decay @700, 2000 steps) +
+stack D+G+G2 + cascade (110: depth 2 map [0,0,0,0,1,2] ; 111: identical twin,
+ONE variable, depth 3 map [0,0,0,1,2,3]) + age-stratified reach-back rehearsal
++ bf16. Job 112 = B1 arm md128 (v2e regime, init v2b_md128_s4). All probes on
+final.pt, n=48, held.
+
+**1. The mechanisms created so far by SFT-on-warm-weights all emerge in joint
+from-scratch training.** Addressing (label-cue defer bank value): d2
+−1.08±0.10 code / −0.44±0.05 web ; d3 −0.57 / −0.56. Selection survives
+junk-last under label cue (+0.07/+0.05 d2 — the v2f signature). MID filter
+acquired (distractor MID ≈ 0 everywhere, |t| ≤ 1.2). GAP healthy on all 14
+sources @2000 (code +1.1..+3.0, web +0.5..+0.9). **Consequence: the 350M does
+NOT need a staged curriculum to create the mechanisms — one joint run
+suffices.** (The recency trap stays open as always: blank-query junk-last
++1.9/+1.3 — that's GRPO phase 2's job, not pretraining's.)
+
+**2. New from-scratch signature: a wrong bank is now POISON, not noise.**
+xdom vs reset: reset−xdom = −0.96 code / −0.77 web (d2), −0.59 / −1.02 (d3)
+— a cross-domain bank costs ~1 nat BELOW empty. SFT-era models shrugged
+(read hedged); the joint model trusts its read, so garbage hurts. Same story
+on distractor LAST: cross-domain last-write costs +1.9/+1.3, worst case +0.8
+above reset. Double-edged: stronger read = stronger addressing value AND a
+real attack surface for pollution (GRPO garde-fou to keep).
+
+**3. Depth 3 costs nothing.** Carried @2000 d2 vs d3 equal within 0.03-0.07
+nat on 11/14 sources (d3 ahead on finemath/openstax/html). Three live layers
+instead of four carry the same conversation; the mid-run GAP divergence seen
+@800 was reset-side noise (rule: carried, never GAP). Depth is free at this
+scale — pick it for capacity, not for loss.
+
+**4. The page: dead 4th strike — the SFT-graft hypothesis is eliminated.**
+Even trained jointly from scratch WITH rehearsal, page ablation does not
+separate: emergence −0.003±0.001 code / +0.004 web (d2), +0.002 / +0.003
+(d3), while reach-back vs reset stays big (−0.43..−0.92) and the capacity
+control "unwritten label vs reset" matches the evicted (−0.62 vs −0.65 d2) ⇒
+all reach-back value is still live-bank superposition (register), zero
+address specificity past eviction. Remaining hypotheses: structural vs
+never-necessary-while-unsaturated. **BUT the capacity-curve page contribution
+is now nonzero and grows with depth**: d2 −0.001/−0.002 (code, |t|~4) and
+−0.002/−0.003 (web) ; d3 −0.002/−0.003 (code) and **−0.008 (N=12) / −0.022
+(N=16) on web, |t|~6** — 10× d2, first double-milli page signal ever, same
+web-side transient seen in the local capacity_deep fill-scan on v3_reach
+(own−ablated −0.04..−0.06, |t| 2-4 at fill 1-2, gone at fill 4). The page
+channel is not structurally unreadable — it is dominated by the register.
+The discriminant is saturation: jobs 113/114/115 (capacity_deep, fills to
+64×first-destroy, register must die ~1024 writes per longlife) are deposited.
+
+**5. md128 GREEN (job 112).** Carried @800 6.639 code / 7.313 web vs gate
+v2e_interleave 6.575/7.269 ±0.15 ⇒ +0.064/+0.044, well inside. The taper
+512→256→128 for deep v3 blocks is validated TRAINED; 350M VRAM budget
+confirmed. Reserve: addressing at md128 is recency-fragile (junk-last
+label-cued +1.85/+1.10 vs ~0 at md512) and merge is pricier (avg64 +0.50
+code vs +0.23 web) ⇒ keep md512 for the LIVE bank, 128 only for deep pages —
+which is exactly the taper design.
+
+Repro:
+```
+PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
+  deepseek_v4_mini/configs/farm/v3_deep.yaml \
+  /mnt/tb/checkpoints/farm/v350_rehearsal/final.pt \
+  --probes swap,distractor,cued,page,capacity_curve --n-files 48
+# d3: config farm/v350_d3_probes.yaml, ckpt farm/v350_rehearsal_d3/final.pt
+# md128: config farm/v2e_md128.yaml, ckpt farm/v2e_md128/final.pt, probes swap,distractor,cued,merge
+```
+
+---
+
 ## 2026-07-14 — Divmix GREEN on 14 sources; the DeltaNet steelman carries but cannot address; reach-back SFT: the page stays dead (3rd strike)
 
 Three verdicts from jobs 106/107/108 (+ the chained 109 arm), all at 97M.
