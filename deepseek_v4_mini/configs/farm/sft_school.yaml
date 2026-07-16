@@ -1,0 +1,197 @@
+# sft_school — MARCHE 2 PHASE 2 : SFT école de maths sur checkpoint chaud 97M.
+# Continuation depuis v350_rehearsal/final.pt (recette 350M complète : divmix +
+# D+G+G2 + cascade d2 + reach), recette SFT-chaud v2f (800 steps, muon_lr
+# 2.4e-4, warmup 20, pas de decay). NOUVEAU : bloc `chat` — convs école de
+# maths (math_school_data.py, 5 kinds ChatML loss-masqués) mixées à p_chat=0.4
+# DANS le carry des vies (cross-domaine gratuit) ; le reste du stack inchangé
+# (anti-oubli = les convs code/web majoritaires + defer/addr/reach actifs).
+# ÉVAL NOTÉE : greedy decode des tours assistant, banque vive VS ablatée,
+# graders du générateur => grade + Δ par kind (drill/derivation/equation/
+# bindings/lesson) — LA figure mémoire de travail (memory dsv6-grpo-m2-integre).
+# PRÉDICTIONS (2026-07-16, Fable, avant lancement) :
+#   1. chat loss part >~8 (réponses = chiffres sous banque seule) et passe
+#      sous ~2.5 à 800 steps (les formats/instructions s'apprennent vite en
+#      SFT chaud — précédent v2f : addr < 7.0 en 800) ;
+#   2. grade drill > 0 dès ~200 steps sur les stages bas (1 chiffre) ; les
+#      stages hauts (multi-chiffres) restent ~0 (le calcul n'est pas dans les
+#      poids d'un 97M/2000 steps — c'est attendu, le curriculum GRPO les vise) ;
+#   3. Δ (live − ablated) POSITIF sur bindings/lesson (la réponse n'existe que
+#      via la banque : la question/leçon est hors de la fenêtre du tour
+#      assistant PAR CONSTRUCTION) — c'est LE verdict de la marche ; Δ ~ 0 =>
+#      le modèle devine depuis le format seul = ROUGE, ne pas enchaîner GRPO ;
+#   4. GAP/addr/reach code ne se dégradent pas (prix de l'école ~ nul, comme
+#      v2f : le carried est le juge, pas le GAP headline) ;
+#   5. VRAM : conv chat <= ~17 forwards ~ conv code (8 ic + 8 defer + addr/
+#      reach cappés) => pic <= 6.5 GiB rig-safe (mesuré au smoke avant queue).
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  cache_dir: /mnt/tb/data_cache
+  sources:
+  # --- identique à v2e_divmix (cache hit garanti avec le job 107)
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.20
+    stream_cap: 90000
+  - name: stack_c
+    dataset: bigcode/the-stack-smol
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_rust
+    dataset: bigcode/the-stack-smol
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_js
+    dataset: bigcode/the-stack-smol
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_sql
+    dataset: bigcode/the-stack-smol
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_html
+    dataset: bigcode/the-stack-smol
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_css
+    dataset: bigcode/the-stack-smol
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.10
+    stream_cap: 250000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 60000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    stream_cap: 60000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 8
+  amp: true
+  init_from: /mnt/tb/checkpoints/farm/v350_rehearsal/final.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 20
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  log_every: 10
+  eval_every: 200
+  eval_convs: 8
+  eval_depths: [2, 4, 6, 8]
+  eval_depth_convs: 8
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 400
+  save_dir: /mnt/tb/checkpoints/farm/sft_school
+  metrics_file: /mnt/tb/runs/farm_sft_school/metrics.jsonl
+  interleave_files:
+  - 2
+  - 4
+  addr_prob: 0.5
+  addr_label: true
+  no_reset_files: 8
+  cascade_depth: 2
+  cascade_map: [0, 0, 0, 0, 1, 2]
+  reach_prob: 0.35
+  reach_max: 2
+chat:
+  stream: math_school
+  p_chat: 0.4
+  weight: 1.0
+  eval_convs: 16
+  max_new: 24
+teacher:
+  enabled: false

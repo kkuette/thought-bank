@@ -257,6 +257,21 @@ def grade_exam(answers: list[str], truths: list[int]) -> float:
     return ok / max(1, len(truths))
 
 
+def grade_conv(conv: dict, texts: list[str]) -> float:
+    """Grade decoded assistant texts (one per assistant seg, in order) against
+    conv['info']. This is the eval/GRPO entry point: the trainer decodes, the
+    generator grades."""
+    info, kind = conv["info"], conv["kind"]
+    if kind == "derivation":
+        return grade_derivation(texts, info["terms"], info["ops"])
+    if kind == "equation":
+        return grade_equation(texts, info["sol"], info["n_steps"])
+    if kind == "drill":
+        return grade_exam(texts, info["answers"])
+    # bindings / lesson: graded turns are the LAST len(truths) assistant turns
+    return grade_exam(texts[-len(info["truths"]):], info["truths"])
+
+
 def _fold(terms: list[int], ops: list[str]) -> int:
     v = terms[0]
     for t, o in zip(terms[1:], ops):
@@ -622,6 +637,9 @@ def _self_test() -> None:
                 n_open = len(A_OPEN)
                 assert s["loss_mask"][0, :n_open].sum() == 0
                 assert s["loss_mask"][0, n_open:].min() == 1
+
+        # grade_conv routes canonical texts to a perfect grade for EVERY kind
+        assert grade_conv(c, _assistant_texts(tok, c)) == 1.0
 
         info = c["info"]
         if c["kind"] == "drill":

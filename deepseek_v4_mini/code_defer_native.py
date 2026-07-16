@@ -55,6 +55,88 @@ def _ic_loss(model, xt, bank, balw, amp, layer_banks=None):
     return loss, o["mem_bank"], float(ce.detach())
 
 
+def _chat_loss(model, x, lmask, bank, balw, amp, layer_banks=None):
+    """Chat-templated segment: next-token CE restricted to supervised positions
+    (loss_mask marks the assistant answer + closing <|im_end|>; template/user
+    tokens are masked). No <think> append — the template carries its own stop.
+    Returns (loss, new_bank, ce_detached_or_None). User segs (mask all-zero)
+    still forward (their WRITE is the point) but contribute no CE."""
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+        o = model(x, init_mem=bank, layer_banks=layer_banks)
+    lg = o["logits"].float()
+    m = lmask[:, 1:].reshape(-1)                        # targets = positions 1..T-1
+    loss = balw * o["balance_loss"].float()
+    ce_f = None
+    if float(m.sum()) > 0:
+        ce_tok = F.cross_entropy(lg[:, :-1].reshape(-1, lg.size(-1)),
+                                 x[:, 1:].reshape(-1), reduction="none")
+        ce = (ce_tok * m).sum() / m.sum()
+        loss = loss + ce
+        ce_f = float(ce.detach())
+    return loss, o["mem_bank"], ce_f
+
+
+@torch.no_grad()
+def _greedy(model, prefix, bank, max_new, stop_id, amp):
+    """Greedy-decode max_new tokens after prefix from the CURRENT bank (reads
+    only; the decode forward's write is discarded). Returns generated ids."""
+    out = prefix
+    for _ in range(max_new):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            o = model(out, init_mem=bank)
+        nt = o["logits"][:, -1].argmax(-1, keepdim=True)
+        out = torch.cat([out, nt], dim=1)
+        if int(nt) == stop_id:
+            break
+    return out[:, prefix.size(1):]
+
+
+@torch.no_grad()
+def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24):
+    """Math-school eval: canonical segments advance the bank (teacher-forced
+    writes); each assistant turn is greedy-decoded TWICE — from the live bank
+    and from an ABLATED (None) bank — and graded by the generator's verifiers.
+    grade_live - grade_ablated per kind = the working-memory efficacy figure
+    (memory dsv6-grpo-m2-integre). Bank-only (no cascade), like evaluate()."""
+    from .math_school_data import A_OPEN, grade_conv
+    model.eval()
+    a_open = torch.tensor(tok(A_OPEN, add_special_tokens=False)["input_ids"],
+                          dtype=torch.long, device=device).unsqueeze(0)
+    stop_id = tok.convert_tokens_to_ids("<|im_end|>")
+    agg = {}                                  # kind -> [nll_sum, nll_n, gl, ga, n]
+    for _ in range(n_conv):
+        conv = stream.next_conv()
+        bank = None
+        live_txt, abl_txt = [], []
+        nll_s, nll_n = 0.0, 0
+        for s in conv["segs"]:
+            x = s["input_ids"].to(device)
+            lmask = s["loss_mask"].to(device)
+            if s["role"] == "assistant":
+                g_live = _greedy(model, a_open, bank, max_new, stop_id, amp)
+                g_abl = _greedy(model, a_open, None, max_new, stop_id, amp)
+                live_txt.append(tok.decode(g_live[0].tolist()))
+                abl_txt.append(tok.decode(g_abl[0].tolist()))
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+                o = model(x, init_mem=bank)
+            bank = o["mem_bank"]
+            m = lmask[:, 1:].reshape(-1)
+            if float(m.sum()) > 0:
+                lg = o["logits"].float()
+                ce = F.cross_entropy(lg[:, :-1].reshape(-1, lg.size(-1)),
+                                     x[:, 1:].reshape(-1), reduction="none")
+                nll_s += float((ce * m).sum() / m.sum()); nll_n += 1
+        a = agg.setdefault(conv["kind"], [0.0, 0, 0.0, 0.0, 0])
+        a[0] += nll_s; a[1] += nll_n
+        a[2] += grade_conv(conv, live_txt)
+        a[3] += grade_conv(conv, abl_txt)
+        a[4] += 1
+    model.train()
+    return {k: {"nll": v[0] / max(v[1], 1), "grade": v[2] / v[4],
+                "grade_abl": v[3] / v[4], "n": v[4]}
+            for k, v in agg.items()}
+
+
 @torch.no_grad()
 def evaluate(model, stream, device, think_id, blank_id, defer_len, n_conv, balw, amp,
              delta=None):
@@ -337,6 +419,29 @@ def main(cfg_path: str, resume: bool = False) -> None:
                    for i, nm in enumerate(eval_stream.src_names)]
                   if len(eval_stream.src_files) > 1 else [("", eval_stream)])
 
+    # ── chat mode (opt-in `chat:` block — phase 2 SFT, marche 2) ─────────────
+    # Chat-templated convs (math school) mixed into the conv stream at p_chat:
+    # a chat conv occupies one grad-accum slot and RIDES the same life carry
+    # (no_reset/cascade) as code convs — cross-domain interleaving for free.
+    # Segments carry loss_mask (CE on assistant answers only); defer/addr/
+    # reach never fire on them (no defer_tgt). Absent block => bit-identical.
+    chat_cfg = raw.get("chat") or {}
+    chat_stream = chat_eval = None
+    p_chat = float(chat_cfg.get("p_chat", 0.5))
+    chat_w = float(chat_cfg.get("weight", 1.0))
+    chat_eval_convs = int(chat_cfg.get("eval_convs", 24))
+    chat_max_new = int(chat_cfg.get("max_new", 24))
+    if chat_cfg:
+        assert chat_cfg.get("stream", "math_school") == "math_school", \
+            "chat.stream: only math_school wired for now"
+        from .math_school_data import MathSchoolStream
+        gen_kw = dict(chat_cfg.get("gen", {}) or {})
+        chat_stream = MathSchoolStream(tok, seed=train_seed + 1, **gen_kw)
+        chat_eval = MathSchoolStream(tok, seed=1234, **gen_kw)
+        print(f"chat mode ON: math_school p_chat {p_chat} weight {chat_w} "
+              f"eval_convs {chat_eval_convs} (masked-CE SFT convs in the "
+              f"life carry)", flush=True)
+
     # single native optimizer: Muon (2-D weights) + bundled AdamW (embed/norm/1-D)
     lr = float(t.get("lr", 3e-4)); muon_lr = float(t.get("muon_lr", 3e-3))
     wd = float(t.get("weight_decay", 0.01)); balw = float(cfg.balance_loss_weight)
@@ -526,10 +631,12 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     "rng_cuda": (torch.cuda.get_rng_state_all()
                                  if torch.cuda.is_available() else None),
                     "rng_train_stream": train_stream.rng.getstate(),
-                    "rng_eval_stream": eval_stream.rng.getstate()}, tmp)
+                    "rng_eval_stream": eval_stream.rng.getstate(),
+                    "rng_chat_stream": (chat_stream.rng.getstate()
+                                        if chat_stream is not None else None)}, tmp)
         os.replace(tmp, path)                        # atomic: no torn file on preemption
 
-    start_step = 0; ema_ic = ema_d = ema_a = None
+    start_step = 0; ema_ic = ema_d = ema_a = ema_chat = None
     ema_reach = [None, None, None]              # EMA de perte par strate d'âge
     if resume:
         import glob, re
@@ -563,6 +670,11 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 train_stream.rng.seed(train_seed + start_step)
             if ck.get("rng_eval_stream") is not None:
                 eval_stream.rng.setstate(ck["rng_eval_stream"])
+            if ck.get("rng_chat_stream") is not None and chat_stream is not None:
+                if ddp_rank == 0:
+                    chat_stream.rng.setstate(ck["rng_chat_stream"])
+                else:
+                    chat_stream.rng.seed(train_seed + 1 + start_step)
             print(f"resume: restored {cks[start_step]} @step {start_step} "
                   f"(opt {'yes' if ck.get('opt') else 'NO — old-format ck'})", flush=True)
         else:
@@ -574,6 +686,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
         lr_now = set_lr(step)
         opt.zero_grad(set_to_none=True)
         ic_v = d_v = a_v = 0.0; ic_cnt = d_cnt = a_cnt = 0; distill_v = 0.0; distill_n = 0
+        chat_v = 0.0; chat_cnt = 0
         reach_v = [0.0, 0.0, 0.0]; reach_cnt = [0, 0, 0]
         # gradient accumulation: G independent conversations (batch=1 each, bank reset
         # between them) summed into one optimizer step => effective batch = G files,
@@ -583,14 +696,18 @@ def main(cfg_path: str, resume: bool = False) -> None:
         dstate_carry = None
         rpool_carry, wt_carry = [], 0
         for _g in range(grad_accum):
-            segs = (train_stream.next_conv_batch(defer_len) if train_stream.B > 1
+            is_chat = (chat_stream is not None
+                       and train_stream.rng.random() < p_chat)
+            segs = (chat_stream.next_conv()["segs"] if is_chat
+                    else train_stream.next_conv_batch(defer_len) if train_stream.B > 1
                     else train_stream.next_conv_interleaved(
                         interleave_files, defer_len,
                         label=addr_label, addr_prob=addr_prob, addr_max=addr_max)
                     if ilv_on else train_stream.next_conv())
             # B2 : la vie se termine à la fin de la DERNIÈRE conv du groupe
             # no_reset ((_g+1) % nrf == 0 ; nrf=1 => chaque conv est une vie).
-            if (ra_ids is not None and (_g + 1) % no_reset_files == 0
+            if (ra_ids is not None and not is_chat
+                    and (_g + 1) % no_reset_files == 0
                     and train_stream.rng.random() < ra_prob):
                 for s_ in segs[-ra_chunks:]:
                     s_["input_ids"] = torch.cat(
@@ -610,7 +727,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
             reach_n = 0                               # cap VRAM par conv
             for i, s in enumerate(segs):
                 x = s["input_ids"].to(device)
-                xt = _append(x, think_id)
+                chat_seg = "loss_mask" in s          # chat segs: no <think>,
+                xt = x if chat_seg else _append(x, think_id)  # masked CE
                 if casc is not None and bank is None:
                     # seed explicite : les niveaux profonds lisent None (vide),
                     # jamais la banque vive par accident au premier chunk
@@ -622,7 +740,15 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 pre0 = (bank[:, 0].detach()
                         if casc is not None and bank.size(1) >= cfg.max_mem else None)
                 lb = casc.layer_banks(bank, cascade_map) if casc is not None else None
-                loss, bank, ce = _ic_loss(_fwd, xt, bank, balw, amp, lb)
+                if chat_seg:
+                    loss, bank, ce = _chat_loss(_fwd, xt, s["loss_mask"].to(device),
+                                                bank, balw, amp, lb)
+                    loss = chat_w * loss
+                    if ce is not None:
+                        chat_v += ce; chat_cnt += 1
+                    ce = None
+                else:
+                    loss, bank, ce = _ic_loss(_fwd, xt, bank, balw, amp, lb)
                 if delta is not None:
                     # B4 : le write du modèle reste actif DANS le chunk (même
                     # forward), mais le carry inter-chunks = l'état delta
@@ -632,12 +758,14 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     n_evict += 1
                     if n_evict > _seed_slots:
                         casc.push_slot(pre0)
-                total = total + loss; ic_v += ce; ic_cnt += 1
+                total = total + loss
+                if ce is not None:
+                    ic_v += ce; ic_cnt += 1
                 # deferred target: batched segs carry their own defer_tgt (incl. the
                 # LAST turn's external successor, -100-padded); batch=1 derives it
                 # from the next in-conv chunk as before.
                 nxt = s.get("defer_tgt")
-                if nxt is None and i < len(segs) - 1:
+                if nxt is None and not chat_seg and i < len(segs) - 1:
                     nxt = segs[i + 1]["input_ids"][:, :defer_len]
                 if nxt is not None and bool((nxt != -100).any()):
                     nxt = nxt.to(device)
@@ -762,6 +890,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
         if a_cnt:
             a_v /= a_cnt
             ema_a = a_v if ema_a is None else 0.95 * ema_a + 0.05 * a_v
+        if chat_cnt:
+            chat_v /= chat_cnt
+            ema_chat = chat_v if ema_chat is None else 0.95 * ema_chat + 0.05 * chat_v
         for _s in range(3):
             if reach_cnt[_s]:
                 rv = reach_v[_s] / reach_cnt[_s]
@@ -769,6 +900,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
                                  else 0.9 * ema_reach[_s] + 0.1 * rv)
         if step % log_every == 0:
             addr_s = f"addr {ema_a:.3f}  " if ema_a is not None else ""
+            if ema_chat is not None:
+                addr_s = f"chat {ema_chat:.3f}  " + addr_s
             if reach_prob > 0 and any(v is not None for v in ema_reach):
                 # s1 ~ page p0, s2 ~ page mergée, s3 ~ détruit (contrôle : ne
                 # doit PAS baisser si c'est bien la page qui est lue)
@@ -786,6 +919,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 writer.add_scalar("train/defer_loss", ema_d, step)
                 if ema_a is not None:
                     writer.add_scalar("train/addr_loss", ema_a, step)
+                if ema_chat is not None:
+                    writer.add_scalar("train/chat_loss", ema_chat, step)
                 for _s, _v in enumerate(ema_reach):
                     if _v is not None:
                         writer.add_scalar(f"train/reach_s{_s + 1}", _v, step)
@@ -833,6 +968,25 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     if writer is not None:
                         for d in eval_depths:
                             writer.add_scalar(f"eval_depth/{pfx}gap_d{d}", bd[d]["gap"], step)
+            if chat_eval is not None:
+                chat_eval.rng.seed(1234)          # same conv set every eval
+                mm = evaluate_math(model, chat_eval, tok, device, amp,
+                                   chat_eval_convs, chat_max_new)
+                for kind in sorted(mm):
+                    v = mm[kind]
+                    print(f"[math @{step}] {kind:10s} nll {v['nll']:.3f} "
+                          f"grade {v['grade']:.2f} abl {v['grade_abl']:.2f} "
+                          f"Δ {v['grade'] - v['grade_abl']:+.2f} (n={v['n']})",
+                          flush=True)
+                if metrics_file:
+                    with open(metrics_file, "a") as f:
+                        f.write(json.dumps({"step": step, "math": mm}) + "\n")
+                if writer is not None:
+                    for kind, v in mm.items():
+                        writer.add_scalar(f"eval_math/{kind}/nll", v["nll"], step)
+                        writer.add_scalar(f"eval_math/{kind}/grade", v["grade"], step)
+                        writer.add_scalar(f"eval_math/{kind}/grade_abl",
+                                          v["grade_abl"], step)
         if (step % save_every == 0 or step == steps) and ddp_rank == 0:
             _save_ck(step, os.path.join(save_dir,
                      "final.pt" if step == steps else f"step_{step}.pt"))
