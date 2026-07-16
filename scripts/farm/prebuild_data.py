@@ -33,9 +33,17 @@ from transformers import AutoTokenizer  # noqa: E402
 from deepseek_v4_mini.code_data import CodeChunkStream  # noqa: E402
 
 
-def prebuild(cfg_path: str, cache_dir: str) -> None:
+def prebuild(cfg_path: str, cache_dir: str, only: list[str] | None = None) -> None:
     with open(cfg_path) as f:
         raw = yaml.safe_load(f)
+    if only:
+        # sous-ensemble de sources (parallélisation par processus : les clés de
+        # cache md5 sont PAR source, donc N prebuilds --only disjoints puis un
+        # passage complet = 100% cache hits)
+        srcs = [s for s in raw["data"].get("sources") or [] if s.get("name") in only]
+        missing = set(only) - {s.get("name") for s in srcs}
+        assert srcs and not missing, f"--only : sources inconnues {sorted(missing)}"
+        raw["data"]["sources"] = srcs
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     # miroir du trainer : <think>/<blank> ajoutés AVANT la construction des données
     # (len(tokenizer) fait partie de la clé de cache md5 — sans ça, cache miss).
@@ -71,10 +79,13 @@ def main() -> None:
     ap.add_argument("configs", nargs="+", help="config(s) YAML d'entraînement")
     ap.add_argument("--cache-dir", default="/tb/data_cache",
                     help="cache partagé (défaut : /tb/data_cache, vue conteneur)")
+    ap.add_argument("--only", default="",
+                    help="noms de sources (séparés par des virgules) à construire seules")
     args = ap.parse_args()
+    only = [s for s in args.only.split(",") if s] or None
     os.makedirs(args.cache_dir, exist_ok=True)
     for c in args.configs:
-        prebuild(c, args.cache_dir)
+        prebuild(c, args.cache_dir, only=only)
     print("prebuild: OK", flush=True)
 
 

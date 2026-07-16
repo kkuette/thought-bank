@@ -49,6 +49,7 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
     """Build (or load from disk cache) ONE source's ragged chunk lists."""
     L = int(seq_len)
     label = f"{split}:{dataset.split('/')[-1]}{'/' + config_name if config_name else ''}"
+    chunk_dtype = torch.uint16 if len(tokenizer) <= 65536 else torch.long
 
     # ── Tokenized-corpus disk cache: the streamed build is deterministic given
     # these knobs, so cache it (pod restarts / re-runs skip the 10-25 min pass).
@@ -62,6 +63,10 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
         cache_path = os.path.join(cache_dir, f"chunks_{split}_{h}.pt")
         if os.path.exists(cache_path):
             files = torch.load(cache_path)
+            # new caches are stored as int16 bit-patterns (torch.save can't
+            # serialize uint16); legacy int64 caches pass through untouched.
+            if files and files[0] and files[0][0].dtype == torch.int16:
+                files = [[c.view(torch.uint16) for c in f] for f in files]
             print(f"tokenize[{label}]: cache hit {cache_path} — {len(files)} files / "
                   f"{sum(len(f) for f in files)} chunks", flush=True)
             return files
@@ -116,8 +121,13 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
         kept += 1
         if is_held != (split == "held"):
             continue
-        tt = torch.tensor(t, dtype=torch.long)
-        files.append([tt[j * L: (j + 1) * L] for j in range(nc)])  # last is ragged
+        # uint16 storage (vocab 49154 < 65536): /4 disk + RAM vs int64 — the 10B-run
+        # cache is ~GBs and every DDP rank holds its own copy. t is truncated at the
+        # chunk cap FIRST so the (per-chunk, contiguous) storage never exceeds it —
+        # the old long slices were views keeping the FULL file storage alive in the
+        # .pt. Chunks are cast back to long at conv-assembly time.
+        tt = torch.tensor(t[:nc * L], dtype=torch.long)
+        files.append([tt[j * L: (j + 1) * L].to(chunk_dtype) for j in range(nc)])
         if len(files) >= n_files:
             break
     if pbar is not None:
@@ -128,7 +138,10 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
     if cache_path is not None:
         os.makedirs(cache_dir, exist_ok=True)
         tmp = cache_path + ".tmp"
-        torch.save(files, tmp); os.replace(tmp, cache_path)  # atomic vs preemption
+        # uint16 isn't serializable (torch<=2.5): store the same bytes as int16
+        out = ([[c.view(torch.int16) for c in f] for f in files]
+               if files[0][0].dtype == torch.uint16 else files)
+        torch.save(out, tmp); os.replace(tmp, cache_path)  # atomic vs preemption
         print(f"tokenize[{label}]: cached → {cache_path}", flush=True)
     return files
 
@@ -296,7 +309,7 @@ class CodeChunkStream:
         st = self.rng.randrange(0, nc - m + 1)         # nc-m >= 0
         segs = []
         for j in range(st, st + m):
-            ids = f[j].unsqueeze(0)                    # [1, Lj]
+            ids = f[j].long().unsqueeze(0)             # [1, Lj] (cache is uint16)
             segs.append({"input_ids": ids, "attention_mask": torch.ones_like(ids)})
         return segs
 
@@ -341,11 +354,12 @@ class CodeChunkStream:
         starts = [self.rng.randrange(0, nf - m + 1) for _, nf in picks]
         segs = []
         for j in range(m):
-            ids = torch.stack([f[st + j] for (f, _), st in zip(picks, starts)])  # [B, L]
+            ids = torch.stack([f[st + j].long()                    # [B, L] (cache uint16)
+                               for (f, _), st in zip(picks, starts)])
             tgt = torch.full((self.B, dl), -100, dtype=torch.long)
             for b, ((f, _), st) in enumerate(zip(picks, starts)):
                 if st + j + 1 < len(f):                            # successor exists
-                    nx = f[st + j + 1][:dl]                        # ragged tail ok
+                    nx = f[st + j + 1][:dl].long()                 # ragged tail ok
                     tgt[b, :nx.numel()] = nx
             segs.append({"input_ids": ids, "attention_mask": torch.ones_like(ids),
                          "defer_tgt": tgt})
@@ -397,12 +411,12 @@ class CodeChunkStream:
             lb = file_label_ids(self.tok, f) if label else None
             q = []
             for j in range(st, st + m):
-                ids = f[j].unsqueeze(0)                     # [1, Lj]
+                ids = f[j].long().unsqueeze(0)              # [1, Lj] (cache uint16)
                 if lb is not None:                          # write carries its address
                     ids = torch.cat([lb.unsqueeze(0), ids], dim=1)
                 tgt = torch.full((1, dl), -100, dtype=torch.long)
                 if j + 1 < len(f):                          # same-file successor
-                    nx = f[j + 1][:dl]                      # (ragged tail ok)
+                    nx = f[j + 1][:dl].long()               # (ragged tail ok)
                     tgt[0, :nx.numel()] = nx
                 q.append({"input_ids": ids, "attention_mask": torch.ones_like(ids),
                           "defer_tgt": tgt, "_j": j})
@@ -433,9 +447,9 @@ class CodeChunkStream:
                 if lbl_ids[t] is not None and self.rng.random() < 0.5:
                     cue = lbl_ids[t]                        # explicit address
                 else:
-                    cue = f_t[j_t][:addr_cue_len]           # semantic address (raw)
+                    cue = f_t[j_t][:addr_cue_len].long()    # semantic address (raw)
                 at = torch.full((1, dl), -100, dtype=torch.long)
-                nx = f_t[j_t + 1][:dl]
+                nx = f_t[j_t + 1][:dl].long()
                 at[0, :nx.numel()] = nx
                 segs[pos]["addr_cue"] = cue.unsqueeze(0)
                 segs[pos]["addr_tgt"] = at
@@ -472,6 +486,6 @@ class CodeChunkStream:
         st = self.rng.randrange(0, len(f) - n_chunks + 1)
         segs = []
         for j in range(st, st + n_chunks):
-            ids = f[j].unsqueeze(0)
+            ids = f[j].long().unsqueeze(0)
             segs.append({"input_ids": ids, "attention_mask": torch.ones_like(ids)})
         return segs

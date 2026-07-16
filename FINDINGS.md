@@ -37,6 +37,232 @@ test this — before scale.
 
 ---
 
+## 2026-07-14 (3) — Saturation scan (capacity_deep, jobs 113/114/115) : le registre ne meurt JAMAIS (jusqu'à 64× la capacité), la page contribue partout en milli-nats (↑ avec la profondeur, ↑ sources structurées) mais ne devient jamais adressée
+
+**Setup.** Probe `capacity_deep` sur 3 checkpoints : v3_reach (d1, job 113, 2 sources,
+fills 0.25×→64×), v350_rehearsal (d2, job 114, 14 sources, fills 0.12×→16×),
+v350_rehearsal_d3 (d3, job 115, 14 sources, fills 0.015×→2×). Vie cumulative unique
+par fil, checkpoints alignés sur le fill (1re destruction @24/@136/@1032 selon la
+profondeur), 3 reps × 8 fils/bin, bins d'âge en octaves. Trois deltas par bin :
+own−reset (valeur), own−foreign (spécificité d'adresse), own−ablated (contribution page).
+Grille pré-enregistrée : (a) la page s'allume où le registre meurt ⇒ « jamais nécessaire
+tant que non saturé » ; (b) tout meurt ⇒ structurel ; (c) le registre tient ⇒ capacité
+sous-estimée.
+
+**Verdict : branche (c), et plus fort que prévu.**
+
+1. **Le registre (own−reset) ne meurt jamais.** Aucune falaise à aucun fill, sur les
+   3 profondeurs et les 14 sources. d1 codeparrot : −0.53 @0.25× → −0.48 @**64×**
+   (pire point −0.35). d2 codeparrot : −1.03 @0.12× → −0.90 @**16×** (W2176 writes).
+   d3 : −0.44 → −0.42 @2×. La « capacité » nominale (M + 2·ΣM^k) n'est pas un mur de
+   valeur : la superposition + cascade continuent de porter un registre utile à 64×
+   le point de première destruction.
+
+2. **La page n'est PAS morte comme canal de valeur — elle est morte comme adressage.**
+   own−ablated significatif (|t|≥2.5) : 10 lignes @d1 → 76 @d2 → 69 @d3 (à fills max
+   plus petits). Amplitude milli→centi-nat, structurée par source : arxiv d2
+   −0.05..−0.09 (|t| jusqu'à 13.6, TOUS les fills, TOUS les âges y compris ev2049+),
+   stack_css −0.02..−0.045, stack_sql d3 −0.03..−0.077, stack_js/html pareil. Présente
+   dès W16 (pas besoin de saturation), croît avec la profondeur de cascade et la
+   structure de la source (formel > prose). Cohérent avec le signal ×10 du job 111.
+
+3. **Aucune spécificité d'adresse, à aucun fill.** own−foreign ≈ 0 partout (seule
+   exception : d1 fineweb W384, −0.10 ev1-8 / −0.055 ev33-128, non répliquée aux W
+   voisins). La saturation ne force PAS la spécificité : la valeur retenue reste un
+   registre générique, même à 64×.
+
+**Lecture.** L'hypothèse « la page deviendra nécessaire quand le registre saturera »
+est éliminée : le registre ne sature pas dans le régime accessible. La page contribue
+déjà (faiblement, en aveugle, proportionnellement à la profondeur), mais rien dans la
+pression de perplexité ne la rendra *adressée* — la spécificité devra venir de
+l'entraînement de politique (SFT reach-back stratifié / GRPO token d'adresse, OPTION 2
+déjà validée). Pour le 350M : la profondeur de cascade est un multiplicateur de
+contribution page quasi gratuit (d3 = même coût, job 111), et aucun risque de falaise
+de capacité en vie longue.
+
+Repro : `python -m deepseek_v4_mini.analysis.code_defer_bank_probes deepseek_v4_mini/configs/farm/v3_deep.yaml --ckpt <final.pt> --probes capacity_deep --n-files 48` (jobs 113/114/115, logs `GPUrig0-gpu{3,2,4}__11{3,4,5}_capdeep_*.workerlog`).
+
+---
+
+## 2026-07-14 (2) — 350M dress rehearsal from scratch: the full stack emerges jointly (no curriculum needed); depth 3 is free; the page stays dead (4th strike) but its capacity-curve trace grows with depth; md128 GREEN
+
+**Setup.** Jobs 110/111 = the 350M recipe at 97M, from scratch, everything at
+once: divmix 14 sources + v2b schedule (muon 7.5e-4, decay @700, 2000 steps) +
+stack D+G+G2 + cascade (110: depth 2 map [0,0,0,0,1,2] ; 111: identical twin,
+ONE variable, depth 3 map [0,0,0,1,2,3]) + age-stratified reach-back rehearsal
++ bf16. Job 112 = B1 arm md128 (v2e regime, init v2b_md128_s4). All probes on
+final.pt, n=48, held.
+
+**1. The mechanisms created so far by SFT-on-warm-weights all emerge in joint
+from-scratch training.** Addressing (label-cue defer bank value): d2
+−1.08±0.10 code / −0.44±0.05 web ; d3 −0.57 / −0.56. Selection survives
+junk-last under label cue (+0.07/+0.05 d2 — the v2f signature). MID filter
+acquired (distractor MID ≈ 0 everywhere, |t| ≤ 1.2). GAP healthy on all 14
+sources @2000 (code +1.1..+3.0, web +0.5..+0.9). **Consequence: the 350M does
+NOT need a staged curriculum to create the mechanisms — one joint run
+suffices.** (The recency trap stays open as always: blank-query junk-last
++1.9/+1.3 — that's GRPO phase 2's job, not pretraining's.)
+
+**2. New from-scratch signature: a wrong bank is now POISON, not noise.**
+xdom vs reset: reset−xdom = −0.96 code / −0.77 web (d2), −0.59 / −1.02 (d3)
+— a cross-domain bank costs ~1 nat BELOW empty. SFT-era models shrugged
+(read hedged); the joint model trusts its read, so garbage hurts. Same story
+on distractor LAST: cross-domain last-write costs +1.9/+1.3, worst case +0.8
+above reset. Double-edged: stronger read = stronger addressing value AND a
+real attack surface for pollution (GRPO garde-fou to keep).
+
+**3. Depth 3 costs nothing.** Carried @2000 d2 vs d3 equal within 0.03-0.07
+nat on 11/14 sources (d3 ahead on finemath/openstax/html). Three live layers
+instead of four carry the same conversation; the mid-run GAP divergence seen
+@800 was reset-side noise (rule: carried, never GAP). Depth is free at this
+scale — pick it for capacity, not for loss.
+
+**4. The page: dead 4th strike — the SFT-graft hypothesis is eliminated.**
+Even trained jointly from scratch WITH rehearsal, page ablation does not
+separate: emergence −0.003±0.001 code / +0.004 web (d2), +0.002 / +0.003
+(d3), while reach-back vs reset stays big (−0.43..−0.92) and the capacity
+control "unwritten label vs reset" matches the evicted (−0.62 vs −0.65 d2) ⇒
+all reach-back value is still live-bank superposition (register), zero
+address specificity past eviction. Remaining hypotheses: structural vs
+never-necessary-while-unsaturated. **BUT the capacity-curve page contribution
+is now nonzero and grows with depth**: d2 −0.001/−0.002 (code, |t|~4) and
+−0.002/−0.003 (web) ; d3 −0.002/−0.003 (code) and **−0.008 (N=12) / −0.022
+(N=16) on web, |t|~6** — 10× d2, first double-milli page signal ever, same
+web-side transient seen in the local capacity_deep fill-scan on v3_reach
+(own−ablated −0.04..−0.06, |t| 2-4 at fill 1-2, gone at fill 4). The page
+channel is not structurally unreadable — it is dominated by the register.
+The discriminant is saturation: jobs 113/114/115 (capacity_deep, fills to
+64×first-destroy, register must die ~1024 writes per longlife) are deposited.
+
+**5. md128 GREEN (job 112).** Carried @800 6.639 code / 7.313 web vs gate
+v2e_interleave 6.575/7.269 ±0.15 ⇒ +0.064/+0.044, well inside. The taper
+512→256→128 for deep v3 blocks is validated TRAINED; 350M VRAM budget
+confirmed. Reserve: addressing at md128 is recency-fragile (junk-last
+label-cued +1.85/+1.10 vs ~0 at md512) and merge is pricier (avg64 +0.50
+code vs +0.23 web) ⇒ keep md512 for the LIVE bank, 128 only for deep pages —
+which is exactly the taper design.
+
+Repro:
+```
+PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
+  deepseek_v4_mini/configs/farm/v3_deep.yaml \
+  /mnt/tb/checkpoints/farm/v350_rehearsal/final.pt \
+  --probes swap,distractor,cued,page,capacity_curve --n-files 48
+# d3: config farm/v350_d3_probes.yaml, ckpt farm/v350_rehearsal_d3/final.pt
+# md128: config farm/v2e_md128.yaml, ckpt farm/v2e_md128/final.pt, probes swap,distractor,cued,merge
+```
+
+---
+
+## 2026-07-14 — Divmix GREEN on 14 sources; the DeltaNet steelman carries but cannot address; reach-back SFT: the page stays dead (3rd strike)
+
+Three verdicts from jobs 106/107/108 (+ the chained 109 arm), all at 97M.
+
+**Job 107 — divmix trained: GREEN, this is the official 350M mix.** v2e
+recipe from v2c final, 800 steps on the 14-source mix. GAP @800 **positive
+on all 14 sources**: codeparrot +1.23, stack_c +1.46, rust +1.17, js +1.43,
+sql +1.96, html +1.68, css +1.63, fineweb +1.41, fineweb_edu +1.54,
+wikipedia +1.43, finemath +1.28, khanacademy +1.15, openstax +1.46, arxiv
++1.87. Depth-flat (code d2 +1.13 → d8 +1.24; web d2 +1.60 → d8 +1.58). The
+invariance battery closes the surface-reuse confound left open by the
+zero-shot smoke: **resegmentation cost ≈ 0 on all 14 sources** (|d| ≤ 0.05,
+all |t| ≤ 1.6), swap distance positive everywhere (+0.29 arxiv … +2.63
+khanacademy; on the never-trained-before languages: stack_c +1.01, js
++1.11, sql +0.92, rust +0.67), and full renaming (codeparrot) costs +0.30
+of a +0.83 swap ceiling — ~2/3 of the gist survives total surface
+replacement. The bank content is file-specific abstraction, not surface
+reuse. **Consequence: the 14-source mix + anchors is frozen as the 350M
+data recipe.**
+
+**Job 106 — B4 internal DeltaNet steelman: the delta channel carries gist,
+but cannot address.** A 49,923-param gated delta-rule state replaces the
+bank as inter-chunk carry (`o['mem_bank']` ignored), init v2c, same recipe
+and budget. It *does* carry: GAP @800 **+0.92 code / +1.22 web** — same
+order of magnitude as the bank arms. But the cued battery is unambiguous:
+JUNK-LAST cost label-cued **+2.07 code / +1.26 web** (trained bank v2f:
+−0.00/+0.03), open-cue +1.93/+1.14, live-thread-last +0.74/+0.30 (v2f
++0.16). The value it shows under a label cue (−0.87/−1.22) exists only
+while the target is the most recent write — one junk write later it is
+gone. Cross-modal doc→body: +0.26, under the +0.3 grid (v2e bank: +1.17).
+**Verdict: a single compressed recurrent state can carry the gist; it
+cannot *select*. Addressed recall — the G2 mechanism — requires slot
+structure. The bank's niche is the addressing, not the carry.** (Public
+DeltaNet commitment at target scale stands; this is the internal science
+point at 97M.)
+
+**Job 108 — reach-back SFT (option 2): the behavior trains, the page stays
+dead — 3rd strike.** SFT with eviction-age-stratified reach-back targets on
+v3 (cascade map [0,0,0,0,1,1]). Addressing strengthens as designed
+(label-cue BANK VALUE −0.81 code / −0.48 web on the final ckpt; reach-back
+vs reset −0.29/−1.10). But the PAGE ABLATION — pre-registered as THE
+verdict — does not separate: real vs ablated page **+0.020 code (wrong
+sign, |t|~2.1) / −0.002 web**. Even when SFT'd *directly on evicted
+targets*, the model routes all reach-back value through live-bank
+superposition and never learns to read the page (the user's reservation
+about the deepest block, confirmed). The chained capacity arm (job 109,
+v3_lite, cascade=on) agrees and adds the killer control: evicted N=12/16 vs
+reset −0.84/−0.87 *but an unwritten label scores −0.843* — evicted recall
+is generic register value, address-specificity past eviction ≈ 0; page
+contribution −0.004 nat (v2h cascade=off shows the same profile: evicted
+−0.75/−0.77, unwritten −0.69). **Consequence: the cascade remains a free
+deployment flag (v3_deep GREEN holds), but no paged-retrieval claim at 97M.
+Page-read drops off the 350M critical path; it becomes a scale/capacity
+question, revisited only if the 350M superposition register saturates.**
+
+Repro:
+```
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2e_divmix.yaml --resume
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2e_delta.yaml --resume
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v3_reach.yaml --resume
+PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
+  deepseek_v4_mini/configs/farm/<cfg>.yaml /mnt/tb/checkpoints/farm/<run>/final.pt \
+  --probes invar|cued,xmodal|page,capacity_curve --n-files 48
+```
+
+---
+
+## 2026-07-13 (6) — Announced resets are neutral: no defensive rehearsal under task loss (B2 GREEN)
+
+The standing note (top of this file) made quantitative. Job 104, config
+`v2e_resetcue.yaml`: strict v2e regime + one addition — 50 % of bank lives
+are *announced* (`<<RESET:SOON>>` prefixed to the last 3 chunks before the
+reset), 50 % surprises. **No loss or reward attached to the marker**; we only
+measure whether the write policy reacts. Pre-registered grid: |d| norm < 2 %,
+|d| redundancy < 0.02, |d| CE < 0.15 nat ⇒ NEUTRAL.
+
+Result (probe resetcue, n=48, announced vs surprise, paired):
+- **CE of the deferred target: unchanged** (−0.001 code |t|~0.1, −0.008 web
+  |t|~1.7) — announcing a wipe does not change what gets remembered.
+- **Write norm: −0.5/−0.6 %** (−0.095/−0.114, |t|~10) — statistically real,
+  far inside the 2 % grid, and in the *deflationary* direction (slightly
+  smaller writes before an announced wipe, the opposite of state-defense).
+- **Intra-write redundancy: −0.009/−0.006** (grid 0.02) — redundancy goes
+  *down*, not up: **no defensive rehearsal**.
+- **The control kills the residue**: the same probe on `v2e_interleave`
+  (never saw the marker) gives the same drift (norm −0.059/−0.155,
+  redundancy −0.006/−0.016) — so the trained model's tiny shift is the
+  generic lexical effect of prefixing an OOD token, **not a learned reset
+  policy**. Training with announced resets added ≈ nothing on top.
+
+Verdict: **NEUTRAL, prediction confirmed.** Under pure task loss, a model
+that can see its own wipe coming treats the announcement as ordinary text —
+no instrumental pressure toward retention appears on its own at this scale.
+This is the baseline the standing warning needs: the dangerous pressure has
+to be *added* (by rewarding retention); it does not emerge from prediction
+loss. Side sanity: carried @800 6.597 ≈ v2e 6.575; swap battery replicates
+(specific +0.88). **B5 (output→input loop) is now unfrozen** per spec order.
+
+Repro:
+```
+python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/farm/v2e_resetcue.yaml --resume
+PYTHONPATH=. python deepseek_v4_mini/analysis/code_defer_bank_probes.py \
+  deepseek_v4_mini/configs/farm/v2e_resetcue.yaml \
+  /mnt/tb/checkpoints/farm/v2e_resetcue/final.pt --probes resetcue,swap,distractor --n-files 48
+# contrôle OOD : même probe sur /mnt/tb/checkpoints/farm/v2e_interleave/final.pt
+```
+
+---
+
 ## 2026-07-13 (5) — Trained taper is free; capacity curve; REGISTER seed #3 (jobs 101/102/109)
 
 Three finished jobs, one dépouillement.

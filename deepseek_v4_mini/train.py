@@ -88,15 +88,18 @@ class Muon(optim.Optimizer):
         adam_betas: tuple = (0.9, 0.95),
         adam_wd: float = 0.1,
         adam_eps: float = 1e-8,
+        adam_fused: bool = False,
     ) -> None:
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
                         ns_steps=ns_steps, wd=wd, rms_match=rms_match)
         super().__init__(params, defaults)
-        # Internal AdamW for non-matrix params
+        # Internal AdamW for non-matrix params. fused=True (opt-in) fuses the
+        # AdamW element-wise update into one CUDA kernel — free on GPU, numerically
+        # ~identical (NOT bit-identical), so gated off by default for repro.
         if adam_params is not None:
             self._adam = optim.AdamW(
                 adam_params, lr=adam_lr, betas=adam_betas, weight_decay=adam_wd,
-                eps=adam_eps,
+                eps=adam_eps, fused=adam_fused,
             )
         else:
             self._adam = None
