@@ -164,6 +164,8 @@ data:
     weight: 0.06
     n_files: 25000
     stream_cap: 60000
+  depth_sync: true                         # DDP : m identique sur les 8 rangs par
+                                           # step (sinon straggler ~2.6x mesuré)
   seq_len: 512
   chunks_per_conv: 8
   defer_len: 16

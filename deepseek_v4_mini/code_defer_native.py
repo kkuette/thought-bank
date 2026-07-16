@@ -323,9 +323,14 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # the tokenized cache alone first (concurrent misses race on the .tmp
     # rename), the barrier releases the others onto a guaranteed cache hit.
     train_seed = sd["seed"] + 9973 * ddp_rank
+    # depth_sync (opt-in): rank-invariant anchor/m rng in next_conv_batch, so all
+    # ranks run the same conv depth per step (a DDP step lasts as long as the
+    # deepest rank — independent draws cost ~2.6x the mean step time).
+    depth_sync = bool(d.get("depth_sync", False))
     if ddp_world > 1 and ddp_rank != 0:
         torch.distributed.barrier()
-    train_stream = CodeChunkStream(tok, split="train", **{**sd, "seed": train_seed})
+    train_stream = CodeChunkStream(tok, split="train", **{**sd, "seed": train_seed},
+                                   depth_sync_seed=sd["seed"] if depth_sync else None)
     eval_stream  = CodeChunkStream(tok, split="held", **{**sd, "batch": 1})  # eval = batch=1 paths
     if ddp_world > 1 and ddp_rank == 0:
         torch.distributed.barrier()               # cache built — release the other ranks
@@ -561,6 +566,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 train_stream.rng.setstate(ck["rng_train_stream"])
             elif ddp_rank != 0:
                 train_stream.rng.seed(train_seed + start_step)
+            # depth_sync: rng_m must stay in LOCKSTEP across ranks after resume —
+            # deterministic re-seed on (base seed, start_step), same everywhere.
+            if train_stream.rng_m is not train_stream.rng:
+                train_stream.rng_m.seed(sd["seed"] + start_step)
             if ck.get("rng_eval_stream") is not None:
                 eval_stream.rng.setstate(ck["rng_eval_stream"])
             print(f"resume: restored {cks[start_step]} @step {start_step} "
