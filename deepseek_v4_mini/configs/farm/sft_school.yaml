@@ -199,5 +199,14 @@ chat:
   weight: 1.0
   eval_convs: 16
   max_new: 24
+  # Biais bas-stages (décision user 2026-07-17, après diagnostic step_400 :
+  # protocole acquis — format/Final answer parfaits — mais arithmétique fausse
+  # même sur 5+7 ; la base 2000-steps n'a jamais appris à compter, l'école doit
+  # l'enseigner). ~74% de la masse sur les stages 0-2 (1-2 chiffres, 2 termes),
+  # tous les stages restent présents (dsv4y : séquentiel pur = oubli).
+  # Prédiction (2026-07-17, Fable) : drill/bindings > 0 sur décodes bas-stages
+  # avant 800 ; le Δ bindings/lesson devient lisible en bas d'abord.
+  gen:
+    stage_weights: [8, 5, 3, 2, 1, 1, 0.5, 0.5, 0.5]
 teacher:
   enabled: false
