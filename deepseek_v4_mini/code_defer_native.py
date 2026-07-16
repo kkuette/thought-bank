@@ -172,8 +172,42 @@ def evaluate_by_depth(model, stream, device, think_id, blank_id, defer_len,
 
 def main(cfg_path: str, resume: bool = False) -> None:
     raw = yaml.safe_load(open(cfg_path)); t = raw["training"]; d = raw["data"]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # DDP (opt-in via torchrun): data parallelism WITHOUT the DDP wrapper — the
+    # conv loop runs many forwards (in-context + defer + addr + reach) per single
+    # backward, which trips DDP's reducer ("marked ready twice"). Instead: each
+    # rank runs its own convs (bank/cascade/carry are rank-local state, exactly
+    # the mono-GPU semantics), gradients are all-reduced manually before
+    # opt.step(). Muon/AdamW are deterministic, so identical grads => identical
+    # weights on every rank, no sync drift. Effective batch = B * G * world_size.
+    ddp_world = int(os.environ.get("WORLD_SIZE", "1"))
+    ddp_rank = int(os.environ.get("RANK", "0"))
+    if ddp_world > 1:
+        import datetime
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)         # BEFORE init: NCCL binds the current
+        #                                           device — after, every rank also grows
+        #                                           a ~0.5GB stray context on cuda:0
+        torch.distributed.init_process_group(
+            "nccl", timeout=datetime.timedelta(hours=2))  # rank0 evals while others wait
+        device = torch.device(f"cuda:{local_rank}")
+        if ddp_rank != 0:
+            sys.stdout = open(os.devnull, "w")   # one log stream; errors keep stderr
+        print(f"ddp: world {ddp_world} (this = rank {ddp_rank}, cuda:{local_rank})",
+              flush=True)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = bool(t.get("amp", False))            # native MoE/sinkhorn: fp32 by default
+
+    # OPT-IN speed levers (all default off => every existing config bit-identical).
+    # tf32: the biggest phase-1 win — MoE/sinkhorn run in fp32, TF32 accelerates
+    # exactly those matmuls on Ampere/Ada with a tiny precision cost. Measured in
+    # the bringup sweep before committing.
+    if bool(t.get("tf32", False)):
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("tf32: enabled (fp32 matmul -> tf32)", flush=True)
 
     tok = AutoTokenizer.from_pretrained(raw["tokenizer"])
     add = [x for x in ("<think>", "<blank>") if x not in tok.get_vocab()]
@@ -200,6 +234,33 @@ def main(cfg_path: str, resume: bool = False) -> None:
         print(f"init_from: model weights <- {init_from} (step {ck0.get('step', '?')})",
               flush=True)
 
+    # `base` is the eager module — the source of truth for state_dict / named params
+    # / optimizer grouping (torch.compile wraps in OptimizedModule and prefixes keys
+    # with `_orig_mod.`, which would break checkpoint format and the name-based Muon
+    # groups below). `model` is what we CALL forward on; when compiled it shares the
+    # same Parameter tensors as `base`, so the optimizer built from `base` still
+    # drives it. Opt-in; graph breaks (MoE/sinkhorn/einsum) measured in the sweep.
+    base = model
+    if bool(t.get("compile", False)):
+        model = torch.compile(model)
+        print("compile: torch.compile(model) enabled", flush=True)
+
+    # grad_checkpoint (opt-in): rematerialize each model forward during backward.
+    # The conv loop keeps EVERY chunk's graph alive until the single end-of-conv
+    # backward (whole-conv TBPTT), so activation peak = O(K * B * depth-draw) —
+    # the step-to-step conv-depth variance is exactly what OOMs B>=8 on 80GB.
+    # Checkpointing stores only the inputs per forward => peak ~ one chunk's
+    # activations; gradients are EXACT (same graph, recomputed), ~+30% compute.
+    grad_ckpt = bool(t.get("grad_checkpoint", False))
+    if grad_ckpt:
+        from torch.utils.checkpoint import checkpoint as _ckpt
+        print("grad_checkpoint: ON (rematerialized forwards, exact grads)", flush=True)
+
+    def _fwd(*a, **k):
+        if grad_ckpt and torch.is_grad_enabled():
+            return _ckpt(model, *a, use_reentrant=False, **k)
+        return model(*a, **k)
+
     # B4 (backlog 2026-07-13) : canal DeltaNet inter-tours À LA PLACE du carry
     # de banque — modèle strictement inchangé, seul le canal inter-chunks change
     # (o["mem_bank"] ignoré, l'état delta est porté et présenté en pseudo-banque).
@@ -213,6 +274,18 @@ def main(cfg_path: str, resume: bool = False) -> None:
         print(f"delta channel ON: d_k {_dk} d_v {delta.d_v} "
               f"({sum(p.numel() for p in delta.parameters()):,} params) — "
               f"carry inter-chunks = état delta, o['mem_bank'] ignoré", flush=True)
+
+    # DDP: model init uses the (unseeded) default RNG, so ranks start with
+    # different weights — broadcast rank0's so the manual all-reduce keeps
+    # everyone bit-identical from step 1. (tf_proj is Generator-seeded: already
+    # identical everywhere.)
+    if ddp_world > 1:
+        with torch.no_grad():
+            for p in base.parameters():
+                torch.distributed.broadcast(p.data, src=0)
+            if delta is not None:
+                for p in delta.parameters():
+                    torch.distributed.broadcast(p.data, src=0)
 
     # teacher: distill the last bank slot toward a fixed random projection of the
     # mean-pooled chunk gist (a target the write CAN produce), β anneals 1->0.
@@ -245,8 +318,17 @@ def main(cfg_path: str, resume: bool = False) -> None:
               sources=d.get("sources"),
               var_chunk=d.get("var_chunk"),
               seed=int(t.get("seed", 0)))
-    train_stream = CodeChunkStream(tok, split="train", **sd)
+    # DDP: per-rank seed offset => each rank samples different convs (random
+    # sampling with per-rank RNG — no distributed sampler needed). Rank0 builds
+    # the tokenized cache alone first (concurrent misses race on the .tmp
+    # rename), the barrier releases the others onto a guaranteed cache hit.
+    train_seed = sd["seed"] + 9973 * ddp_rank
+    if ddp_world > 1 and ddp_rank != 0:
+        torch.distributed.barrier()
+    train_stream = CodeChunkStream(tok, split="train", **{**sd, "seed": train_seed})
     eval_stream  = CodeChunkStream(tok, split="held", **{**sd, "batch": 1})  # eval = batch=1 paths
+    if ddp_world > 1 and ddp_rank == 0:
+        torch.distributed.barrier()               # cache built — release the other ranks
     print(f"corpus: train {train_stream.n_chunk} chunks / held {eval_stream.n_chunk} | "
           f"seq_len {L}  K {K}  defer_len {defer_len}", flush=True)
     # per-domain eval views: on a weighted mix, GAP/depth are reported PER SOURCE
@@ -258,7 +340,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # single native optimizer: Muon (2-D weights) + bundled AdamW (embed/norm/1-D)
     lr = float(t.get("lr", 3e-4)); muon_lr = float(t.get("muon_lr", 3e-3))
     wd = float(t.get("weight_decay", 0.01)); balw = float(cfg.balance_loss_weight)
-    muon_p, adam_p = _split_muon_params(model)
+    muon_p, adam_p = _split_muon_params(base)
     if delta is not None:
         # B4 : les ~50k params du canal delta vont dans le bundle AdamW (module
         # neuf, pas de piège √cols Muon à gérer) ; état optimiseur sauvé avec.
@@ -272,7 +354,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
     ref_dim = float(t.get("muon_ref_mem_dim", 64))
     s_read  = (ref_dim / cfg.mem_dim) ** 0.5          # cols = mem_dim grew → scale down
     s_write = (cfg.mem_dim / ref_dim) ** 0.5          # rows = mem_dim grew → scale up
-    names = {id(p): n for n, p in model.named_parameters()}
+    names = {id(p): n for n, p in base.named_parameters()}
     g_read  = [p for p in muon_p if ("fw_A" in names[id(p)] or "fw_B" in names[id(p)])]
     g_write = [p for p in muon_p if ("thought_head" in names[id(p)] or "write_gate" in names[id(p)])]
     ids = {id(p) for p in g_read} | {id(p) for p in g_write}
@@ -281,7 +363,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
               {"params": g_read,  "lr_scale": s_read},
               {"params": g_write, "lr_scale": s_write}]
     opt = Muon(groups, lr=muon_lr, momentum=0.95, nesterov=True, ns_steps=10, wd=wd,
-               adam_params=adam_p, adam_lr=lr, adam_wd=wd)
+               adam_params=adam_p, adam_lr=lr, adam_wd=wd,
+               adam_fused=bool(t.get("adam_fused", False)))
     print(f"optimizer: Muon lr {muon_lr} ({sum(p.numel() for p in muon_p):,}) "
           f"+ AdamW lr {lr} ({sum(p.numel() for p in adam_p):,}) | "
           f"lr_scale read {s_read:.3f} ({sum(p.numel() for p in g_read):,}) "
@@ -397,9 +480,14 @@ def main(cfg_path: str, resume: bool = False) -> None:
     log_every, eval_every = int(t.get("log_every", 20)), int(t.get("eval_every", 200))
     eval_depths = list(t.get("eval_depths", []) or [])   # [] => depth-stratified eval OFF
     eval_depth_convs = int(t.get("eval_depth_convs", 8))
+    # step == steps déclenche l'éval même avec eval_every énorme : sur un mix
+    # large ça bloque ~40 min de GPU en fin de run (et le rang 0 seul en DDP).
+    skip_final_eval = bool(t.get("skip_final_eval", False))
     save_every, save_dir = int(t.get("save_every", 500)), t["save_dir"]
     metrics_file = t.get("metrics_file"); os.makedirs(save_dir, exist_ok=True)
     if metrics_file: os.makedirs(os.path.dirname(metrics_file), exist_ok=True)
+    if ddp_rank != 0:
+        metrics_file = None                       # IO (metrics/tb/eval/save) = rank0 only
     writer = None
     if metrics_file:
         from torch.utils.tensorboard import SummaryWriter
@@ -429,7 +517,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
     def _save_ck(step, path):
         """Full training state: preemption-safe resume on rented/spot GPUs."""
         tmp = path + ".tmp"
-        torch.save({"step": step, "model": model.state_dict(), "cfg": cfg.__dict__,
+        torch.save({"step": step, "model": base.state_dict(), "cfg": cfg.__dict__,
                     "opt": opt.state_dict(),
                     "adam": opt._adam.state_dict() if opt._adam else None,
                     "delta": delta.state_dict() if delta is not None else None,
@@ -456,7 +544,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
         if cks:
             start_step = max(cks)
             ck = torch.load(cks[start_step], map_location="cpu", weights_only=False)
-            model.load_state_dict(ck["model"])
+            base.load_state_dict(ck["model"])
             if ck.get("opt") is not None: opt.load_state_dict(ck["opt"])
             if ck.get("adam") is not None and opt._adam is not None:
                 opt._adam.load_state_dict(ck["adam"])
@@ -466,8 +554,13 @@ def main(cfg_path: str, resume: bool = False) -> None:
             if ck.get("rng_torch") is not None: torch.set_rng_state(ck["rng_torch"])
             if ck.get("rng_cuda") is not None and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all(ck["rng_cuda"])
-            if ck.get("rng_train_stream") is not None:
+            # DDP: the checkpoint holds rank0's stream RNG — restoring it on every
+            # rank would make them all sample the SAME convs. Rank0 resumes its
+            # exact stream; other ranks re-seed on (rank, start_step) instead.
+            if ck.get("rng_train_stream") is not None and ddp_rank == 0:
                 train_stream.rng.setstate(ck["rng_train_stream"])
+            elif ddp_rank != 0:
+                train_stream.rng.seed(train_seed + start_step)
             if ck.get("rng_eval_stream") is not None:
                 eval_stream.rng.setstate(ck["rng_eval_stream"])
             print(f"resume: restored {cks[start_step]} @step {start_step} "
@@ -477,6 +570,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
 
     model.train(); t0 = time.time()
     for step in range(start_step + 1, steps + 1):
+        _t_step0 = time.time()
         lr_now = set_lr(step)
         opt.zero_grad(set_to_none=True)
         ic_v = d_v = a_v = 0.0; ic_cnt = d_cnt = a_cnt = 0; distill_v = 0.0; distill_n = 0
@@ -528,7 +622,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 pre0 = (bank[:, 0].detach()
                         if casc is not None and bank.size(1) >= cfg.max_mem else None)
                 lb = casc.layer_banks(bank, cascade_map) if casc is not None else None
-                loss, bank, ce = _ic_loss(model, xt, bank, balw, amp, lb)
+                loss, bank, ce = _ic_loss(_fwd, xt, bank, balw, amp, lb)
                 if delta is not None:
                     # B4 : le write du modèle reste actif DANS le chunk (même
                     # forward), mais le carry inter-chunks = l'état delta
@@ -561,9 +655,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         bank = torch.cat([bank[:, :-1], blended], dim=1)
                     di = _fill(x, blank_id, dl)
                     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-                        od = model(di, init_mem=bank,
-                                   layer_banks=casc.layer_banks(bank, cascade_map)
-                                   if casc is not None else None)
+                        od = _fwd(di, init_mem=bank,
+                                  layer_banks=casc.layer_banks(bank, cascade_map)
+                                  if casc is not None else None)
                     lg = od["logits"].float()
                     dloss = F.cross_entropy(lg.reshape(-1, lg.size(-1)), nxt.reshape(-1),
                                             ignore_index=-100)
@@ -576,9 +670,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     ac, at = ac.to(device), at.to(device)
                     di = torch.cat([ac, _fill(ac, blank_id, at.size(1))], dim=1)
                     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-                        oa = model(di, init_mem=bank,
-                                   layer_banks=casc.layer_banks(bank, cascade_map)
-                                   if casc is not None else None)
+                        oa = _fwd(di, init_mem=bank,
+                                  layer_banks=casc.layer_banks(bank, cascade_map)
+                                  if casc is not None else None)
                     lga = oa["logits"].float()[:, ac.size(1):]
                     aloss = F.cross_entropy(lga.reshape(-1, lga.size(-1)),
                                             at.reshape(-1), ignore_index=-100)
@@ -601,9 +695,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         rt = e["tgt"].to(device)
                         di = torch.cat([rc, _fill(rc, blank_id, rt.size(1))], dim=1)
                         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-                            orr = model(di, init_mem=bank,
-                                        layer_banks=casc.layer_banks(bank, cascade_map)
-                                        if casc is not None else None)
+                            orr = _fwd(di, init_mem=bank,
+                                       layer_banks=casc.layer_banks(bank, cascade_map)
+                                       if casc is not None else None)
                         lgr = orr["logits"].float()[:, rc.size(1):]
                         rloss = F.cross_entropy(lgr.reshape(-1, lgr.size(-1)),
                                                 rt.reshape(-1), ignore_index=-100)
@@ -629,8 +723,39 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     dstate_carry = dstate.detach()
                 if reach_prob > 0:
                     rpool_carry, wt_carry = reach_pool, w_total
+        _prof = os.environ.get("TB_DDP_PROF")
+        if _prof:
+            torch.cuda.synchronize(); _t_bwd = time.time()
+        if ddp_world > 1:
+            # manual grad sync: average across ranks BEFORE clip so every rank
+            # computes the same norm and the same update (ranks stay identical).
+            # Buckets of ~64MB: one flat all-reduce per bucket instead of one
+            # NCCL call per tensor (the MoE makes that hundreds of tiny calls).
+            from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+            grads = [p.grad for p in base.parameters() if p.grad is not None]
+            if delta is not None:
+                grads += [p.grad for p in delta.parameters() if p.grad is not None]
+            bucket, nbytes = [], 0
+            for g_ in grads + [None]:
+                if g_ is None or nbytes + g_.numel() * g_.element_size() > 64 << 20:
+                    if bucket:
+                        flat = _flatten_dense_tensors(bucket)
+                        torch.distributed.all_reduce(flat)
+                        flat.div_(ddp_world)
+                        for b_, s_ in zip(bucket, _unflatten_dense_tensors(flat, bucket)):
+                            b_.copy_(s_)
+                    bucket, nbytes = [], 0
+                if g_ is not None:
+                    bucket.append(g_); nbytes += g_.numel() * g_.element_size()
+        if _prof:
+            torch.cuda.synchronize(); _t_ar = time.time()
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(t.get("grad_clip", 1.0)))
         opt.step()
+        if _prof:
+            torch.cuda.synchronize()
+            print(f"[prof step {step}] fwd+bwd {_t_bwd - _t_step0:.2f}s  "
+                  f"allreduce {_t_ar - _t_bwd:.2f}s  clip+opt {time.time() - _t_ar:.2f}s",
+                  flush=True)
         ic_v /= max(ic_cnt, 1); d_v /= max(d_cnt, 1)
         ema_ic = ic_v if ema_ic is None else 0.95 * ema_ic + 0.05 * ic_v
         ema_d  = d_v  if ema_d  is None else 0.95 * ema_d  + 0.05 * d_v
@@ -649,8 +774,11 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 # doit PAS baisser si c'est bien la page qui est lue)
                 addr_s += "reach " + "/".join(
                     "—" if v is None else f"{v:.2f}" for v in ema_reach) + "  "
+            mem_s = (f"mem {torch.cuda.memory_allocated()/2**30:.1f}/"
+                     f"{torch.cuda.max_memory_allocated()/2**30:.1f}G  "
+                     if torch.cuda.is_available() else "")
             print(f"step {step:5d}  ic {ema_ic:.3f} (ppl {math.exp(ema_ic):.1f})  defer {ema_d:.3f}  "
-                  f"{addr_s}β {_beta(step):.2f}  lr {lr_now:.2e}  "
+                  f"{addr_s}β {_beta(step):.2f}  lr {lr_now:.2e}  {mem_s}"
                   f"{(time.time()-t0)/max(step - start_step, 1):.2f}s/step", flush=True)
             if writer is not None:
                 writer.add_scalar("train/ic_loss", ema_ic, step)
@@ -665,7 +793,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 writer.add_scalar("sched/beta", _beta(step), step)
                 if distill_n:
                     writer.add_scalar("train/distill", distill_v / distill_n, step)
-        if step % eval_every == 0 or step == steps:
+        if (step % eval_every == 0
+                or (step == steps and not skip_final_eval)) and ddp_rank == 0:
             # eval_depth_sources (mix large, ex. divmix 13 sources) : la courbe
             # par profondeur coûte 4x le GAP top-level (eval_depths x
             # eval_depth_convs convs PAR source) et ne sert de comparaison que
@@ -704,9 +833,12 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     if writer is not None:
                         for d in eval_depths:
                             writer.add_scalar(f"eval_depth/{pfx}gap_d{d}", bd[d]["gap"], step)
-        if step % save_every == 0 or step == steps:
+        if (step % save_every == 0 or step == steps) and ddp_rank == 0:
             _save_ck(step, os.path.join(save_dir,
                      "final.pt" if step == steps else f"step_{step}.pt"))
+    if ddp_world > 1:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
     print("done.", flush=True)
 
 
