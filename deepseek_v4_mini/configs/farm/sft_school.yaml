@@ -169,7 +169,13 @@ training:
   log_every: 10
   eval_every: 200
   eval_convs: 8
-  eval_depths: [2, 4, 6, 8]
+  # ancres seulement (feedback user 2026-07-16 : l'éval 14 sources re-teste
+  # tout le corpus à chaque palier et domine le wall-clock du SFT) — la
+  # prédiction 4 (code intact) se lit sur 2 ancres, pas sur les 14 sources.
+  eval_sources:
+  - codeparrot
+  - fineweb
+  eval_depths: [2, 8]
   eval_depth_convs: 8
   eval_depth_sources:
   - codeparrot

@@ -418,6 +418,13 @@ def main(cfg_path: str, resume: bool = False) -> None:
     eval_views = ([(nm, eval_stream.source_stream(i))
                    for i, nm in enumerate(eval_stream.src_names)]
                   if len(eval_stream.src_files) > 1 else [("", eval_stream)])
+    # eval_sources (opt-in) : restreint l'éval per-source à des ANCRES — sur un
+    # mix 14 sources l'éval complète re-teste tout le corpus à chaque palier
+    # (14x8 convs + depth), ce qui domine le wall-clock d'un SFT court. None
+    # (défaut) = toutes les sources (comportement historique).
+    ev_srcs = t.get("eval_sources")
+    if ev_srcs:
+        eval_views = [(nm, es) for nm, es in eval_views if nm in ev_srcs]
 
     # ── chat mode (opt-in `chat:` block — phase 2 SFT, marche 2) ─────────────
     # Chat-templated convs (math school) mixed into the conv stream at p_chat:
