@@ -44,8 +44,8 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
                  dataset: str, data_dir: str = "", config_name: str = "",
                  content_key: str = "content", min_chunks: int = 1,
                  stream_skip: int = 0, max_chunks_per_file: int = 12,
-                 stream_cap: int = 60000, cache_dir: str = "data_cache"
-                 ) -> list[list[torch.Tensor]]:
+                 stream_cap: int = 60000, cache_dir: str = "data_cache",
+                 revision: str = "") -> list[list[torch.Tensor]]:
     """Build (or load from disk cache) ONE source's ragged chunk lists."""
     L = int(seq_len)
     label = f"{split}:{dataset.split('/')[-1]}{'/' + config_name if config_name else ''}"
@@ -58,7 +58,8 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
         key = "|".join(str(v) for v in (
             dataset, data_dir, split, L, max_chunks_per_file, n_files, stream_cap,
             content_key, config_name, min_chunks, stream_skip,
-            getattr(tokenizer, "name_or_path", "?"), len(tokenizer)))
+            getattr(tokenizer, "name_or_path", "?"), len(tokenizer))
+            + ((revision,) if revision else ()))  # appended only if set: old keys intact
         h = hashlib.md5(key.encode()).hexdigest()[:16]
         cache_path = os.path.join(cache_dir, f"chunks_{split}_{h}.pt")
         if os.path.exists(cache_path):
@@ -75,6 +76,9 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
     kw = {}
     if data_dir: kw["data_dir"] = data_dir
     if config_name: kw["name"] = config_name            # HF *config* (e.g. fineweb dumps)
+    # revision: e.g. refs/convert/parquet — datasets>=4 dropped script datasets;
+    # the auto-converted parquet branch keeps them loadable (scientific_papers).
+    if revision: kw["revision"] = revision
     ds = load_dataset(dataset, split="train", streaming=True, **kw)
     if stream_skip:
         ds = ds.skip(int(stream_skip))                  # per-pod shard offset
@@ -224,6 +228,7 @@ class CodeChunkStream:
                     content_key=s.get("content_key", "content"),
                     min_chunks=int(s.get("min_chunks", 1)),
                     stream_skip=int(s.get("stream_skip", 0)),
+                    revision=s.get("revision", ""),
                     stream_cap=int(s.get("stream_cap", stream_cap)), **common))
                 self.src_weights.append(w)
                 self.src_names.append(s.get("name") or s["dataset"].split("/")[-1])
