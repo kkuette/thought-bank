@@ -16,13 +16,17 @@
 # cache uint16 ≈ 5 GB) puis tar → HF privé → untar dans /workspace/data_cache
 # au boot. the-stack (full, PAS smol) est GATED : token HF requis au prébuild.
 #
-# DIMENSIONNEMENT (2026-07-16, Fable) : W8 x B6 x G1 = 48 convs/step, m moyen
-# ~3.5-4 => ~90-100k tokens/step => 110k steps ≈ 10B. B6 = sûr sans grad_
-# checkpoint (variance de profondeur des convs, OOM-roulette au-delà) ; au
-# bring-up, mesurer B12+grad_checkpoint (grads prouvés exacts) vs B6 et garder
-# le meilleur $/1M. DÉCISIONS DE BRING-UP restantes : LR (3e-4/7.5e-4 = prouvé
-# à batch effectif 8 ; batch 48 admettrait ~sqrt(6)x mais NaN-recipe caps) et
-# anneal teacher (ici ~15-22% des steps, la proportion du twin/v2b_mix).
+# DIMENSIONNEMENT (validé pod 8xA100 2026-07-17, contrats 45123153+45132091) :
+# W8 x B32 x G1 = 256 convs/step, m moyen ~3.9 => ~510-550k tokens/step =>
+# 19600 steps ≈ 10B. Croisière mesurée 5.4 s/step (B32+GC+compile+depth_sync)
+# => ~28-30h ≈ $260-280 sur la 44773580. Empilement des gains : depth_sync
+# (straggler 2.6x tué), grad_checkpoint (B6 sans GC = OOM), compile (+5%
+# vitesse, -29% mem alloc => c'est lui qui paie B32), B24->B32 gratuit (host-
+# bound : 8 boucles data single-core à 99%). IMAGE : pytorch/pytorch:2.6.0-
+# cuda12.4-cudnn9-devel MINIMUM — torch 2.5.1 = CheckpointError compile+GC
+# (pytorch #166926, fix dynamic=False insuffisant sur 2.5). LR inchangé
+# 3e-4/7.5e-4 (batch 550k tokens = zone standard 350M, NaN-recipe caps) ;
+# anneal teacher = proportion twin ~15-22% des steps.
 tokenizer: HuggingFaceTB/SmolLM2-135M
 
 model:                                     # = v350_bringup / v350_curr (386M)
@@ -169,7 +173,7 @@ data:
   seq_len: 512
   chunks_per_conv: 8
   defer_len: 16
-  batch_size: 6                            # par GPU ; sûr sans grad_checkpoint
+  batch_size: 32                           # par GPU (B32+GC+compile : 69.5G/80 réservés, validé pod 2026-07-17)
   n_files: 1000000                         # inutilisé (n_files épinglé par source)
   stream_cap: 90000
   # PAS de var_chunk : phase 1 = chunks fixes (le chemin batché v2b_mix) ;
@@ -177,26 +181,27 @@ data:
 
 training:
   seed: 0                                  # shard DDP = seed + 9973*rank (trainer)
-  steps: 110000
+  steps: 19600
   grad_accum: 1
   amp: true
   # PAS d'init_from : la phase 1 EST le from-scratch (batché).
   lr: 3.0e-04
   muon_lr: 7.5e-04
   muon_ref_mem_dim: 64
-  warmup_steps: 2000
+  warmup_steps: 400
   weight_decay: 0.01
   grad_clip: 1.0
   defer_weight: 1.0
   wsd_decay: true
   wsd_floor: 0.0
-  wsd_decay_start: 66000                   # 60% (convention DeepSeek, shape step)
+  wsd_decay_start: 11800                   # 60% (convention DeepSeek, shape step)
   wsd_decay_shape: step
   tf32: true                               # +17% tok/s mesuré A100, opt-in validé
-  grad_checkpoint: false                   # bring-up : tester B12+GC vs B6
+  grad_checkpoint: true                    # OBLIGATOIRE a 386M (B6 sans GC = OOM step 1)
+  compile: true                            # torch>=2.6 requis (2.5.1 = CheckpointError) ; +5% vitesse, -29% mem
   skip_final_eval: true                    # pas d'éval bloquante à step==steps
   log_every: 20
-  eval_every: 2000
+  eval_every: 500
   eval_convs: 8
   eval_depths:
   - 2
@@ -207,7 +212,7 @@ training:
   eval_depth_sources:                      # courbe par profondeur : ancres seules
   - codeparrot
   - fineweb
-  save_every: 2000                         # ~35-45 min entre checkpoints
+  save_every: 500                          # ~45 min entre checkpoints (5.4 s/step)
   save_dir: /workspace/checkpoints/v350_phase1_10b
   metrics_file: /workspace/runs/v350_phase1_10b/metrics.jsonl
   # AUCUN flag de stack : pas d'interleave, pas de no_reset, pas d'addr,
@@ -217,5 +222,5 @@ teacher:
   enabled: true                            # recette from-scratch (kick du read)
   distill_weight: 2.0
   anneal:                                  # ~15-22% des steps = proportion twin
-  - 16000
-  - 24000
+  - 2850
+  - 4300
