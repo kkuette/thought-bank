@@ -247,8 +247,18 @@ def main(cfg_path: str, resume: bool = False) -> None:
         # shape. Sans ça, la transition automatique statique->dynamique fait
         # choisir au recompute du grad_checkpoint un graphe différent du forward
         # (CheckpointError "different number of tensors", pytorch #166926).
+        # cache_size_limit relevé : le mem_bank flippe requires_grad (write on/off)
+        # => dynamo recompile a chaque flip ; la limite par defaut (8) est crevee
+        # vers step 60 (observe pod 45185048 2026-07-17) et le fallback eager
+        # desynchronise les graphes entre rangs DDP => deadlock NCCL (100% util,
+        # ~95W). On monte la limite pour que les 8 rangs recompilent en lockstep
+        # (depth_sync garantit m identique) sans jamais tomber en fallback.
+        from torch._dynamo import config as _dynamo_config
+        _dynamo_config.cache_size_limit = 256
+        _dynamo_config.accumulated_cache_size_limit = 1024
         model = torch.compile(model, dynamic=False)
-        print("compile: torch.compile(model, dynamic=False) enabled", flush=True)
+        print("compile: torch.compile(model, dynamic=False) enabled "
+              "(dynamo cache_size_limit=256)", flush=True)
 
     # grad_checkpoint (opt-in): rematerialize each model forward during backward.
     # The conv loop keeps EVERY chunk's graph alive until the single end-of-conv
