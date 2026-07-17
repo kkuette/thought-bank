@@ -830,7 +830,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
             for src_name, es in eval_views:
                 tag = f" [{src_name}]" if src_name else ""
                 pfx = f"{src_name}/" if src_name else ""
-                m = evaluate(model, es, device, think_id, blank_id, defer_len,
+                # eval sur `base` (non-compile) : les convs d'eval ont des largeurs
+                # B=1 toutes differentes => un graphe dynamo par shape, premier
+                # eval bloque >13 min a step 500 (pod 45191495). Eager = 1-2 min.
+                m = evaluate(base, es, device, think_id, blank_id, defer_len,
                              int(t.get("eval_convs", 8)), balw, amp, delta=delta)
                 print(f"[eval @{step}]{tag} ic_ppl {m['ic_ppl']:.1f} | defer car {m['defer_car']:.3f} "
                       f"res {m['defer_res']:.3f} GAP {m['defer_gap']:+.3f} GAP0 {m['defer_gap0']:+.3f} "
@@ -845,7 +848,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         writer.add_scalar(f"eval/{pfx}{k}", v, step)
                 if eval_depths and (depth_srcs is None or not src_name
                                     or src_name in depth_srcs):
-                    bd = evaluate_by_depth(model, es, device, think_id, blank_id,
+                    bd = evaluate_by_depth(base, es, device, think_id, blank_id,
                                            defer_len, eval_depths, eval_depth_convs, amp,
                                            delta=delta)
                     curve = "  ".join(f"d{d}:{bd[d]['gap']:+.3f}(n{bd[d]['n']})" for d in eval_depths)
