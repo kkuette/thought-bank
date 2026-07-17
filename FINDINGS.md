@@ -37,6 +37,60 @@ test this — before scale.
 
 ---
 
+## 2026-07-17 — SFT école de maths (marche 2 phase 2, jobs 117→119) : le protocole s'apprend en 200 steps, l'arithmétique n'émerge pas en 800 — verdict Δ ILLISIBLE (plancher), pas ROUGE ; le mécanisme code ne paie rien
+
+**Setup.** `sft_school.yaml` : SFT-chaud 800 steps sur `v350_rehearsal/final.pt`
+(97M from scratch 2000 steps ≈ 65M tokens), convs ChatML de l'école de maths
+(`math_school_data.py`, 5 kinds) mixées à p_chat 0.4 dans le carry des vies,
+CE masquée réponses assistant. Éval intégrée : greedy decode par tour, banque
+vive vs ablatée, graders du générateur. Verdict cible : Δ = grade − grade_abl
+> 0 sur bindings/lesson (la réponse ne peut venir que de la banque). En cours
+de run, deux correctifs (jobs 118/119, resume @400) : évals réduites à 2
+ancres (`eval_sources`, feedback user — les 14 sources dominaient le
+wall-clock) et biais bas-stages `stage_weights [8,5,3,2,1,1,.5,.5,.5]`
+(stages 0-3 : 30%→61%) après diagnostic local du step_400.
+
+**1. La chaîne de notation est hors de cause.** Graders 40/40 = 1.000 sur les
+textes canoniques au format exact des décodes ; le bras ablaté est un contrôle
+sain (constante `12`/`148` quel que soit l'énoncé).
+
+**2. Le protocole s'apprend vite, le calcul pas.** Chat CE 4.48→1.01 en 400
+steps ; dès 400 les décodes ont le format parfait (nombres seuls, `x + .. =
+..`, `Final answer:`), la réponse VARIE avec l'énoncé (la banque est lue) et
+@800 la MAGNITUDE est calée (cible 3 chiffres → `124`, 4 chiffres → `1244`,
+2 chiffres → `44`) avec des exacts occasionnels sur les tout petits nombres
+(`13`→`12`, un filler juste). Mais l'exact-match reste 0.00 sur tous les
+kinds @800 — même `5+7` était faux @400. nll par kind : drill 1.43→0.93,
+lesson 0.96→0.75.
+
+**3. Verdict Δ : ILLISIBLE (grade 0 des deux bras), pas ROUGE.** La grille
+« ROUGE = il devine sans banque » supposait des grades > 0. La cause est la
+base : 2000 steps from scratch n'ont jamais appris l'arithmétique, l'école
+doit l'enseigner et 800 steps n'y suffisent pas. Le signal encourageant :
+live ≠ abl partout (structure, magnitude, énoncé) = la banque porte déjà
+l'information de travail, c'est l'ARITHMÉTIQUE qui manque, pas la mémoire.
+
+**4. Le prix de l'école ≈ 0 sur le code.** @800 : GAP codeparrot +1.47,
+probes finales label-cue BANK VALUE −0.88 (|t| 12, adressage RENFORCÉ vs
+−0.36/−0.48 au rehearsal), SPECIFIC +0.47, MID-filter propre (distractor
++0.00..+0.01). fineweb : GAP top-level bruité (+0.97@200 → +0.27@800, n=8)
+mais GAP par profondeur stable (d2/d8 +0.66/+0.66) — à surveiller, pas un
+verdict.
+
+**Next.** Rallonger l'école (continuation depuis `sft_school/final.pt`),
+seule variable = steps ; le Δ se lira quand drill bas-stages > 0. Les autres
+boutons (p_chat, poids stages, partial credit d'éval) restent en réserve —
+une variable à la fois.
+
+```
+# ckpt: /mnt/tb/checkpoints/farm/sft_school/final.pt (step 800)
+# logs: /mnt/tb/runs/GPUrig0-gpu1__117_sft_school.workerlog (0→400, tué),
+#       GPUrig0-gpu2__118 (tué, sans biais), GPUrig0-gpu1__119 (400→800+probes)
+# diag décodes : scratchpad diag_math_decode.py (rejouable sur tout ckpt)
+```
+
+---
+
 ## 2026-07-14 (3) — Saturation scan (capacity_deep, jobs 113/114/115) : le registre ne meurt JAMAIS (jusqu'à 64× la capacité), la page contribue partout en milli-nats (↑ avec la profondeur, ↑ sources structurées) mais ne devient jamais adressée
 
 **Setup.** Probe `capacity_deep` sur 3 checkpoints : v3_reach (d1, job 113, 2 sources,
