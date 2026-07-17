@@ -242,23 +242,23 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # drives it. Opt-in; graph breaks (MoE/sinkhorn/einsum) measured in the sweep.
     base = model
     if bool(t.get("compile", False)):
-        # dynamic=False : nos shapes sont statiques par construction ([B,512] et
-        # [B,16] ; m ne change que le NOMBRE d'appels) — un graphe statique par
-        # shape. Sans ça, la transition automatique statique->dynamique fait
-        # choisir au recompute du grad_checkpoint un graphe différent du forward
-        # (CheckpointError "different number of tensors", pytorch #166926).
-        # cache_size_limit relevé : le mem_bank flippe requires_grad (write on/off)
-        # => dynamo recompile a chaque flip ; la limite par defaut (8) est crevee
-        # vers step 60 (observe pod 45185048 2026-07-17) et le fallback eager
-        # desynchronise les graphes entre rangs DDP => deadlock NCCL (100% util,
-        # ~95W). On monte la limite pour que les 8 rangs recompilent en lockstep
-        # (depth_sync garantit m identique) sans jamais tomber en fallback.
+        # dynamic=True : les largeurs de sequence varient reellement en train
+        # (assemblage des convs, m variable, appends think) => avec dynamic=False
+        # un graphe PAR largeur. Historique pod 45185048/45191495 (2026-07-17) :
+        # limite 8 -> fallback eager desynchronise entre rangs = deadlock NCCL ;
+        # limite 256 -> frame [6/256] crevee, scan lineaire des guards a chaque
+        # appel = s/step qui degrade 4.4 -> 19.5. Un graphe symbolique absorbe
+        # toutes les largeurs. Requiert torch>=2.6 : sur 2.5 le recompute du
+        # grad_checkpoint choisissait un graphe different du forward
+        # (CheckpointError, pytorch #166926) — corrige en 2.6.
+        # cache_size_limit 32 : variantes restantes = flips requires_grad du
+        # mem_bank et tailles de banque, petit et borne.
         from torch._dynamo import config as _dynamo_config
-        _dynamo_config.cache_size_limit = 256
-        _dynamo_config.accumulated_cache_size_limit = 1024
-        model = torch.compile(model, dynamic=False)
-        print("compile: torch.compile(model, dynamic=False) enabled "
-              "(dynamo cache_size_limit=256)", flush=True)
+        _dynamo_config.cache_size_limit = 32
+        _dynamo_config.accumulated_cache_size_limit = 256
+        model = torch.compile(model, dynamic=True)
+        print("compile: torch.compile(model, dynamic=True) enabled "
+              "(dynamo cache_size_limit=32)", flush=True)
 
     # grad_checkpoint (opt-in): rematerialize each model forward during backward.
     # The conv loop keeps EVERY chunk's graph alive until the single end-of-conv
