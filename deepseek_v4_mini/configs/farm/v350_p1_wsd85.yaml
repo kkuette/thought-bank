@@ -1,0 +1,173 @@
+# v350_p1_wsd85 — ABLATION WSD (2026-07-17) : copie exacte de v350_curr_p1
+# avec UNE variable : wsd_decay_start 700 (47%) -> 1275 (85%). Litterature WSD
+# (MiniCPM et al.) : decay = 10-20% final ; 40-53% de decay gaspille du temps
+# a haut LR. Verdict : ic/defer @1500 <= baseline (attendu legerement MIEUX) ;
+# ROUGE si instabilite en fin de plateau LR (NaN-recipe caps inchanges).
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  cache_dir: /mnt/tb/data_cache
+  sources:
+  # --- identique à v2e_divmix (cache hit garanti avec le job 107)
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.20
+    stream_cap: 90000
+  - name: stack_c
+    dataset: bigcode/the-stack-smol
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_rust
+    dataset: bigcode/the-stack-smol
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_js
+    dataset: bigcode/the-stack-smol
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_sql
+    dataset: bigcode/the-stack-smol
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_html
+    dataset: bigcode/the-stack-smol
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_css
+    dataset: bigcode/the-stack-smol
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.10
+    stream_cap: 250000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 60000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    stream_cap: 60000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 4
+  n_files: 6000
+  stream_cap: 90000
+  # PAS de var_chunk : phase 1 = chunks fixes (le chemin batché v2b_mix) ;
+  # var_chunk arrive en phase 2 (continued, batch=1), précédent v2b_mix -> v2c.
+training:
+  seed: 0
+  steps: 1500
+  grad_accum: 2
+  amp: true
+  # PAS d'init_from : la phase 1 EST le from-scratch (batché).
+  lr: 0.0003
+  muon_lr: 0.00075
+  muon_ref_mem_dim: 64
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_start: 1275
+  wsd_decay_shape: step
+  log_every: 10
+  eval_every: 200
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 500
+  save_dir: /mnt/tb/checkpoints/v350_p1_wsd85
+  metrics_file: /mnt/tb/runs/farm_v350_p1_wsd85/metrics.jsonl
+  # AUCUN flag de stack : pas d'interleave, pas de no_reset, pas d'addr,
+  # pas de reach, pas de cascade — c'est la définition de la phase 1.
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal:
+  - 300
+  - 450
