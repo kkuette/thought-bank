@@ -25,8 +25,13 @@
 # bound : 8 boucles data single-core à 99%). IMAGE : pytorch/pytorch:2.6.0-
 # cuda12.4-cudnn9-devel MINIMUM — torch 2.5.1 = CheckpointError compile+GC
 # (pytorch #166926, fix dynamic=False insuffisant sur 2.5). LR inchangé
-# 3e-4/7.5e-4 (batch 550k tokens = zone standard 350M, NaN-recipe caps) ;
-# anneal teacher = proportion twin ~15-22% des steps.
+# 3e-4/7.5e-4 (batch 550k tokens = zone standard 350M, NaN-recipe caps).
+# SCHEDULES recalés sur ablations rigs jobs 120/121 (2026-07-17) :
+#   anneal [600,1200] — le kick du read = convs absolues, pas une proportion.
+#     Twin [100,200] (800 convs teacher) : defer suit ic post-β→0, coût +0.04
+#     nat (anneal trop tôt en progression). Ici 153k convs pré-anneal = marge.
+#   wsd_decay_start 16660 (85%) — twin : ic −0.09 nat, mieux 14/14 sources,
+#     defer plat, plateau long stable (convention MiniCPM decay 10-20% finaux).
 tokenizer: HuggingFaceTB/SmolLM2-135M
 
 model:                                     # = v350_bringup / v350_curr (386M)
@@ -194,7 +199,7 @@ training:
   defer_weight: 1.0
   wsd_decay: true
   wsd_floor: 0.0
-  wsd_decay_start: 11800                   # 60% (convention DeepSeek, shape step)
+  wsd_decay_start: 16660                   # 85% (ablation job 121 wsd85 : ic −0.09 nat, 14/14 sources, defer plat)
   wsd_decay_shape: step
   tf32: true                               # +17% tok/s mesuré A100, opt-in validé
   grad_checkpoint: true                    # OBLIGATOIRE a 386M (B6 sans GC = OOM step 1)
@@ -221,6 +226,6 @@ training:
 teacher:
   enabled: true                            # recette from-scratch (kick du read)
   distill_weight: 2.0
-  anneal:                                  # ~15-22% des steps = proportion twin
-  - 2850
-  - 4300
+  anneal:                                  # convs ABSOLUES pas proportion (ablation job 120) :
+  - 600                                    # 600x256 = 153k convs pre-anneal, 190x le [100,200]
+  - 1200                                   # du twin qui suffisait deja (defer suit ic, pas de kick rate)
