@@ -1,0 +1,80 @@
+# v350_compile_smoke — smoke LOCAL (3090) du flag training.compile sur le
+# modèle 386M exact de v350_phase1_10b : mêmes dims, même chemin batché
+# (grad_checkpoint + tf32 + teacher), data réduite à une source pour que la
+# tokenisation tienne en ~2 min. But : compile ne crashe pas (graph breaks
+# tolérés), loss identique à eager au bruit près, gain s/step indicatif.
+#   python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/v350_compile_smoke.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v350_phase1_10b (386M)
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: data_cache_smoke
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 1.0
+    n_files: 300
+    stream_cap: 1200
+  depth_sync: true                         # exerce aussi le chemin rng_m en mono
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 2                            # 3090 24GB : B2+GC tient
+  n_files: 300
+  stream_cap: 1200
+
+training:
+  seed: 0
+  steps: 30
+  grad_accum: 1
+  amp: true
+  lr: 3.0e-04
+  muon_lr: 7.5e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 2000
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  tf32: true
+  grad_checkpoint: true
+  compile: true                            # LE flag sous test (OFF pour baseline)
+  skip_final_eval: true
+  log_every: 5
+  eval_every: 100000
+  eval_convs: 2
+  save_every: 100000
+  save_dir: data_cache_smoke/ckpt_smoke
+  metrics_file: data_cache_smoke/metrics_smoke.jsonl
+
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal:
+  - 16000
+  - 24000

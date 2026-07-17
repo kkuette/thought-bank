@@ -242,8 +242,13 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # drives it. Opt-in; graph breaks (MoE/sinkhorn/einsum) measured in the sweep.
     base = model
     if bool(t.get("compile", False)):
-        model = torch.compile(model)
-        print("compile: torch.compile(model) enabled", flush=True)
+        # dynamic=False : nos shapes sont statiques par construction ([B,512] et
+        # [B,16] ; m ne change que le NOMBRE d'appels) — un graphe statique par
+        # shape. Sans ça, la transition automatique statique->dynamique fait
+        # choisir au recompute du grad_checkpoint un graphe différent du forward
+        # (CheckpointError "different number of tensors", pytorch #166926).
+        model = torch.compile(model, dynamic=False)
+        print("compile: torch.compile(model, dynamic=False) enabled", flush=True)
 
     # grad_checkpoint (opt-in): rematerialize each model forward during backward.
     # The conv loop keeps EVERY chunk's graph alive until the single end-of-conv

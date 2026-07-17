@@ -1,0 +1,87 @@
+# v350_sync_val — validation POD COURT (8x A100, ~30 min, ~$5) de depth_sync
+# (+compile en Run B) sur le modèle 386M exact, AVANT le GO de la run 10B.
+# Data = le mini-cache codeparrot du smoke local (2.2 MB, embarqué dans le tar
+# de code -> data_cache_smoke/, AUCUN download HF) : on mesure du s/step, le
+# contenu est indifférent, seule compte la distribution de profondeur m
+# (codeparrot = fichiers longs, nfull>=8 courant, m ~ U[2,8] comme en prod).
+# Le bloc data DOIT rester identique a v350_compile_smoke.yaml (cles de cache).
+#
+#   Run A : torchrun --nproc_per_node=8 -m deepseek_v4_mini.code_defer_native \
+#             deepseek_v4_mini/configs/v350_sync_val.yaml
+#           -> attendu ~5-6 s/step (mono 4.9 mesure ; straggler legacy = 12.6)
+#   Run B : idem avec training.compile: true (sed) -> gain a mesurer, ignorer
+#           les premiers steps (compilation Dynamo), lire steps 20-60.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v350_phase1_10b (386M)
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: data_cache_smoke              # embarque dans le tar de code
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 1.0
+    n_files: 300
+    stream_cap: 1200
+  depth_sync: true                         # LE flag sous test
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 24                           # = candidat prod (B24+GC)
+  n_files: 300
+  stream_cap: 1200
+
+training:
+  seed: 0
+  steps: 60
+  grad_accum: 1
+  amp: true
+  lr: 3.0e-04
+  muon_lr: 7.5e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 2000
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  tf32: true
+  grad_checkpoint: true                    # = candidat prod
+  compile: false                           # Run B : passer a true
+  skip_final_eval: true
+  log_every: 10
+  eval_every: 100000
+  eval_convs: 2
+  save_every: 100000
+  save_dir: /workspace/checkpoints/v350_sync_val
+  metrics_file: /workspace/runs/v350_sync_val/metrics.jsonl
+
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal:
+  - 16000
+  - 24000
