@@ -143,6 +143,7 @@ training:
   warmup_steps: 100
   weight_decay: 0.01
   grad_clip: 1.0
+  grad_checkpoint: true   # 3070Ti 8GB : B4x512x8 OOM sans GC (meme gradient, juste recompute)
   defer_weight: 1.0
   wsd_decay: true
   wsd_floor: 0.0
