@@ -1,0 +1,100 @@
+# v350_phase1_bringup — MESURE du gain de batching en phase 1 (curriculum
+# 2 phases, décision explorée 2026-07-13 : la masse des tokens en recette
+# v2b_mix BATCHÉE — chunks fixes, sans interleave/no-reset/addr/reach/cascade,
+# le chemin B>1 qui EXISTE déjà — puis phase 2 continued-pretrain full-stack
+# batch=1, précédent v2b_mix -> v2c_varlen -> SFT v2f).
+# Ce fichier = jumeau de v350_bringup.yaml SANS le stack : backbone 386M bf16
+# identique, teacher ON (actif aux steps 1-40, donc dans la mesure — il fait
+# partie de la phase 1 jusqu'à l'anneal 300-450). Sweep B in {1,2,4} à batch
+# effectif 8 constant via vast/sweep_350m.sh (BASECFG=ce fichier).
+# PRÉDICTIONS (2026-07-13, Fable, avant lancement) :
+#   1. B=1 phase 1 NETTEMENT plus rapide que les 42.2 s/step du full-stack
+#      (pas de forwards addr/reach, pas de cascade) — attendu ~25-35 s/step ;
+#   2. VRAM ~4.6 GB états + ~14 GB/conv (l'estimation historique était CE
+#      backbone-là) : B=4 ≈ 60 GB => tient sur A100 80GB, B=2 tient sur 40GB ;
+#   3. gain B=4 vs B=1 dans la fourchette du 97M (×3-3.7) => coût phase 1
+#      ÷3 vs un pretrain full-stack équivalent en tokens.
+# VERDICT = sec/step et pic VRAM par B dans EXPERIMENTS.md ; si ×3+ confirmé,
+# la voie C (curriculum 2 phases) porte l'essentiel de la réduction de coût.
+#
+# python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/v350_phase1_bringup.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v350_bringup / 350m_mix (386M)
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8                         # r*d constant (piège Muon sqrt(cols))
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: /workspace/data_cache
+  sources:                                 # ancres seules (mesure) ; le mix officiel
+  - name: codeparrot                       # attend le verdict divmix (job 107)
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1                            # sweepé {1,2,4} par vast/sweep_350m.sh
+  n_files: 1200
+  stream_cap: 90000
+  # PAS de var_chunk : phase 1 = chunks fixes (le chemin batché v2b_mix) ;
+  # var_chunk arrive en phase 2 (continued, batch=1) comme v2c l'a fait.
+
+training:
+  seed: 0
+  steps: 40
+  grad_accum: 8                            # sweepé en 8/B (batch effectif 8 constant)
+  amp: true
+  lr: 3.0e-04
+  muon_lr: 7.5e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  log_every: 5
+  eval_every: 20
+  eval_convs: 8
+  eval_depths: [2, 4, 6, 8]
+  eval_depth_convs: 8
+  save_every: 1000
+  save_dir: /workspace/checkpoints/v350_phase1_bringup
+  metrics_file: /workspace/runs/v350_phase1_bringup/metrics.jsonl
+  # AUCUN flag de stack : pas d'interleave, pas de no_reset, pas d'addr,
+  # pas de reach, pas de cascade — c'est la définition de la phase 1.
+
+teacher:
+  enabled: true                            # partie de la recette from-scratch (anneal 300-450)
+  distill_weight: 2.0
+  anneal: [300, 450]

@@ -405,6 +405,7 @@ class ThoughtBankLM(nn.Module):
         init_mem: Optional[torch.Tensor] = None,
         compute_logits: bool = True,
         pad_mask: Optional[torch.Tensor] = None,
+        layer_banks: Optional[list] = None,
     ) -> dict:
         B, T  = input_ids.shape
         cfg   = self.cfg
@@ -422,8 +423,10 @@ class ThoughtBankLM(nn.Module):
         # ── Step 3: text blocks read the bank as fast weights ─────────────────
         X = h.unsqueeze(2).expand(-1, -1, n_hc, -1).contiguous()         # [B,T,n_hc,d]
         total_bal = torch.zeros((), device=X.device)
-        for block in self.blocks:
-            X, bal = block(X, bank)
+        # Cascade v3: layer_banks[i] = banque lue par la couche i (None = pas de
+        # read). La banque VIVE (init_mem) reste seule sur le chemin d'écriture.
+        for li, block in enumerate(self.blocks):
+            X, bal = block(X, bank if layer_banks is None else layer_banks[li])
             total_bal = total_bal + bal
         total_bal = total_bal / cfg.n_layers
 

@@ -79,12 +79,12 @@ def main(cfg_path, ckpt_path, depths=(1, 2, 4, 6, 8, 10)):
 
         bank = None
         for j in range(need):
-            x = f[j].unsqueeze(0).to(dev)
+            x = f[j].long().unsqueeze(0).to(dev)        # cache chunks are uint16
             o = model(torch.cat([x, _fill(x, think_id, 1)], 1), init_mem=bank)
             bank = o["mem_bank"]
             d_now = j + 1                               # chunks written so far
             if d_now in depths and j + 1 < len(f):
-                gt = f[j + 1][:defer_len].unsqueeze(0).to(dev)
+                gt = f[j + 1][:defer_len].long().unsqueeze(0).to(dev)
                 dl = gt.size(1)
                 car = _greedy(model, gt, blank_id, bank, dl)
                 res = _greedy(model, gt, blank_id, None, dl)

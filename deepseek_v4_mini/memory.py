@@ -85,8 +85,15 @@ class ThoughtStream(nn.Module):
     def seed_bank(
         self, batch: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
-        """Return a fresh bank of `mem_seed_slots` random-uniform[0,1] vectors."""
+        """Return a fresh bank of `mem_seed_slots` vectors (init per cfg.mem_seed_init)."""
         n = max(1, int(self.cfg.mem_seed_slots))
+        init = getattr(self.cfg, "mem_seed_init", "uniform01")
+        if init == "zeros":
+            return torch.zeros(batch, n, self.cfg.mem_dim, device=device, dtype=dtype)
+        if init == "pm1":
+            return torch.rand(batch, n, self.cfg.mem_dim, device=device, dtype=dtype) * 2.0 - 1.0
+        if init != "uniform01":
+            raise ValueError(f"mem_seed_init inconnu: {init!r}")
         return torch.rand(batch, n, self.cfg.mem_dim, device=device, dtype=dtype)
 
     # ── Write ──────────────────────────────────────────────────────────────────

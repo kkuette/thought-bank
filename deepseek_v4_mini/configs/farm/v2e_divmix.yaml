@@ -1,0 +1,191 @@
+# v2e_divmix — DIVERSITÉ de sources à recette constante (décision user
+# 2026-07-13 : tout en anglais, langages C/Rust/Python/JS/SQL/HTML/CSS,
+# maths tous niveaux + un peu de physique/chimie — code et maths = cibles
+# VÉRIFIABLES pour le RL de phase 2).
+# Question : à budget constant (mêmes steps, mêmes n_files totaux, même
+# recette v2e entrelacée), un mix 14 sources coûte-t-il quelque chose sur
+# les ancres (codeparrot/fineweb, comparables DIRECTEMENT à v2e) et le GAP
+# apparaît-il zero-recipe sur les domaines nouveaux ? L'éval par domaine
+# est automatique (eval_views par source dans le trainer).
+# Design : code = 50 % exactement (la batterie de probes est code-centrique,
+# on ne change qu'une variable) ; codeparrot et fineweb GARDÉS comme ancres
+# de comparabilité ; the-stack-smol = 10k docs/langage, rendement min_chunks=2
+# vérifié 2026-07-13 (c 66 %, rust 71 %, js 51 %, sql 41 %, html 78 %, css 57 %
+# — tous >> besoin) ; finemath+khanacademy = maths tous niveaux, openstax =
+# physique/chimie manuel, arxiv = très longs docs structurés (26k chars p50).
+# PRÉDICTION (2026-07-13, Fable) : le mécanisme est content-agnostic (v2b_mix :
+# GAP positif code ET web) — je prédis GAP par domaine POSITIF sur les 13
+# sources ; ancres : carried codeparrot dégradé <= +0.20 nat vs v2e 6.58 (moins
+# de tokens python au même budget), fineweb ~inchangé ; domaines nouveaux :
+# GAP >= +0.4 partout, maths/code les plus forts (structure locale dense),
+# wikipedia le meilleur en adressage (1 article = 1 sujet).
+# VERDICT : VERT (ancres <= +0.2 ET GAP > 0 partout) => mix officiel du 350M ;
+# ROUGE (une famille négative OU ancres > +0.5) => diversité repoussée au 350M
+# avec courbe de données propre. Entre les deux : ajuster les poids, pas l'idée.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  cache_dir: /mnt/tb/data_cache
+  sources:
+  # --- code 50 % (python = ancre v2e, poids et params identiques sauf budget)
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.20
+    stream_cap: 90000
+  - name: stack_c
+    dataset: bigcode/the-stack-smol
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_rust
+    dataset: bigcode/the-stack-smol
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_js
+    dataset: bigcode/the-stack-smol
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_sql
+    dataset: bigcode/the-stack-smol
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_html
+    dataset: bigcode/the-stack-smol
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_css
+    dataset: bigcode/the-stack-smol
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  # --- prose/maths/sciences 50 % (fineweb = ancre v2e)
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.10
+    stream_cap: 250000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 60000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    stream_cap: 60000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 8
+  amp: true
+  init_from: /mnt/tb/checkpoints/code_defer_native_v2c_varlen/final.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 20
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  log_every: 10
+  eval_every: 100
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  # courbe par profondeur sur les ancres seulement (32 convs/source = 80 % du
+  # coût d'éval) ; les 11 autres domaines gardent le GAP top-level à chaque éval
+  # et auront leur courbe complète via les probes finales.
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 400
+  save_dir: /mnt/tb/checkpoints/farm/v2e_divmix
+  metrics_file: /mnt/tb/runs/farm_v2e_divmix/metrics.jsonl
+  interleave_files:
+  - 2
+  - 4
+teacher:
+  enabled: false

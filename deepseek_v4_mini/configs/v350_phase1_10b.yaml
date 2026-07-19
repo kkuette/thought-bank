@@ -1,0 +1,218 @@
+# v350_phase1_10b — LA run phase 1 du 350M (voie C, curriculum 2 phases) : la
+# masse des tokens en recette v2b_mix BATCHÉE (chunks fixes, AUCUN flag de
+# stack), 10B tokens sur 8x A100 80GB SXM4 (deal Vast id 44773580, ~$1.11/GPU/h,
+# ~24-27h, ~$210-250). Jumeau à l'échelle du twin 97M validé (v350_curr_p1,
+# FINDINGS 2026-07-16 : curriculum warm-restart VERT). Phase 2 = continued
+# full-stack B=1 var_chunk + cascade (config à venir, précédent v350_curr_p2).
+#
+# LANCEMENT (DDP manuel, commit 3675d94) :
+#   torchrun --nproc_per_node=8 -m deepseek_v4_mini.code_defer_native \
+#     deepseek_v4_mini/configs/v350_phase1_10b.yaml
+#   Mono-GPU (debug) : python -m deepseek_v4_mini.code_defer_native <ce yaml>
+#
+# DONNÉES : pool ~2.4B tokens uniques (≈4 époques sur 10B — le tirage est avec
+# remise, les poids du mix restent exacts quelle que soit la taille des pools).
+# PRÉBUILD OBLIGATOIRE avant le pod (scripts/farm/prebuild_data.py sur server0,
+# cache uint16 ≈ 5 GB) puis tar → HF privé → untar dans /workspace/data_cache
+# au boot. the-stack (full, PAS smol) est GATED : token HF requis au prébuild.
+#
+# DIMENSIONNEMENT (2026-07-16, Fable) : W8 x B6 x G1 = 48 convs/step, m moyen
+# ~3.5-4 => ~90-100k tokens/step => 110k steps ≈ 10B. B6 = sûr sans grad_
+# checkpoint (variance de profondeur des convs, OOM-roulette au-delà) ; au
+# bring-up, mesurer B12+grad_checkpoint (grads prouvés exacts) vs B6 et garder
+# le meilleur $/1M. DÉCISIONS DE BRING-UP restantes : LR (3e-4/7.5e-4 = prouvé
+# à batch effectif 8 ; batch 48 admettrait ~sqrt(6)x mais NaN-recipe caps) et
+# anneal teacher (ici ~15-22% des steps, la proportion du twin/v2b_mix).
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v350_bringup / v350_curr (386M)
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8                         # r*d constant (piège Muon sqrt(cols))
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: /workspace/data_cache
+  # Mix divmix officiel (poids IDENTIQUES au job 107 / v350_curr_p1) ; seuls
+  # changent les pools (n_files par source ~ poids x 2.4B / tokens-par-fichier)
+  # et les stack_* qui passent de the-stack-smol (10k fichiers/langue, trop
+  # petit) à bigcode/the-stack full (gated). stream_cap ~ n_files / taux de
+  # rétention (min_chunks=2 jette ~70-80% du web court).
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.20
+    n_files: 90000
+    stream_cap: 150000
+  - name: stack_c
+    dataset: bigcode/the-stack
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    n_files: 60000
+    stream_cap: 200000
+  - name: stack_rust
+    dataset: bigcode/the-stack
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    n_files: 60000
+    stream_cap: 200000
+  - name: stack_js
+    dataset: bigcode/the-stack
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    n_files: 60000
+    stream_cap: 200000
+  - name: stack_sql
+    dataset: bigcode/the-stack
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    n_files: 40000
+    stream_cap: 150000
+  - name: stack_html
+    dataset: bigcode/the-stack
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    n_files: 40000
+    stream_cap: 150000
+  - name: stack_css
+    dataset: bigcode/the-stack
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    n_files: 40000
+    stream_cap: 150000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.10
+    n_files: 140000
+    stream_cap: 1200000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    n_files: 110000
+    stream_cap: 1000000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    n_files: 130000
+    stream_cap: 900000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    n_files: 130000
+    stream_cap: 800000
+  - name: khanacademy                      # subset ~24k docs : pool court, le
+    dataset: HuggingFaceTB/cosmopedia      # poids 0.04 reste exact (remise)
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    n_files: 24000
+    stream_cap: 40000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    n_files: 100000
+    stream_cap: 200000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    n_files: 25000
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 6                            # par GPU ; sûr sans grad_checkpoint
+  n_files: 1000000                         # inutilisé (n_files épinglé par source)
+  stream_cap: 90000
+  # PAS de var_chunk : phase 1 = chunks fixes (le chemin batché v2b_mix) ;
+  # var_chunk arrive en phase 2 (continued, batch=1), précédent v2b_mix -> v2c.
+
+training:
+  seed: 0                                  # shard DDP = seed + 9973*rank (trainer)
+  steps: 110000
+  grad_accum: 1
+  amp: true
+  # PAS d'init_from : la phase 1 EST le from-scratch (batché).
+  lr: 3.0e-04
+  muon_lr: 7.5e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 2000
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_start: 66000                   # 60% (convention DeepSeek, shape step)
+  wsd_decay_shape: step
+  tf32: true                               # +17% tok/s mesuré A100, opt-in validé
+  grad_checkpoint: false                   # bring-up : tester B12+GC vs B6
+  skip_final_eval: true                    # pas d'éval bloquante à step==steps
+  log_every: 20
+  eval_every: 2000
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  eval_depth_sources:                      # courbe par profondeur : ancres seules
+  - codeparrot
+  - fineweb
+  save_every: 2000                         # ~35-45 min entre checkpoints
+  save_dir: /workspace/checkpoints/v350_phase1_10b
+  metrics_file: /workspace/runs/v350_phase1_10b/metrics.jsonl
+  # AUCUN flag de stack : pas d'interleave, pas de no_reset, pas d'addr,
+  # pas de reach, pas de cascade — c'est la définition de la phase 1.
+
+teacher:
+  enabled: true                            # recette from-scratch (kick du read)
+  distill_weight: 2.0
+  anneal:                                  # ~15-22% des steps = proportion twin
+  - 16000
+  - 24000

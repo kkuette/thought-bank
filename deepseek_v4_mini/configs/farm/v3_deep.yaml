@@ -1,0 +1,103 @@
+# v3_deep — PROFONDEUR 2 : le flag de déploiement est-il SÛR ? (point
+# bloquant « v3 full 0-4 » du plan 350M, config décidée 2026-07-13).
+# Diff UNIQUE vs v3_lite : cascade_map [0,0,0,0,1,2] (couche 5 lit le niveau 2).
+# Régime inchangé (~20 chunks/vie => ~8-20 slots descendus) : le niveau 2 ne
+# reçoit sa 1re matrice qu'à la 16e descente => il restera VIDE ou quasi-vide
+# pendant l'entraînement. C'est EXACTEMENT la situation du 350M entraîné
+# depth 4 (les niveaux profonds ne se remplissent jamais en training) : on
+# teste la NEUTRALITÉ (une couche vouée à un niveau vide dégrade-t-elle le
+# carried ?), pas la lecture de contenu profond (ça = probe zero-shot vies
+# longues, après).
+# PRÉDICTION (datée 2026-07-13, Fable) : (1) carried ≈ v3_lite à ±0.15 nat
+# (la couche 5 reçoit bank=None => read sauté, chemin déjà exercé par
+# l'ablation probe_page) ; (2) addr loss < 7.2 ; (3) VRAM ≈ v3_lite (aucun
+# forward de plus, niveau 2 détaché). VERT = neutralité => la profondeur est
+# un pur flag de déploiement, le 350M peut partir depth 4 sans risque.
+# ROUGE (carried décroche) => la map doit réserver les couches profondes aux
+# niveaux GARANTIS remplis au régime d'entraînement.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  cache_dir: /mnt/tb/data_cache
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 8
+  amp: true
+  init_from: /mnt/tb/checkpoints/code_defer_native_v2c_varlen/final.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 20
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  log_every: 10
+  eval_every: 100
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  save_every: 400
+  save_dir: /mnt/tb/checkpoints/farm/v3_deep
+  metrics_file: /mnt/tb/runs/farm_v3_deep/metrics.jsonl
+  interleave_files:
+  - 2
+  - 4
+  addr_prob: 0.5
+  no_reset_files: 4
+  cascade_depth: 2
+  cascade_map: [0, 0, 0, 0, 1, 2]
+  addr_label: true
+teacher:
+  enabled: false

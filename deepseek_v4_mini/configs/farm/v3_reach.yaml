@@ -1,0 +1,105 @@
+# v3_reach — OPTION 2 (verdict page 2026-07-13, FINDINGS d70b595) : le
+# reach-back par la page ne PAS émerge (2 seeds ROUGE) => on le CRÉE par SFT,
+# recette v2f (l'adressage aussi était nul zero-shot avant 800 steps).
+# Départ = v3_lite final (cascade déjà exposée), 800 steps frais ; vies
+# ALLONGÉES no_reset_files 8 (jusqu'à ~64 writes) pour peupler les 3 strates
+# d'âge ; reach_prob 0.35 / reach_max 2 (garde VRAM = leçon addr_max).
+# Cibles : pool porté à travers la vie, cue = ouverture du chunk (label
+# compris), tgt = successeur même-fichier ; éligible dès que âge >= max_mem
+# writes (les slots ont quitté la banque vive — la page est le seul pont).
+# PRÉDICTION (2026-07-13, Fable) : reach s1 (page p0) et s2 (page mergée)
+# baissent nettement sous la borne "banque étrangère" en ~300-500 steps
+# (comme l'addr loss de v2f) ; s3 (DÉTRUIT, contrôle) reste au plancher
+# no-info — RÉSERVE USER enregistrée : s2 (bloc le plus mergé) pourrait ne
+# pas apprendre ; si s1 apprend et s2 non, le merge moyenne est le suspect
+# (=> merge appris ou pages plus petites). VERDICT final = probe page sur le
+# ckpt : early_on vs early_off doit se SÉPARER (émergence créée), et le
+# carried standard ne doit pas payer > 0.1 nat.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 0.0001
+data:
+  cache_dir: /mnt/tb/data_cache
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 8
+  amp: true
+  init_from: /mnt/tb/checkpoints/farm/v3_lite/final.pt
+  lr: 0.0001
+  muon_lr: 0.00024
+  muon_ref_mem_dim: 64
+  warmup_steps: 20
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  log_every: 10
+  eval_every: 100
+  eval_convs: 8
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  save_every: 400
+  save_dir: /mnt/tb/checkpoints/farm/v3_reach
+  metrics_file: /mnt/tb/runs/farm_v3_reach/metrics.jsonl
+  interleave_files:
+  - 2
+  - 4
+  addr_prob: 0.5
+  no_reset_files: 8
+  cascade_depth: 1
+  cascade_map: [0, 0, 0, 0, 1, 1]
+  reach_prob: 0.35
+  reach_max: 2
+  addr_label: true
+teacher:
+  enabled: false

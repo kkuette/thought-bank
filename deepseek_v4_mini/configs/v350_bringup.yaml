@@ -1,0 +1,110 @@
+# v350_bringup — MESURE DE DIMENSIONNEMENT du 350M sur GPU cloud (Vast.ai,
+# décision user 2026-07-13) : PAS un run d'entraînement, un run de MESURE.
+# Objectif : les deux nombres qui manquent pour budgéter le vrai run —
+#   (1) débit steps/h du 350M hors WSL2 (jamais mesuré),
+#   (2) pic VRAM réel du stack complet à 768d (l'estimation ~14 GB/conv date
+#       du backbone nu, sans cascade ni reach ni interleave).
+# Composition = backbone code_defer_native_350m_mix (768d/12L, bf16,
+# mem_read_rank 16->8 = parade Muon sqrt(cols), r*d constant au scale-up)
+# x stack v350_rehearsal (D+G+G2 + cascade depth 2 + reach stratifié).
+# Data = ancres seules (codeparrot+fineweb 50/50) : le débit ne dépend pas de
+# l'identité du mix, et un pod éphémère ne doit pas télécharger 14 sources.
+# cascade_map 12 couches = sémantique rehearsal (2 dernières couches -> 1,2).
+# PRÉDICTIONS (2026-07-13, Fable, avant lancement) :
+#   1. pic VRAM 15-19 GB (4090 24 GB = OK batch 1, mais < 5 GB de marge) ;
+#   2. step time 4-8x le 97M rehearsal (~47 s/step sur 3070Ti) sur 4090 —
+#      soit ~2000 steps en 25-55 h de 4090 ; si > 60 h, l'A100 B=4 devient
+#      obligatoire pour le wall-clock ;
+#   3. pas de NaN en 40 steps (trop court pour un verdict bf16 — c'est le
+#      job de la rehearsal 110/111, pas de celui-ci).
+# VERDICT = les 2 nombres publiés dans EXPERIMENTS.md + choix 4090 vs A100.
+# SMOKE LOCAL 2026-07-13 (3090 WSL2, 2 essais) : config/modèle/data/lr_scale
+# OK, forward+accum ~17 GB, mais CRASH REPRODUCTIBLE au 1er backward
+# (« CUDA driver error: device not ready ») = le précédent « 386M spille
+# WSL2 » du 10/07 avec signature précise. Le backward ne se smoke QUE sur
+# le pod — c'est la raison d'être de ce bring-up.
+#
+# python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/v350_bringup.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = code_defer_native_350m_mix (386M)
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8                         # 16 -> 8 : r*d constant (piège Muon sqrt(cols))
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: /workspace/data_cache         # pod-local (smoke 3090 : sed vers /mnt/tb/data_cache)
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.5
+    stream_cap: 90000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    stream_cap: 250000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk: [128, 512]
+  n_files: 1200                            # assez pour 40 steps, pas plus (download pod)
+  stream_cap: 90000
+
+training:
+  seed: 0
+  steps: 40                                # mesure, pas entraînement
+  grad_accum: 8
+  amp: true
+  lr: 3.0e-04
+  muon_lr: 7.5e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 100                        # jamais atteint — sans importance ici
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  log_every: 5
+  eval_every: 20                           # 1 éval au milieu = mesurer son coût aussi
+  eval_convs: 8
+  eval_depths: [2, 4, 6, 8]
+  eval_depth_convs: 8
+  save_every: 1000                         # pas de checkpoint voulu
+  save_dir: /workspace/checkpoints/v350_bringup
+  metrics_file: /workspace/runs/v350_bringup/metrics.jsonl
+  interleave_files: [2, 4]
+  addr_prob: 0.5
+  addr_label: true
+  no_reset_files: 8
+  cascade_depth: 2
+  cascade_map: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2]
+  reach_prob: 0.35
+  reach_max: 2
+
+teacher:
+  enabled: false

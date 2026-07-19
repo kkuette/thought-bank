@@ -1,0 +1,96 @@
+# dsv6 GRPO-LIVES — vies continues multi-environnements (groundwork phase 2,
+# design user 2026-07-13 : épisodes tirés d'un MIX d'envs, banque JAMAIS reset
+# entre épisodes ; mix = idée G au niveau RL, la condition anti-raccourci de
+# frontière). Ce config = SMOKE/debug local 3090, pas un run de verdict.
+#
+# Hérité du post-mortem v1 (rl_defer_grpo phases 1-4) :
+#   train_scope think_row (le full-model RL érode le backbone à tout lr),
+#   temp Bernoulli 3.0, clip asym DAPO, kl 1e-2, lambda_write 0.03 < GAP
+#   marginal/write (~0.1). init_from = v2h_stack (adressage + carry + stack —
+#   le substrat le plus complet disponible sans les runs 110/111).
+#
+# NOUVEAU vs v1 : n_lives vies parallèles, forks de groupe depuis la banque
+# PORTÉE (piège seed_bank généralisé), commit d'UN rollout uniforme (jamais
+# argmax — pression de rétention déguisée), checkpoint last.pt avec l'état
+# complet des vies (banques + cascade + compteurs + rng mixer/streams) pour
+# une reprise qui CONTINUE les vies au lieu de les reset.
+#
+# python -m deepseek_v4_mini.rl_defer_grpo_lives deepseek_v4_mini/configs/rl_lives_97m.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v2h 97M, verbatim (init_from doit matcher)
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  var_chunk: [128, 512]
+  cache_dir: /mnt/tb/data_cache
+  envs:                                    # le MIX : chaque env = un stream pondéré ;
+  - name: code                             # reward_fn (rubric verifiers) branchable par env
+    dataset: codeparrot/codeparrot-clean   # plus tard sans toucher l'orchestrateur
+    weight: 0.5
+    n_files: 3000
+    stream_cap: 90000
+    lambda_write: 0.03                     # calibrable PAR ENV (échelles de reward)
+  - name: web
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.5
+    n_files: 3000
+    stream_cap: 250000
+    lambda_write: 0.03
+
+rl:
+  seed: 0
+  train_scope: think_row
+  init_from: /mnt/tb/checkpoints/farm/v2h_stack/final.pt
+  n_lives: 4                               # vies parallèles (round-robin par groupe)
+  max_episodes_per_life: 0                 # 0 = illimité ; >0 = mort naturelle + vie neuve
+  cascade_depth: 0                         # 0 = banque vive seule (brancher 2 apres verdict 110)
+  # cascade_map: [0, 0, 0, 0, 1, 2]
+  steps: 300
+  group_size: 8
+  groups_per_step: 4
+  lr: 3.0e-04
+  temp: 3.0
+  lambda_write: 0.03
+  clip_low: 0.2
+  clip_high: 0.28
+  kl_coef: 1.0e-2
+  min_reward_std: 1.0e-4
+  max_resample: 4
+  grad_clip: 1.0
+  log_every: 1
+  eval_every: 25
+  eval_convs: 16
+  save_every: 50
+  save_dir: checkpoints/rl_lives_97m
+  metrics_file: runs/rl_lives_97m/metrics.jsonl
