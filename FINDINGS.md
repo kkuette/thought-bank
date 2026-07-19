@@ -91,6 +91,82 @@ une variable à la fois.
 
 ---
 
+## 2026-07-16 — dsv6: the stack holds on real data (97M) — addressing, eviction, cross-modal, curriculum
+
+**TL;DR.** A batch of ~15 farm jobs at the **97M native scale** (d=384, 6
+layers, MoE, `mem_dim: 512`, `max_mem: 8`) closes out the dsv6 mechanism arc
+on real data. Every claim from the smaller-scale synthetic work survives at
+97M from scratch, and they **compose**: content is addressable, survives
+eviction across very long horizons, transfers across modalities, and is
+robust to segmentation and domain. The V3 cascade is the final design and
+the **reach-back curriculum beats the deep variant on addressing**. A
+two-phase warm-restart curriculum (`v350_curr_p1` step 1500 → `_p2`) trains
+cleanly — the recipe intended to carry to the 350M write-up.
+
+> **Scale note.** The `v350_*` configs are the *curriculum recipe* under
+> development; the model they train is the **97M native** proxy
+> (96,955,817 params), not 350M — that stays inside the 8 GB rig frontier.
+> "v350" names the target of the write-up, not the size of these runs.
+
+### The mechanism claims, at 97M on fineweb / mixed real text
+
+- **Addressing works.** Label-cued value delivery: `d valeur adressée N=2`
+  = **−0.41 to −0.54 nats**, |t| 12–18 (110/111/116). The bank carries the
+  addressed content, co-adapted from init.
+- **Eviction leaves a residual trace.** Evicted threads still beat a reset
+  bank (−0.26 to −0.42, |t| 4–7) — content is not cleanly gone at FIFO
+  eviction.
+- **Content survives very long horizons, with clean specificity** (capdeep,
+  114): `own − reset` stays **−0.60** (|t| 8) even for threads evicted
+  **2049+ steps ago**; `own − foreign ≈ 0` (it is the *own* content, not a
+  generic prior); `own − ablated` significant (the read is causal).
+- **No hallucinated address.** Unwritten labels sit at reset (no fabricated
+  content).
+- **Interference is cheap.** Bank-full (N=8) cost +0.07 to +0.14, |t| 1–2.
+- Deferred-continuation GAP @2000 positive on every real domain (wiki +0.62,
+  finemath +0.77, khanacademy +0.70, openstax +0.87, **arxiv +1.32**).
+
+### V3 cascade is the final design; reach-back wins (100 v3_deep / 108 v3_reach)
+
+- **Recency trap is real but cue-defeasible.** JUNK-LAST blank-query cost
+  +1.4/+1.46 (|t| 15–17) — the default-recency behaviour — collapses to ≈0
+  once the query is cont- or id-cued. Selection survives when addressed.
+- **G2 label-cue addressing:** BANK VALUE **−0.36 (deep) → −0.48 (reach)**,
+  |t| 7 → 13. The stratified **reach-back curriculum beats the deep variant**
+  — the direction flagged after "PAGE 2× red" pays off.
+
+### Cross-modal transfer is positive both ways (106 v2e_delta)
+
+docstring↔code, held-out mix: **doc→body +0.264** (|t| 3.3), **body→doc
++0.296** (|t| 4.8), specificity +0.22. Both directions clear zero and the
+specificity control; doc→body sits just under the +0.3 "green" bar
+(near-green, accepted at 1500 steps). This is the cross-modal-CoT vision
+realised at v2e: modalities write abstractions into one `mem_dim` and the
+read reasons over the fusion.
+
+### Domain robustness (107 v2e_divmix)
+
+Segmentation invariance holds (reseg cost ≈ 0) while swap specificity is
+strong (openstax +1.06, arxiv +0.29, |t| 3–4): the gist is robust to how the
+document is chunked but specific to *which* document.
+
+### Reproduce
+
+Farm configs live under `deepseek_v4_mini/configs/farm/` (branch
+`claude/status-check-2fa903`). Train: `python -m
+deepseek_v4_mini.code_defer_native
+deepseek_v4_mini/configs/farm/<cfg>.yaml [--resume]`. Probes: `PYTHONPATH=.
+python deepseek_v4_mini/analysis/code_defer_bank_probes.py
+deepseek_v4_mini/configs/farm/<cfg>.yaml --probes <set> --n-files 48`, with
+probe sets `capacity_curve` / `capacity_deep` (110/114), `page,capacity_curve`
+(V3), `swap,distractor,cued,xmodal` (delta). Curriculum: `v350_curr_p1` then
+`v350_curr_p2 --resume` (warm-restart from p1 `final.pt` @ step 1500). One
+job (110) was preempted mid-run at step 2000 with healthy GAPs and re-ran to
+completion; not a crash.
+
+---
+
+
 ## 2026-07-14 (3) — Saturation scan (capacity_deep, jobs 113/114/115) : le registre ne meurt JAMAIS (jusqu'à 64× la capacité), la page contribue partout en milli-nats (↑ avec la profondeur, ↑ sources structurées) mais ne devient jamais adressée
 
 **Setup.** Probe `capacity_deep` sur 3 checkpoints : v3_reach (d1, job 113, 2 sources,
