@@ -97,7 +97,7 @@ notes instead of a re-read of the whole history — is the object of study.
 - **Paper (mechanism, at 3M):** *A Trained Fast-Weight Memory: Continual Rule
   Binding at Inference Without Backward* —
   [DOI 10.5281/zenodo.21225721](https://doi.org/10.5281/zenodo.21225721)
-- **Usage repo (start here):** https://github.com/kkuette/fractale —
+- **Usage repo (start here):** https://github.com/fractale-lm/fractale —
   loading, generation and bank-management scripts for this model. Because the
   memory lives *outside* the context window, inference differs from a classic
   LM: you carry a bank state across calls instead of a growing prompt.
@@ -215,7 +215,7 @@ depth flatness) improved monotonically through the rest of training.
 (fp32, self-describing `{"cfg", "model"}`) of a single training run of
 [`v350_phase1_10b.yaml`](https://github.com/kkuette/thought-bank/blob/main/deepseek_v4_mini/configs/v350_phase1_10b.yaml),
 trained with `deepseek_v4_mini.code_defer_native` at thought-bank commit
-⟨commit⟩. The [usage repo](https://github.com/kkuette/fractale) vendors its
+⟨commit⟩. The [usage repo](https://github.com/fractale-lm/fractale) vendors its
 inference code from that same commit.
 
 **Curriculum provenance.** Phase 1 is the *batched* recipe (fixed chunks, no
@@ -275,14 +275,14 @@ Two caveats we state up front rather than in fine print:
 
 Inference with this model is **not** the classic tokenize-and-generate loop:
 the model reads documents chunk by chunk and carries a bank state between
-forward passes. The [usage repo](https://github.com/kkuette/fractale) owns
+forward passes. The [usage repo](https://github.com/fractale-lm/fractale) owns
 that loop through one object, `BankSession`:
 
 ```python
-# git clone https://github.com/kkuette/fractale && cd fractale && pip install -e .
+# git clone https://github.com/fractale-lm/fractale && cd fractale && pip install -e .
 from fractale import BankSession
 
-sess = BankSession.from_pretrained("kkuette/Fractale-350M-base")
+sess = BankSession.from_pretrained("fractale-lm/Fractale-350M-base")
 
 # Read anything, any length — the bank accumulates, no growing prompt.
 sess.read(open("mystery_novel_ch1-9.txt").read())
