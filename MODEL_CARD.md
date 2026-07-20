@@ -222,7 +222,10 @@ run of `v350_phase1_10b.yaml`, trained with
 [`073bb67`](https://github.com/kkuette/thought-bank/commit/073bb67) (branch
 `claude/status-check-2fa903` — config and stability patches exactly as run).
 The [usage repo](https://github.com/fractale-lm/fractale) vendors its
-inference code from that same commit.
+inference code from that same commit, and ships a **step-by-step
+reproduction of this run** (environment, data prebuild, launch command,
+what to expect):
+[`repro/phase1/`](https://github.com/fractale-lm/fractale/tree/main/repro/phase1).
 
 **Curriculum provenance.** Phase 1 is the *batched* recipe (fixed chunks, no
 addressing flags), the scaled twin of the 97M `v350_curr_p1` cell validated in
