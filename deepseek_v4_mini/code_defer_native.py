@@ -573,7 +573,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
             ema_ic, ema_d = ck.get("ema_ic"), ck.get("ema_d")
             if ck.get("rng_torch") is not None: torch.set_rng_state(ck["rng_torch"])
             if ck.get("rng_cuda") is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(ck["rng_cuda"])
+                # migration de world size (ex. 8->6 GPUs) : le ck porte un état
+                # RNG par device du node d'origine — ne restaurer que les nôtres
+                torch.cuda.set_rng_state_all(ck["rng_cuda"][:torch.cuda.device_count()])
             # DDP: the checkpoint holds rank0's stream RNG — restoring it on every
             # rank would make them all sample the SAME convs. Rank0 resumes its
             # exact stream; other ranks re-seed on (rank, start_step) instead.
@@ -741,10 +743,12 @@ def main(cfg_path: str, resume: bool = False) -> None:
             (total / grad_accum).backward()          # mean over the G accumulated convs
             if no_reset_files > 1:
                 # graph freed per file; the carried bank is data, not gradient path
-                bank_carry = bank.detach() if bank is not None else None
+                # nan_to_num : un NaN d'un forward malade écrit dans la banque
+                # persistante contaminerait tous les steps suivants
+                bank_carry = torch.nan_to_num(bank.detach()) if bank is not None else None
                 casc_carry, nev_carry = casc, n_evict
                 if delta is not None:
-                    dstate_carry = dstate.detach()
+                    dstate_carry = torch.nan_to_num(dstate.detach())
                 if reach_prob > 0:
                     rpool_carry, wt_carry = reach_pool, w_total
         _prof = os.environ.get("TB_DDP_PROF")
@@ -773,16 +777,28 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     bucket.append(g_); nbytes += g_.numel() * g_.element_size()
         if _prof:
             torch.cuda.synchronize(); _t_ar = time.time()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), float(t.get("grad_clip", 1.0)))
-        opt.step()
+        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(t.get("grad_clip", 1.0)))
+        # nan-guard : après l'all-reduce les grads sont identiques sur tous les
+        # ranks, donc ce check prend la même branche partout (pas de désync).
+        # Un step sauté vaut mieux qu'un run entier à NaN (incident step 2520).
+        if torch.isfinite(gnorm):
+            opt.step()
+        elif ddp_rank == 0:
+            # diagnostic : quels modules portent les grads non finis (incident 2520)
+            bad = [n for n, p in model.named_parameters()
+                   if p.grad is not None and not torch.isfinite(p.grad).all()]
+            print(f"[nan-guard] step {step}: gnorm={float(gnorm):.3e} — update sauté ; "
+                  f"{len(bad)} tenseurs: {bad[:6]}", flush=True)
         if _prof:
             torch.cuda.synchronize()
             print(f"[prof step {step}] fwd+bwd {_t_bwd - _t_step0:.2f}s  "
                   f"allreduce {_t_ar - _t_bwd:.2f}s  clip+opt {time.time() - _t_ar:.2f}s",
                   flush=True)
         ic_v /= max(ic_cnt, 1); d_v /= max(d_cnt, 1)
-        ema_ic = ic_v if ema_ic is None else 0.95 * ema_ic + 0.05 * ic_v
-        ema_d  = d_v  if ema_d  is None else 0.95 * ema_d  + 0.05 * d_v
+        if ic_v == ic_v:   # un batch NaN isolé ne doit pas polluer l'EMA à vie
+            ema_ic = ic_v if ema_ic is None else 0.95 * ema_ic + 0.05 * ic_v
+        if d_v == d_v:
+            ema_d  = d_v  if ema_d  is None else 0.95 * ema_d  + 0.05 * d_v
         if a_cnt:
             a_v /= a_cnt
             ema_a = a_v if ema_a is None else 0.95 * ema_a + 0.05 * a_v

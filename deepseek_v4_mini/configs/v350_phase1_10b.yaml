@@ -190,8 +190,8 @@ training:
   grad_accum: 1
   amp: true
   # PAS d'init_from : la phase 1 EST le from-scratch (batché).
-  lr: 3.0e-04
-  muon_lr: 7.5e-04
+  lr: 1.5e-04                              # 3.0e-04 ÷2 : skips residuels en accélération à 2.37e-4 effectif
+  muon_lr: 3.75e-04                        # 7.5e-04 ÷2 ⇒ effectif post-decay_start 1.19e-4 (user 2026-07-18)
   muon_ref_mem_dim: 64
   warmup_steps: 400
   weight_decay: 0.01
@@ -199,14 +199,15 @@ training:
   defer_weight: 1.0
   wsd_decay: true
   wsd_floor: 0.0
-  wsd_decay_start: 16660                   # 85% (ablation job 121 wsd85 : ic −0.09 nat, 14/14 sources, defer plat)
+  wsd_decay_start: 2000                    # avancé de 16660 (85%) → 2000 : grads inf récurrents dès step 2519
+                                           # à lr plein (7.5e-4) ; shape step ⇒ ×0.316 immédiat = 2.37e-4 (décision user 2026-07-18)
   wsd_decay_shape: step
   tf32: true                               # +17% tok/s mesuré A100, opt-in validé
   grad_checkpoint: true                    # OBLIGATOIRE a 386M (B6 sans GC = OOM step 1)
   compile: true                            # torch>=2.6 requis (2.5.1 = CheckpointError) ; +5% vitesse, -29% mem
   skip_final_eval: true                    # pas d'éval bloquante à step==steps
   log_every: 20
-  eval_every: 500
+  eval_every: 1000000                      # évals désactivées pendant le train (décision 2026-07-18, migration RunPod) ; skip_final_eval déjà true
   eval_convs: 8
   eval_depths:
   - 2
