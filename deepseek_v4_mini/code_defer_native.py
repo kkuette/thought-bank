@@ -99,6 +99,7 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24):
     grade_live - grade_ablated per kind = the working-memory efficacy figure
     (memory dsv6-grpo-m2-integre). Bank-only (no cascade), like evaluate()."""
     from .math_school_data import A_OPEN, grade_conv
+    grade = getattr(stream, "grade_conv", grade_conv)   # persona ships its own
     model.eval()
     a_open = torch.tensor(tok(A_OPEN, add_special_tokens=False)["input_ids"],
                           dtype=torch.long, device=device).unsqueeze(0)
@@ -128,8 +129,8 @@ def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24):
                 nll_s += float((ce * m).sum() / m.sum()); nll_n += 1
         a = agg.setdefault(conv["kind"], [0.0, 0, 0.0, 0.0, 0])
         a[0] += nll_s; a[1] += nll_n
-        a[2] += grade_conv(conv, live_txt)
-        a[3] += grade_conv(conv, abl_txt)
+        a[2] += grade(conv, live_txt)
+        a[3] += grade(conv, abl_txt)
         a[4] += 1
     model.train()
     return {k: {"nll": v[0] / max(v[1], 1), "grade": v[2] / v[4],
@@ -439,13 +440,18 @@ def main(cfg_path: str, resume: bool = False) -> None:
     chat_eval_convs = int(chat_cfg.get("eval_convs", 24))
     chat_max_new = int(chat_cfg.get("max_new", 24))
     if chat_cfg:
-        assert chat_cfg.get("stream", "math_school") == "math_school", \
-            "chat.stream: only math_school wired for now"
-        from .math_school_data import MathSchoolStream
+        sname = chat_cfg.get("stream", "math_school")
+        if sname == "math_school":
+            from .math_school_data import MathSchoolStream as _ChatStream
+        elif sname == "persona":
+            from .persona_chat_data import PersonaChatStream as _ChatStream
+        else:
+            raise ValueError(f"chat.stream: unknown stream {sname!r} "
+                             "(math_school | persona)")
         gen_kw = dict(chat_cfg.get("gen", {}) or {})
-        chat_stream = MathSchoolStream(tok, seed=train_seed + 1, **gen_kw)
-        chat_eval = MathSchoolStream(tok, seed=1234, **gen_kw)
-        print(f"chat mode ON: math_school p_chat {p_chat} weight {chat_w} "
+        chat_stream = _ChatStream(tok, seed=train_seed + 1, **gen_kw)
+        chat_eval = _ChatStream(tok, seed=1234, **gen_kw)
+        print(f"chat mode ON: {sname} p_chat {p_chat} weight {chat_w} "
               f"eval_convs {chat_eval_convs} (masked-CE SFT convs in the "
               f"life carry)", flush=True)
 
@@ -494,6 +500,13 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # the first STARTS with the previous file's gists in its slots (dirty-bank regime).
     # Boundary defer stays masked for free: batch=1 derives defer targets within-file only.
     no_reset_files = int(t.get("no_reset_files", 1))
+    # no_reset_files == 0 : UNE vie infinie — la banque n'est JAMAIS reset, ni entre
+    # convs ni entre steps d'optimiseur ; elle évolue en continu sur tout le run
+    # (décision user 2026-07-20, run 5c). Non sauvegardée dans les ckpts : un resume
+    # repart banque vide.
+    nrf_never = (no_reset_files == 0)
+    if nrf_never:
+        assert int(d["batch_size"]) == 1, "no_reset_files=0 requires batch_size 1 (ragged mode)"
     if no_reset_files > 1:
         assert int(d["batch_size"]) == 1, "no_reset_files requires batch_size 1 (ragged mode)"
         assert grad_accum % no_reset_files == 0, "grad_accum must be a multiple of no_reset_files"
@@ -643,6 +656,34 @@ def main(cfg_path: str, resume: bool = False) -> None:
                                         if chat_stream is not None else None)}, tmp)
         os.replace(tmp, path)                        # atomic: no torn file on preemption
 
+    def _save_bank(step, path):
+        """La banque COMPLÈTE (vive + cascade) : artefact autonome — rechargeable
+        au resume, échangeable entre runs (bank_init), inspectable hors trainer."""
+        if bank_carry is None:
+            return
+        tmp = path + ".tmp"
+        torch.save({"step": step, "bank": bank_carry.detach().cpu(),
+                    "casc": (casc_carry.state_dict()
+                             if casc_carry is not None else None),
+                    "n_evict": nev_carry, "w_total": wt_carry}, tmp)
+        os.replace(tmp, path)
+
+    def _load_bank(path, tag):
+        _bk = torch.load(path, map_location="cpu", weights_only=False)
+        casc_ld = (CascadeMemory.from_state(_bk["casc"], device=device)
+                   if _bk.get("casc") is not None else None)
+        print(f"{tag}: banque chargée depuis {path} (step d'origine "
+              f"{_bk.get('step')}, cascade {'oui' if casc_ld else 'non'})",
+              flush=True)
+        return (_bk["bank"].to(device), casc_ld,
+                int(_bk.get("n_evict", 0)), int(_bk.get("w_total", 0)))
+
+    _bank_loaded, _casc_loaded, _nev_loaded, _wt_loaded = None, None, 0, 0
+    _bi = t.get("bank_init")                 # chemin explicite : seed la vie avec
+    if _bi:                                  # une banque venue d'un autre run
+        _bank_loaded, _casc_loaded, _nev_loaded, _wt_loaded = \
+            _load_bank(_bi, "bank_init")
+
     start_step = 0; ema_ic = ema_d = ema_a = ema_chat = None
     ema_reach = [None, None, None]              # EMA de perte par strate d'âge
     if resume:
@@ -682,12 +723,22 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     chat_stream.rng.setstate(ck["rng_chat_stream"])
                 else:
                     chat_stream.rng.seed(train_seed + 1 + start_step)
+            _bp = os.path.join(save_dir, f"bank_step_{start_step}.pt")
+            if os.path.exists(_bp):
+                _bank_loaded, _casc_loaded, _nev_loaded, _wt_loaded = \
+                    _load_bank(_bp, "resume")
             print(f"resume: restored {cks[start_step]} @step {start_step} "
                   f"(opt {'yes' if ck.get('opt') else 'NO — old-format ck'})", flush=True)
         else:
             print("resume: no checkpoint found, starting fresh.", flush=True)
 
     model.train(); t0 = time.time()
+    # carries hoisted out of the step loop: with nrf_never they persist across
+    # optimizer steps (une vie = le run entier) ; sinon ils sont reset par step.
+    bank_carry = _bank_loaded
+    casc_carry, nev_carry = _casc_loaded, _nev_loaded
+    dstate_carry = None
+    rpool_carry, wt_carry = [], _wt_loaded
     for step in range(start_step + 1, steps + 1):
         _t_step0 = time.time()
         lr_now = set_lr(step)
@@ -698,10 +749,11 @@ def main(cfg_path: str, resume: bool = False) -> None:
         # gradient accumulation: G independent conversations (batch=1 each, bank reset
         # between them) summed into one optimizer step => effective batch = G files,
         # variance reduced without padding/GPU-batching the ragged chunks.
-        bank_carry = None
-        casc_carry, nev_carry = None, 0
-        dstate_carry = None
-        rpool_carry, wt_carry = [], 0
+        if not nrf_never:
+            bank_carry = None
+            casc_carry, nev_carry = None, 0
+            dstate_carry = None
+            rpool_carry, wt_carry = [], 0
         for _g in range(grad_accum):
             is_chat = (chat_stream is not None
                        and train_stream.rng.random() < p_chat)
@@ -714,14 +766,17 @@ def main(cfg_path: str, resume: bool = False) -> None:
             # B2 : la vie se termine à la fin de la DERNIÈRE conv du groupe
             # no_reset ((_g+1) % nrf == 0 ; nrf=1 => chaque conv est une vie).
             if (ra_ids is not None and not is_chat
-                    and (_g + 1) % no_reset_files == 0
+                    and (_g + 1) % max(no_reset_files, 1) == 0
                     and train_stream.rng.random() < ra_prob):
                 for s_ in segs[-ra_chunks:]:
                     s_["input_ids"] = torch.cat(
                         [ra_ids.unsqueeze(0), s_["input_ids"]], dim=1)
-            if no_reset_files > 1 and _g % no_reset_files != 0:
+            if (nrf_never and bank_carry is not None) or (
+                    no_reset_files > 1 and _g % no_reset_files != 0):
                 bank = bank_carry                     # dirty start: previous file's gists
                 casc, n_evict = casc_carry, nev_carry
+                if cascade_depth and casc is None:    # banque chargée sans cascade
+                    casc = CascadeMemory(cascade_depth, cfg.max_mem)
                 dstate = dstate_carry
                 reach_pool, w_total = rpool_carry, wt_carry
             else:
@@ -850,7 +905,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         if len(reach_pool) > 64:      # borne mémoire (tenseurs CPU 16+16 tok)
                             reach_pool.pop(0)
             (total / grad_accum).backward()          # mean over the G accumulated convs
-            if no_reset_files > 1:
+            if no_reset_files > 1 or nrf_never:
                 # graph freed per file; the carried bank is data, not gradient path
                 bank_carry = bank.detach() if bank is not None else None
                 casc_carry, nev_carry = casc, n_evict
@@ -997,6 +1052,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
         if (step % save_every == 0 or step == steps) and ddp_rank == 0:
             _save_ck(step, os.path.join(save_dir,
                      "final.pt" if step == steps else f"step_{step}.pt"))
+            if nrf_never:
+                _save_bank(step, os.path.join(save_dir,
+                           "bank_final.pt" if step == steps
+                           else f"bank_step_{step}.pt"))
     if ddp_world > 1:
         torch.distributed.barrier()
         torch.distributed.destroy_process_group()

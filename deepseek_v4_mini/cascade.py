@@ -118,6 +118,26 @@ class CascadeMemory:
             out.append(cache[lvl])
         return out
 
+    # ── (dé)sérialisation : la banque complète comme artefact fichier ────────
+
+    def state_dict(self) -> dict:
+        return {"depth": self.depth, "M": self.M,
+                "n_pushed": self.n_pushed, "n_destroyed": self.n_destroyed,
+                "lv": {k: {"p0": [u.detach().cpu() for u in L["p0"]],
+                           "p1": (None if L["p1"] is None
+                                  else L["p1"].detach().cpu())}
+                       for k, L in self.lv.items()}}
+
+    @classmethod
+    def from_state(cls, sd: dict, device=None) -> "CascadeMemory":
+        c = cls(sd["depth"], sd["M"])
+        c.n_pushed, c.n_destroyed = sd["n_pushed"], sd["n_destroyed"]
+        mv = (lambda t: t.to(device)) if device is not None else (lambda t: t)
+        c.lv = {k: {"p0": [mv(u) for u in L["p0"]],
+                    "p1": None if L["p1"] is None else mv(L["p1"])}
+                for k, L in sd["lv"].items()}
+        return c
+
     # ── stats (probes / logs) ────────────────────────────────────────────────
 
     def stats(self) -> Dict[str, int]:

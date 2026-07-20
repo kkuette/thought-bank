@@ -1,0 +1,227 @@
+# sft_persona_350m — SFT démo « souvenir x contextes avant » sur le 350M release.
+# Décision user 2026-07-20 : la démo publique la plus lisible = un chat où un
+# fait personnel énoncé tôt est rappelé N tours plus tard, bras banque ablatée
+# en contrôle (persona_chat_data.py, kinds smalltalk/recall, supersession
+# p_update, strate beyond-FIFO p_beyond). Recette = SFT-chaud v2f (800 steps,
+# muon_lr 2.4e-4, warmup 20, pas de decay), base = final.pt du run phase 1
+# (step 19600, ckpt release). Local 3090, mono-GPU.
+#
+# CHOIX ASSUMÉ : pas de flag de stack (interleave/addr/reach/cascade) — la
+# phase 1 n'en a vu aucun. EXCEPTION run 5b (décision user 2026-07-20) :
+# no_reset_files 4 = la banque vit sur 4 conversations consécutives, le
+# rappel doit survivre aux frontières de conv (démo multi-sessions).
+# Le vrai continued full-stack reste la phase 2, config séparée.
+#
+# DÉCISION USER 2026-07-20 (2e lancement) : SFT PUR conversations — p_chat 1.0,
+# pas de replay code/web ; la protection du modèle = le LR bas (muon 1e-4,
+# adam 4e-5), pas le mix. Les ancres GAP restent aux évals : c'est le compteur
+# de destruction (si GAP code chute, remonter le replay ou baisser encore).
+# Le bloc data reste requis (machinerie stream + éval held) mais aucun step
+# de gradient ne passe sur les data classiques.
+#
+# LANCEMENT :
+#   python -m deepseek_v4_mini.code_defer_native \
+#     deepseek_v4_mini/configs/sft_persona_350m.yaml
+#
+# PRÉDICTIONS (2026-07-20, Fable, avant lancement) :
+#   1. chat loss démarre haut (le modèle n'a jamais vu ChatML) et passe sous
+#      ~2.0 avant 800 steps (réponses templatées courtes, plus faciles que
+#      l'école de maths) ;
+#   2. grade recall live > 0 dès ~200-400 steps sur les âges <= 8 writes
+#      (in-FIFO) ; le Δ (live - ablated) est LE verdict — Δ ~ 0 = le modèle
+#      devine du format seul = ROUGE, pas de démo ;
+#   3. strate beyond (âge > 8 writes, fait évincé de la FIFO) : grade
+#      au-dessus du hasard = bonus (survie post-éviction, précédent capdeep),
+#      pas requis pour la démo — la reporter séparément ;
+#   4. GAP code/web ne se dégrade pas aux ancres (prix du SFT ~ nul, comme
+#      v2f/sft_school : le carried est le juge).
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v350_phase1_10b (386M, release)
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: /mnt/tb/data_cache
+  # --- identique au bloc sft_school (cache hit garanti sur le cache local)
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.20
+    stream_cap: 90000
+  - name: stack_c
+    dataset: bigcode/the-stack-smol
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_rust
+    dataset: bigcode/the-stack-smol
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_js
+    dataset: bigcode/the-stack-smol
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_sql
+    dataset: bigcode/the-stack-smol
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_html
+    dataset: bigcode/the-stack-smol
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_css
+    dataset: bigcode/the-stack-smol
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.10
+    stream_cap: 250000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 60000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    stream_cap: 60000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 4                            # 8->4 (décision user 2026-07-20, run 4) :
+                                           # ~2x plus rapide, batch effectif 4 convs
+                                           # — tolérable au LR bas du SFT
+  amp: true
+  init_from: /home/kkuette/v350_phase1_ckpts/final.pt
+  lr: 4.0e-05
+  muon_lr: 1.0e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 0                          # décision user run 4 : LR plein dès step 1
+  no_reset_files: 0                        # décision user run 5c : 0 = JAMAIS de reset —
+                                           # une seule vie de banque pour tout le run,
+                                           # portée entre convs ET entre steps d'optim ;
+                                           # la banque (FIFO 8 slots) évolue en permanence
+  cascade_depth: 4                         # décision user run 5e : banque COMPLÈTE V3 —
+                                           # 4 niveaux au-dessus de la banque vive, les
+                                           # slots évincés débordent au lieu de mourir ;
+                                           # map par défaut = couches 8-11 lisent lv 1-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: false
+  grad_checkpoint: true                    # obligatoire à 386M (pod : B6 sans GC
+                                           # = OOM step 1) ; grads exacts. Piste
+                                           # NaN user surveillée : nan-guard actif,
+                                           # muon_lr 2.4e-4 loin du régime incident.
+  log_every: 1
+  eval_every: 200
+  eval_convs: 8
+  eval_sources:
+  - codeparrot
+  - fineweb
+  eval_depths: [2, 8]
+  eval_depth_convs: 8
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 50                           # 400->50 (décision user 2026-07-20 : coupure de courant, sauvegardes rapprochées)
+  save_dir: /mnt/tb/checkpoints/v350_sft_persona
+  metrics_file: /mnt/tb/runs/v350_sft_persona/metrics.jsonl
+
+chat:
+  stream: persona
+  p_chat: 1.0
+  weight: 1.0
+  eval_convs: 12
+  max_new: 24
+  # Filler hybride (feu vert user 2026-07-20) : 80% des échanges filler =
+  # vraies paires smol-smoltalk (tours <= 96 tokens, cache disque), registre
+  # naturel supervisé ; faits/requêtes restent synthétiques et notables.
+  gen:
+    real_filler: HuggingFaceTB/smol-smoltalk
+    real_cache_dir: /mnt/tb/data_cache
+
+teacher:
+  enabled: false
