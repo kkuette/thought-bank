@@ -157,7 +157,7 @@ a teacher-forced bootstrap on the write (distillation annealed to zero early
 in training) to break the ignore-the-bank fixed point — without it the model
 converges to never reading the bank (paper §5).
 
-**Data.** ~10B tokens (sampling with replacement from a ~2.4B-token unique
+**Data.** ≈10B tokens (sampling with replacement from a ≈2.4B-token unique
 pool), a 13-source mix of code and English web/reference text:
 
 | Source | Weight |
@@ -194,21 +194,21 @@ output may occasionally reproduce fragments of training data subject to
 their original terms.
 
 **Recipe.** 8× A100-80GB (DDP), batch 32/GPU, 19,600 steps ≈ 550k
-tokens/step (~10.8B tokens seen); AdamW (1.5e-4) + Muon (3.75e-4,
+tokens/step (≈10.8B tokens seen); AdamW (1.5e-4) + Muon (3.75e-4,
 `√cols`-normalized with `muon_ref_mem_dim` correction); WSD schedule (step
 decay from step 2000); grad clip 1.0; a NaN guard skips the update when the
 all-reduced grad norm is non-finite, and the persistent bank state is
 sanitized between files (a NaN written into a carried bank otherwise
-contaminates every later step). Total compute: ~30 h of pod time ≈ $320,
+contaminates every later step). Total compute: about 30 h of pod time ≈ $320,
 including the incident replay below — the entire run was self-funded.
 
-**Training incident, disclosed.** At ~step 2500 the run hit a forward-pass
+**Training incident, disclosed.** Around step 2500 the run hit a forward-pass
 NaN that contaminated the carried bank; it was caught, the run resumed from
 the last verified-clean checkpoint (step 2500), and the learning-rate
 schedule was brought forward (decay from step 2000 instead of 60%) — the
 skip-rate telemetry showed full-LR updates were pushing the weights into the
 overflow region. The NaN guard and bank sanitization above were added as a
-result. The guard kept firing for the rest of the run (~16% of updates
+result. The guard kept firing for the rest of the run (≈16% of updates
 skipped overall, escalating late in training despite LR decay — the drift is
 in the weights, not the LR; root-causing it is on the phase-2 list), yet all
 health metrics (bank advantage, in-context ppl, depth flatness) improved
@@ -257,7 +257,7 @@ model has never seen. It is an exact content control — same weights, same
 target, the only difference is whether the written gists are present.
 
 Final checkpoint (step 19,600), held-out documents, 3090 eval harness
-(re-run noise ~±0.3 nats):
+(re-run noise ±0.3 nats):
 
 | Metric (held-out) | Value |
 |---|---|
@@ -279,7 +279,7 @@ Two caveats we state up front rather than in fine print:
 - The GAP compares the model **to itself without its memory**, not to an
   external baseline at matched compute; baseline comparisons live in the
   [research repo](https://github.com/kkuette/thought-bank).
-- Closed-book token accuracy on the deferred turn is low (~0.06–0.19).
+- Closed-book token accuracy on the deferred turn is low (0.06–0.19).
   Remember what this checkpoint is: a **pretrained base model**, not a
   fine-tuned one. The bank reliably carries *gist* — domain, register,
   structure, addressed facts (a +6 to +8 nat distribution shift) — not
@@ -364,4 +364,3 @@ public repo.
 }
 ```
 
-⟨Add the 350M write-up citation here when it exists.⟩
