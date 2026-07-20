@@ -23,10 +23,9 @@ datasets:
 - armanc/scientific_papers
 ---
 
-<!-- This file is the model card for the public HF release of the 350M phase-1
-     model. ⟨angle-bracket⟩ fields are placeholders to fill at release time
-     with the final run numbers. Source of truth for claims: FINDINGS.md and
-     the paper (DOI 10.5281/zenodo.21225721). -->
+<!-- Model card for Fractale-350M-base (phase-1 final, step 19600).
+     Source of truth for claims: FINDINGS.md and the paper
+     (DOI 10.5281/zenodo.21225721). -->
 
 ![Fractale — the model reads page by page, writes 8 self-written notes, and thinks through them](assets/fractale-banner.png)
 <!-- PNG, not SVG: the HF Hub does not render SVG images in model cards.
@@ -194,13 +193,14 @@ covers the **model weights and code**, not the training texts; generated
 output may occasionally reproduce fragments of training data subject to
 their original terms.
 
-**Recipe.** 8× A100-80GB (DDP), batch 32/GPU, ⟨19600⟩ steps ≈ ⟨550k⟩
-tokens/step; AdamW (3e-4) + Muon (7.5e-4, `√cols`-normalized with
-`muon_ref_mem_dim` correction) ; WSD schedule (step decay from step ⟨2000⟩);
-grad clip 1.0; a NaN guard skips the update when the all-reduced grad norm is
-non-finite, and the persistent bank state is sanitized between files (a NaN
-written into a carried bank otherwise contaminates every later step).
-Total compute: ~⟨30⟩ h ≈ ⟨$300⟩ — the entire run was self-funded.
+**Recipe.** 8× A100-80GB (DDP), batch 32/GPU, 19,600 steps ≈ 550k
+tokens/step (~10.8B tokens seen); AdamW (1.5e-4) + Muon (3.75e-4,
+`√cols`-normalized with `muon_ref_mem_dim` correction); WSD schedule (step
+decay from step 2000); grad clip 1.0; a NaN guard skips the update when the
+all-reduced grad norm is non-finite, and the persistent bank state is
+sanitized between files (a NaN written into a carried bank otherwise
+contaminates every later step). Total compute: ~30 h of pod time ≈ $320,
+including the incident replay below — the entire run was self-funded.
 
 **Training incident, disclosed.** At ~step 2500 the run hit a forward-pass
 NaN that contaminated the carried bank; it was caught, the run resumed from
@@ -208,14 +208,20 @@ the last verified-clean checkpoint (step 2500), and the learning-rate
 schedule was brought forward (decay from step 2000 instead of 60%) — the
 skip-rate telemetry showed full-LR updates were pushing the weights into the
 overflow region. The NaN guard and bank sanitization above were added as a
-result. Post-resume, all health metrics (bank advantage, in-context ppl,
-depth flatness) improved monotonically through the rest of training.
+result. The guard kept firing for the rest of the run (~16% of updates
+skipped overall, escalating late in training despite LR decay — the drift is
+in the weights, not the LR; root-causing it is on the phase-2 list), yet all
+health metrics (bank advantage, in-context ppl, depth flatness) improved
+monotonically to the end: code-side bank advantage still rose +8.74 → +9.42
+nats over the final 1,100 steps.
 
-**Checkpoint provenance.** This checkpoint is `model.pt` = step ⟨19600⟩
-(fp32, self-describing `{"cfg", "model"}`) of a single training run of
-[`v350_phase1_10b.yaml`](https://github.com/kkuette/thought-bank/blob/main/deepseek_v4_mini/configs/v350_phase1_10b.yaml),
-trained with `deepseek_v4_mini.code_defer_native` at thought-bank commit
-⟨commit⟩. The [usage repo](https://github.com/fractale-lm/fractale) vendors its
+**Checkpoint provenance.** This checkpoint is `model.pt` = step 19,600 (the
+final step; fp32, self-describing `{"cfg", "model"}`) of a single training
+run of `v350_phase1_10b.yaml`, trained with
+`deepseek_v4_mini.code_defer_native` at thought-bank commit
+[`073bb67`](https://github.com/kkuette/thought-bank/commit/073bb67) (branch
+`claude/status-check-2fa903` — config and stability patches exactly as run).
+The [usage repo](https://github.com/fractale-lm/fractale) vendors its
 inference code from that same commit.
 
 **Curriculum provenance.** Phase 1 is the *batched* recipe (fixed chunks, no
@@ -247,16 +253,23 @@ content shifts the prediction toward the true continuation of a document the
 model has never seen. It is an exact content control — same weights, same
 target, the only difference is whether the written gists are present.
 
+Final checkpoint (step 19,600), held-out documents, 3090 eval harness
+(re-run noise ~±0.3 nats):
+
 | Metric (held-out) | Value |
 |---|---|
-| GAP, code (codeparrot) | ⟨+8.3⟩ nats |
-| GAP, web (fineweb) | ⟨+6.5⟩ nats |
-| GAP by depth (2→8 chunks written) | ⟨flat — no FIFO cliff⟩ |
-| In-context ppl, code / web | ⟨8.6 / 93⟩ |
+| GAP, code (codeparrot) | **+9.42 nats** (CE 12.86 reset → 3.45 carried) |
+| GAP, web (fineweb) | **+7.27 nats** |
+| GAP at position 0 (bank only, first deferred token block) | +9.45 nats (code) |
+| GAP by depth (2→8 chunks written) | flat, d2 ≈ d8, both sources — no FIFO cliff |
+| In-context ppl, code / web | 8.4 / 94 |
 
-⟨Final-checkpoint numbers + a plot of GAP over training to be inserted at
-release; mid-run trajectory: all three axes (GAP, in-context ppl, depth
-flatness) improved monotonically from step 500 to ⟨N⟩.⟩
+The trajectory over training is the point, not just the endpoint: from step
+500 to 19,600 the code GAP rose +1.04 → +9.42 nats (web +2.05 → +7.27) and
+in-context ppl fell monotonically (code 237 → 8.4). The gap widened from
+*both* sides — the bank-only arm kept sharpening while the no-bank arm
+degraded — i.e. the model grew **more dependent on its memory** as training
+progressed, which is exactly the behaviour the objective selects for.
 
 Two caveats we state up front rather than in fine print:
 
