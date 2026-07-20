@@ -335,12 +335,38 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # Checkpointing stores only the inputs per forward => peak ~ one chunk's
     # activations; gradients are EXACT (same graph, recomputed), ~+30% compute.
     grad_ckpt = bool(t.get("grad_checkpoint", False))
+    _ckpt_ctx = None
     if grad_ckpt:
         from torch.utils.checkpoint import checkpoint as _ckpt
-        print("grad_checkpoint: ON (rematerialized forwards, exact grads)", flush=True)
+        # gc_save_topk (défaut ON) : les grads du checkpoint ne sont « exacts »
+        # que si le recompute est bit-identique au forward — faux en pratique :
+        # cuBLAS peut choisir un autre algo au recompute (workspace différent
+        # pendant le backward), les scores bougent d'un ULP, et les TOPK durs
+        # (routage MoE, sélection de blocs CSA) FLIPPENT => gradients calculés
+        # sur un autre graphe que la loss. Suspect n°1 des NaN (incident phase 1
+        # step 2520, run 5e step 33 — tous deux GC ON). Fix : selective
+        # activation checkpointing — les sorties de topk sont SAUVÉES au
+        # forward et rejouées au recompute (coût mémoire = des indices).
+        if bool(t.get("gc_save_topk", True)):
+            from torch.utils.checkpoint import (create_selective_checkpoint_contexts,
+                                                CheckpointPolicy)
+            _save_ops = {torch.ops.aten.topk.default}
+
+            def _sac_policy(ctx, op, *args, **kwargs):
+                return (CheckpointPolicy.MUST_SAVE if op in _save_ops
+                        else CheckpointPolicy.PREFER_RECOMPUTE)
+
+            _ckpt_ctx = lambda: create_selective_checkpoint_contexts(_sac_policy)
+            print("grad_checkpoint: ON + save-topk (routage figé au recompute)",
+                  flush=True)
+        else:
+            print("grad_checkpoint: ON (rematerialized forwards)", flush=True)
 
     def _fwd(*a, **k):
         if grad_ckpt and torch.is_grad_enabled():
+            if _ckpt_ctx is not None:
+                return _ckpt(model, *a, use_reentrant=False,
+                             context_fn=_ckpt_ctx, **k)
             return _ckpt(model, *a, use_reentrant=False, **k)
         return model(*a, **k)
 
@@ -745,6 +771,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
         opt.zero_grad(set_to_none=True)
         ic_v = d_v = a_v = 0.0; ic_cnt = d_cnt = a_cnt = 0; distill_v = 0.0; distill_n = 0
         chat_v = 0.0; chat_cnt = 0
+        _step_convs = []                     # trace repro nan-guard (voir plus bas)
         reach_v = [0.0, 0.0, 0.0]; reach_cnt = [0, 0, 0]
         # gradient accumulation: G independent conversations (batch=1 each, bank reset
         # between them) summed into one optimizer step => effective batch = G files,
@@ -787,6 +814,14 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 reach_pool, w_total = [], 0           # le pool meurt avec la vie
             total = 0.0
             reach_n = 0                               # cap VRAM par conv
+            # trace repro nan-guard : entrées de la conv AVANT forward (segs =
+            # tenseurs CPU du générateur, banque d'entrée = ref détachée) — si
+            # le guard grad-norm trip en fin de step, on dumpe tout le step
+            _step_convs.append({
+                "segs": segs,
+                "bank_in": None if bank is None else bank.detach(),
+                "casc": None if casc is None else casc.state_dict(),
+                "n_evict": n_evict})
             for i, s in enumerate(segs):
                 x = s["input_ids"].to(device)
                 chat_seg = "loss_mask" in s          # chat segs: no <think>,
@@ -836,7 +871,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     if tf_on and beta > 0.0:
                         with torch.no_grad():
                             gist = model.embed.weight[x].float().mean(dim=1) @ tf_proj.float()
-                            gist = gist / gist.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
+                            gist = gist / gist.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
                         w0 = bank[:, -1]
                         distill = (1.0 - F.cosine_similarity(w0.float(), gist, dim=1)).mean()
                         total = total + tf_dw * beta * distill
@@ -904,15 +939,51 @@ def main(cfg_path: str, resume: bool = False) -> None:
                                            "tgt": tg, "w": w_total})
                         if len(reach_pool) > 64:      # borne mémoire (tenseurs CPU 16+16 tok)
                             reach_pool.pop(0)
+            # nan-guard (incident run 5e step 33 : chat nan -> opt.step sur grads
+            # NaN = poids morts ; le pod phase 1 avait son guard, ce chemin non).
+            # Conv non finie => pas de backward, et la banque de cette conv ne
+            # rentre JAMAIS dans le carry (en never-reset un carry NaN est éternel).
+            tot_ok = bool(torch.isfinite(total).all()) if torch.is_tensor(total) \
+                else math.isfinite(total)
+            if not tot_ok:
+                # dump repro : la conv fautive + son état d'entrée, pour rejouer
+                # offline GC on/off (hypothèse user : recompute du checkpoint qui
+                # diverge du forward sur le routage MoE => grads incohérents)
+                _dp = os.path.join(save_dir, f"nan_conv_step{step}_g{_g}.pt")
+                try:
+                    torch.save({"step": step, "g": _g,
+                                "segs": [{k: (v.cpu() if torch.is_tensor(v) else v)
+                                          for k, v in s.items()} for s in segs],
+                                "bank_in": None if bank_carry is None
+                                else bank_carry.detach().cpu(),
+                                "casc": None if casc is None else casc.state_dict(),
+                                "n_evict": n_evict}, _dp)
+                except Exception as e:
+                    _dp = f"dump raté: {e}"
+                # les poids du MOMENT du nan (une seule fois par run) : sans eux
+                # le repro depuis le dernier ckpt peut ne pas trigger
+                _wp = os.path.join(save_dir, "nan_weights.pt")
+                if not os.path.exists(_wp):
+                    torch.save({"step": step, "model": base.state_dict()}, _wp)
+                print(f"[nan-guard] step {step} conv {_g}: loss non finie, "
+                      f"conv sautée (carry préservé) — repro {_dp}", flush=True)
+                continue
             (total / grad_accum).backward()          # mean over the G accumulated convs
             if no_reset_files > 1 or nrf_never:
                 # graph freed per file; the carried bank is data, not gradient path
-                bank_carry = bank.detach() if bank is not None else None
-                casc_carry, nev_carry = casc, n_evict
+                nb = bank.detach() if bank is not None else None
+                if nb is not None and not bool(torch.isfinite(nb).all()):
+                    print(f"[nan-guard] step {step} conv {_g}: banque non finie, "
+                          f"carry RESET (vie neuve)", flush=True)
+                    bank_carry, casc_carry, nev_carry = None, None, 0
+                    rpool_carry, wt_carry = [], 0
+                else:
+                    bank_carry = nb
+                    casc_carry, nev_carry = casc, n_evict
+                    if reach_prob > 0:
+                        rpool_carry, wt_carry = reach_pool, w_total
                 if delta is not None:
                     dstate_carry = dstate.detach()
-                if reach_prob > 0:
-                    rpool_carry, wt_carry = reach_pool, w_total
         _prof = os.environ.get("TB_DDP_PROF")
         if _prof:
             torch.cuda.synchronize(); _t_bwd = time.time()
@@ -939,8 +1010,33 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     bucket.append(g_); nbytes += g_.numel() * g_.element_size()
         if _prof:
             torch.cuda.synchronize(); _t_ar = time.time()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), float(t.get("grad_clip", 1.0)))
-        opt.step()
+        gn = torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                            float(t.get("grad_clip", 1.0)))
+        if not bool(torch.isfinite(gn)):
+            # LE cas intéressant pour l'hypothèse GC : loss finie mais grads NaN
+            # (recompute qui diverge du forward). Dump du step complet + poids
+            # (encore sains puisque le step est sauté).
+            _dp = os.path.join(save_dir, f"nan_gradstep_{step}.pt")
+            try:
+                torch.save({"step": step,
+                            "convs": [{"segs": [{k: (v.cpu() if torch.is_tensor(v)
+                                                     else v) for k, v in s.items()}
+                                                for s in c["segs"]],
+                                       "bank_in": None if c["bank_in"] is None
+                                       else c["bank_in"].cpu(),
+                                       "casc": c["casc"],
+                                       "n_evict": c["n_evict"]}
+                                      for c in _step_convs]}, _dp)
+            except Exception as e:
+                _dp = f"dump raté: {e}"
+            _wp = os.path.join(save_dir, "nan_weights.pt")
+            if not os.path.exists(_wp):
+                torch.save({"step": step, "model": base.state_dict()}, _wp)
+            print(f"[nan-guard] step {step}: grad norm non finie, opt.step SAUTÉ "
+                  f"— repro {_dp}", flush=True)
+            opt.zero_grad(set_to_none=True)
+        else:
+            opt.step()
         if _prof:
             torch.cuda.synchronize()
             print(f"[prof step {step}] fwd+bwd {_t_bwd - _t_step0:.2f}s  "

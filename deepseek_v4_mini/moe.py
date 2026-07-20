@@ -90,7 +90,10 @@ class DeepSeekMoE(nn.Module):
             shared_out = sum(e(flat) for e in self.shared) / self.n_shared
 
         # ── Routing ───────────────────────────────────────────────────────────
-        scores = torch.sqrt(F.softplus(self.W_gate(flat)))     # [BT, n_routed]
+        # clamp_min: softplus underflows to exactly 0 in bf16 for very negative
+        # logits, and sqrt'(0)=inf turns the (zero) grad of unselected experts
+        # into 0*inf=NaN
+        scores = torch.sqrt(F.softplus(self.W_gate(flat)).clamp_min(1e-12))  # [BT, n_routed]
         top_scores, top_idx = scores.topk(self.top_k, dim=-1)  # [BT, top_k]
         # Normalise weights within the selected set
         top_w = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-8)

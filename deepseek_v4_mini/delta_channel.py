@@ -63,5 +63,5 @@ class DeltaChannel(nn.Module):
     def to_bank(self, S, dtype):
         """État -> pseudo-banque [B, max_mem, mem_dim] à l'échelle du read."""
         b = S.reshape(S.size(0), self.M, self.D)
-        b = b / b.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
+        b = b / b.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
         return (self.gain * b).to(dtype)
