@@ -459,15 +459,21 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # DISCRIMINANT par valeur (recette 47M nn.Embedding(rule_id) : 0.03→0.99).
     # En mode 'value' le teacher ne tire QUE les segs porteurs de valeur ; les
     # autres writes (filler, question, ack) restent natifs.
+    # 'surprisal' = généralisation label-free de 'value' : pooling pondéré par
+    # la nll^alpha d'un LM de référence gelé (surp_w posé par le générateur,
+    # clé gen.surprisal_ref) — les tokens imprévisibles (l'information) dominent
+    # la cible, les templates pèsent ~0. Marche sur tout corpus, tous les segs.
     tf_target = str(tf_cfg.get("target", "chunk"))
+    assert tf_target in ("chunk", "value", "surprisal"), tf_target
     tf_proj = None
     if tf_on:
         g = torch.Generator(device="cpu").manual_seed(1789)
         tf_proj = (torch.randn(cfg.d_model, cfg.mem_dim, generator=g) / cfg.d_model ** 0.5).to(device)
+        _tdesc = {"value": "proj embed valeur (discriminant)",
+                  "surprisal": "proj pooling pondéré nll ref (label-free)",
+                  "chunk": "proj gist chunk"}[tf_target]
         print(f"teacher ON: distill_w {tf_dw}, anneal [{tf_a0},{tf_a1}], "
-              f"target={tf_target} "
-              f"({'proj embed valeur (discriminant)' if tf_target == 'value' else 'proj gist chunk'})",
-              flush=True)
+              f"target={tf_target} ({_tdesc})", flush=True)
 
     def _beta(s):
         if not tf_on or s >= tf_a1: return 0.0
@@ -927,14 +933,19 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 # discriminant par valeur, et NE tire que les segs porteurs.
                 beta = _beta(step)
                 vmask = s.get("val_mask")
+                surpw = s.get("surp_w") if tf_target == "surprisal" else None
                 fire = tf_on and beta > 0.0 and (
-                    tf_target != "value" or vmask is not None)
+                    (tf_target != "value" or vmask is not None) and
+                    (tf_target != "surprisal" or surpw is not None))
                 if fire:
                     with torch.no_grad():
                         emb = model.embed.weight[x].float()          # [B,T,D]
                         if tf_target == "value" and vmask is not None:
                             vm = vmask.to(device).unsqueeze(-1).float()  # [B,T,1]
                             pooled = (emb * vm).sum(dim=1) / vm.sum(dim=1).clamp_min(1.0)
+                        elif surpw is not None:
+                            sw = surpw.to(device).unsqueeze(-1).float()  # [B,T,1]
+                            pooled = (emb * sw).sum(dim=1) / sw.sum(dim=1).clamp_min(1e-6)
                         else:
                             pooled = emb.mean(dim=1)
                         gist = pooled @ tf_proj.float()

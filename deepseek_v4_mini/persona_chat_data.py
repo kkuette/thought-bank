@@ -274,7 +274,9 @@ class PersonaChatStream:
                  real_filler: str = None,
                  real_split: str = "train", real_cap: int = 20000,
                  real_max_tok: int = 96, p_real: float = 0.8,
-                 real_cache_dir: str = None, seed: int = 0) -> None:
+                 real_cache_dir: str = None,
+                 surprisal_ref: str = None, surprisal_device: str = "cpu",
+                 surprisal_alpha: float = 2.0, seed: int = 0) -> None:
         self.tok = tok
         self.rng = random.Random(seed)
         self.p_smalltalk = float(p_smalltalk)
@@ -291,6 +293,40 @@ class PersonaChatStream:
                 real_filler, real_split, int(real_cap), int(real_max_tok),
                 real_cache_dir)
         self._enc = {}
+        # teacher surprisal (label-free) : poids par token = nll^alpha sous un
+        # LM de référence GELÉ — « l'information d'un seg = ce que le modèle de
+        # référence n'a pas su prédire ». Généralise val_mask à tout corpus
+        # (code/prose : pas de span étiquetable). Cible fixe (modèle gelé),
+        # cache par texte de seg (les templates se répètent massivement).
+        self.surp_ref_name = surprisal_ref
+        self.surp_device = surprisal_device
+        self.surp_alpha = float(surprisal_alpha)
+        self._surp_model = None
+        self._surp_cache = {}
+
+    def _surp_weights(self, ids: torch.Tensor) -> torch.Tensor:
+        """[T] float : poids de saillance par token (nll de référence ^ alpha).
+        Le token 0 hérite du poids moyen (pas de prédiction pour lui)."""
+        key = tuple(ids.tolist())
+        w = self._surp_cache.get(key)
+        if w is not None:
+            return w
+        if self._surp_model is None:
+            from transformers import AutoModelForCausalLM
+            m = AutoModelForCausalLM.from_pretrained(self.surp_ref_name)
+            self._surp_model = m.eval().requires_grad_(False).to(self.surp_device)
+            self._surp_vocab = m.get_input_embeddings().num_embeddings
+            print(f"surprisal ref: {self.surp_ref_name} gelé sur "
+                  f"{self.surp_device} (vocab {self._surp_vocab}, "
+                  f"alpha {self.surp_alpha})", flush=True)
+        x = ids.clamp_max(self._surp_vocab - 1).unsqueeze(0).to(self.surp_device)
+        with torch.no_grad():
+            lg = self._surp_model(x).logits.float()
+        import torch.nn.functional as F
+        nll = F.cross_entropy(lg[0, :-1], x[0, 1:], reduction="none")
+        w = torch.cat([nll.mean().reshape(1), nll]).pow(self.surp_alpha).cpu()
+        self._surp_cache[key] = w
+        return w
 
     def _load_real_pairs(self, name, split, cap, max_tok, cache_dir):
         """Filler pairs from a real SFT dataset, disk-cached (texts, small)."""
@@ -325,9 +361,19 @@ class PersonaChatStream:
         ids = torch.cat([self._ids(p) for p, _ in pieces])
         mask = torch.cat([torch.full((self._ids(p).numel(),), float(sup))
                           for p, sup in pieces])
-        return {"input_ids": ids.unsqueeze(0), "loss_mask": mask.unsqueeze(0),
-                "attention_mask": torch.ones(1, ids.numel(), dtype=torch.long),
-                "role": role, "write": True}
+        seg = {"input_ids": ids.unsqueeze(0), "loss_mask": mask.unsqueeze(0),
+               "attention_mask": torch.ones(1, ids.numel(), dtype=torch.long),
+               "role": role, "write": True}
+        if self.surp_ref_name:
+            # l'échafaudage ChatML est injecté par la machine, pas du contenu :
+            # exclu du pooling (sinon <|im_end|>/user, très surprenants pour une
+            # ref base, dominent TOUTES les cibles -> zéro discriminabilité)
+            body = torch.cat([torch.full((self._ids(p).numel(),),
+                                         0.0 if p in (U_OPEN, A_OPEN, CLOSE)
+                                         else 1.0)
+                              for p, _ in pieces])
+            seg["surp_w"] = (self._surp_weights(ids) * body).unsqueeze(0)
+        return seg
 
     def _user(self, text: str) -> dict:
         return self._seg([(U_OPEN, False), (text + "\n", False), (CLOSE, False)],
@@ -381,9 +427,14 @@ class PersonaChatStream:
         ids = torch.cat([pre, body, suf, cl])
         mask = torch.cat([torch.zeros(pre.numel()), m,
                           torch.ones(suf.numel() + cl.numel())])
-        return {"input_ids": ids.unsqueeze(0), "loss_mask": mask.unsqueeze(0),
-                "attention_mask": torch.ones(1, ids.numel(), dtype=torch.long),
-                "role": "assistant", "write": True}
+        seg = {"input_ids": ids.unsqueeze(0), "loss_mask": mask.unsqueeze(0),
+               "attention_mask": torch.ones(1, ids.numel(), dtype=torch.long),
+               "role": "assistant", "write": True}
+        if self.surp_ref_name:
+            keep = torch.cat([torch.zeros(pre.numel()), torch.ones(body.numel()),
+                              torch.zeros(suf.numel() + cl.numel())])
+            seg["surp_w"] = (self._surp_weights(ids) * keep).unsqueeze(0)
+        return seg
 
     # ── pieces ───────────────────────────────────────────────────────────────
     def _filler_pair(self) -> list[dict]:
