@@ -218,7 +218,7 @@ def main():
             print(f"bank -> {path}")
             continue
 
-        sess.write(_ids(tok, U_OPEN + user + CLOSE, device))
+        sess.write(_ids(tok, U_OPEN + user + "\n" + CLOSE, device))
         if args.ablated:
             rd_bank, rd_lb = None, None
         else:
