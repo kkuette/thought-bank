@@ -236,7 +236,7 @@ chat:
     # contenu). Validé offline : cos inter-faits 0.046 @alpha 2 (discriminant),
     # cos vs cible val_mask 0.48 (= valeur + composante slot, acceptable).
     surprisal_ref: HuggingFaceTB/SmolLM2-135M-Instruct
-    surprisal_device: cpu
+    surprisal_device: cuda                    # fp16 colocalisée (CPU rig trop lent)
     surprisal_alpha: 2.0
     # RUN 7 : pondération du span VALEUR dans la réponse de rappel (×4). La
     # valeur ne peut venir que de la banque (fait hors contexte) ⇒ surpondérer

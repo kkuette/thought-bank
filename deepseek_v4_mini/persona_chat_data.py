@@ -313,7 +313,13 @@ class PersonaChatStream:
             return w
         if self._surp_model is None:
             from transformers import AutoModelForCausalLM
-            m = AutoModelForCausalLM.from_pretrained(self.surp_ref_name)
+            # sur GPU : fp16 (~270 Mo pour 135M) — permet de coloc la ref avec
+            # le train 386M dans 8 Go de VRAM rig (le CPU des rigs est trop
+            # lent pour le forward de ref, décision user 2026-07-21)
+            m = AutoModelForCausalLM.from_pretrained(
+                self.surp_ref_name,
+                torch_dtype=(torch.float16 if self.surp_device != "cpu"
+                             else torch.float32))
             self._surp_model = m.eval().requires_grad_(False).to(self.surp_device)
             self._surp_vocab = m.get_input_embeddings().num_embeddings
             print(f"surprisal ref: {self.surp_ref_name} gelé sur "
