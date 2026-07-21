@@ -836,6 +836,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
         lr_now = set_lr(step)
         opt.zero_grad(set_to_none=True)
         ic_v = d_v = a_v = 0.0; ic_cnt = d_cnt = a_cnt = 0; distill_v = 0.0; distill_n = 0
+        # dist ventilée porteur/filler : porteur = seg avec val_mask (fait
+        # énoncé/màj). Si fait descend et fill reste ~1.0 = le write imite le
+        # contenu ; les deux plats = le write n'imite rien (lever distill_w/α).
+        dist_c = dist_f = 0.0; dist_cn = dist_fn = 0
         chat_v = 0.0; chat_cnt = 0
         _step_convs = []                     # trace repro nan-guard (voir plus bas)
         reach_v = [0.0, 0.0, 0.0]; reach_cnt = [0, 0, 0]
@@ -954,6 +958,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     distill = (1.0 - F.cosine_similarity(w0.float(), gist, dim=1)).mean()
                     total = total + tf_dw * beta * distill
                     distill_v += float(distill.detach()); distill_n += 1
+                    if vmask is not None:
+                        dist_c += float(distill.detach()); dist_cn += 1
+                    else:
+                        dist_f += float(distill.detach()); dist_fn += 1
                     blended = (beta * gist.to(w0.dtype) + (1.0 - beta) * w0).unsqueeze(1)
                     bank = torch.cat([bank[:, :-1], blended], dim=1)
                 # deferred target: batched segs carry their own defer_tgt (incl. the
@@ -1163,6 +1171,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
                     if ic_cnt else "")
             d_s = f"defer {ema_d:.3f}  " if d_cnt else ""
             dist_s = (f"dist {distill_v / distill_n:.3f}  " if distill_n else "")
+            if dist_cn or dist_fn:
+                dist_s += ("[fait " + (f"{dist_c / dist_cn:.3f}" if dist_cn else "—")
+                           + "/fill " + (f"{dist_f / dist_fn:.3f}" if dist_fn else "—")
+                           + "]  ")
             print(f"step {step:5d}  {ic_s}{d_s}"
                   f"{addr_s}{dist_s}β {_beta(step):.2f}  lr {lr_now:.2e}  {mem_s}"
                   f"{(time.time()-t0)/max(step - start_step, 1):.2f}s/step", flush=True)
@@ -1181,6 +1193,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 writer.add_scalar("sched/beta", _beta(step), step)
                 if distill_n:
                     writer.add_scalar("train/distill", distill_v / distill_n, step)
+                if dist_cn:
+                    writer.add_scalar("train/distill_fait", dist_c / dist_cn, step)
+                if dist_fn:
+                    writer.add_scalar("train/distill_fill", dist_f / dist_fn, step)
         if (step % eval_every == 0
                 or (step == steps and not skip_final_eval)) and ddp_rank == 0:
             # eval_depth_sources (mix large, ex. divmix 13 sources) : la courbe
