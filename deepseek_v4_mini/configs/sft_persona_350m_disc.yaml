@@ -174,7 +174,12 @@ training:
                                            # ~2x plus rapide, batch effectif 4 convs
                                            # — tolérable au LR bas du SFT
   amp: true
-  init_from: /home/kkuette/v350_phase1_ckpts/final.pt
+  # REPRISE run 7 @400 (poids seuls, schedule/optim frais, step→0 : ré-arme β).
+  # On garde les ~400 steps de registre chat + canal partiellement ouvert, on
+  # repart avec le teacher DISCRIMINANT. Banque fraîche (pas de bank_init) :
+  # elle se re-remplit par FIFO, évite de mélanger les slots écrits sous
+  # l'ancien teacher chunk-gist.
+  init_from: /mnt/tb/checkpoints/v350_sft_persona/run7_resume_step_400.pt
   lr: 4.0e-05
   muon_lr: 1.0e-04
   muon_ref_mem_dim: 64
@@ -209,8 +214,8 @@ training:
   - codeparrot
   - fineweb
   save_every: 50                           # 400->50 (décision user 2026-07-20 : coupure de courant, sauvegardes rapprochées)
-  save_dir: /mnt/tb/checkpoints/v350_sft_persona
-  metrics_file: /mnt/tb/runs/v350_sft_persona/metrics.jsonl
+  save_dir: /mnt/tb/checkpoints/v350_sft_persona_disc
+  metrics_file: /mnt/tb/runs/v350_sft_persona_disc/metrics.jsonl
 
 chat:
   stream: persona
@@ -238,9 +243,16 @@ chat:
 # (projection fixe), β 1→0 ; le CE de la réponse peut trouver le chemin.
 # Le blend s'applique désormais à CHAQUE seg (chat inclus), pas seulement
 # aux segs à cible defer.
+# REPRISE DISCRIMINANTE : teacher target=value. Verdict runs 6b/7 = le teacher
+# chunk-gist ouvre le canal sous β mais il s'érode au retrait (Δnll +0.18→+0.07
+# à β=0) car la cible (hash du chunk) n'enseigne pas un code d'où la VALEUR se
+# décode. Ici la cible = proj de l'embedding des tokens valeur (val_mask sur les
+# segs statement/update) = code propre par valeur, recette 47M (0.03→0.99). La
+# pondération valeur ×4 (gen) fournit la pression native qui doit le retenir
+# après retrait. Anneal ré-armé court (registre chat déjà acquis).
 teacher:
   enabled: true
   distill_weight: 2.0
-  anneal: [150, 300]                       # β=1 jusqu'à 150, →0 à 300 (fondu
-                                           # 150 steps, décision user), 500
-                                           # steps natifs avant la fin (800)
+  target: value                            # discriminant (défaut 'chunk' = ancien)
+  anneal: [120, 260]                       # β=1 jusqu'à 120, →0 à 260 ; ~540
+                                           # steps natifs de rétention (steps 800)

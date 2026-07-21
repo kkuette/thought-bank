@@ -233,6 +233,16 @@ def extract_filler_pairs(rows, tok, *, max_tok: int = 96, cap: int = 20000):
     return pairs
 
 
+def _find_sub(seq: list, sub: list):
+    """Premier span [i, j) où seq[i:j] == sub, sinon None."""
+    if not sub:
+        return None
+    for i in range(len(seq) - len(sub) + 1):
+        if seq[i:i + len(sub)] == sub:
+            return (i, i + len(sub))
+    return None
+
+
 def _canon(v: str) -> re.Pattern:
     return re.compile(r"\b" + re.escape(v.lower()) + r"\b")
 
@@ -260,7 +270,8 @@ class PersonaChatStream:
     def __init__(self, tok, *, p_smalltalk: float = 0.25,
                  n_facts: tuple = (1, 3), n_queries: tuple = (1, 2),
                  p_ack: float = 0.5, p_update: float = 0.15,
-                 p_beyond: float = 0.15, real_filler: str = None,
+                 p_beyond: float = 0.15, value_weight: float = 1.0,
+                 real_filler: str = None,
                  real_split: str = "train", real_cap: int = 20000,
                  real_max_tok: int = 96, p_real: float = 0.8,
                  real_cache_dir: str = None, seed: int = 0) -> None:
@@ -272,6 +283,7 @@ class PersonaChatStream:
         self.p_ack = float(p_ack)
         self.p_update = float(p_update)
         self.p_beyond = float(p_beyond)
+        self.value_weight = float(value_weight)
         self.p_real = float(p_real)
         self.real_pairs = None
         if real_filler:
@@ -321,9 +333,57 @@ class PersonaChatStream:
         return self._seg([(U_OPEN, False), (text + "\n", False), (CLOSE, False)],
                          "user")
 
+    def _val_span(self, ids: list, v: str):
+        """Span [i,j) des tokens de la valeur v dans ids (essaie l'espace de
+        tête d'abord = tokenisation naturelle), sinon None."""
+        for vs in (" " + v, v):
+            vids = self.tok(vs, add_special_tokens=False)["input_ids"]
+            if vids:
+                span = _find_sub(ids, vids)
+                if span is not None:
+                    return span
+        return None
+
+    def _user_valued(self, text: str, v: str) -> dict:
+        """Seg user qui ÉNONCE un fait : balise le span valeur avec un val_mask
+        (séparé du loss_mask — le user n'est pas supervisé) pour que le teacher
+        discriminant puisse pooler l'embedding de LA valeur (code propre par
+        valeur) au lieu du gist moyen du chunk. Run 7-resume."""
+        seg = self._user(text)
+        ids = seg["input_ids"][0].tolist()
+        vmask = torch.zeros(len(ids))
+        span = self._val_span(ids, v)
+        if span is not None:
+            vmask[span[0]:span[1]] = 1.0
+        seg["val_mask"] = vmask.unsqueeze(0)
+        return seg
+
     def _assistant(self, text: str) -> dict:
         return self._seg([(A_OPEN, False), (text, True), ("\n", True),
                           (CLOSE, True)], "assistant")
+
+    def _assistant_valued(self, text: str, v: str) -> dict:
+        """Assistant answer whose VALUE token span is upweighted in the loss
+        mask (run 7 : pression native persistante — la valeur ne peut venir que
+        de la banque, donc la surpondérer concentre le gradient sur le chemin
+        read→réponse, et ça SURVIT au retrait du teacher, contrairement au blend
+        β qui n'est qu'un échafaudage). Tokenisation identique à _assistant
+        (texte entier en un bloc) ; seul le masque change sur le span valeur."""
+        w = self.value_weight
+        if w == 1.0:
+            return self._assistant(text)
+        body = self._ids(text)
+        m = torch.ones(body.numel())
+        span = self._val_span(body.tolist(), v)
+        if span is not None:
+            m[span[0]:span[1]] = w
+        pre = self._ids(A_OPEN); suf = self._ids("\n"); cl = self._ids(CLOSE)
+        ids = torch.cat([pre, body, suf, cl])
+        mask = torch.cat([torch.zeros(pre.numel()), m,
+                          torch.ones(suf.numel() + cl.numel())])
+        return {"input_ids": ids.unsqueeze(0), "loss_mask": mask.unsqueeze(0),
+                "attention_mask": torch.ones(1, ids.numel(), dtype=torch.long),
+                "role": "assistant", "write": True}
 
     # ── pieces ───────────────────────────────────────────────────────────────
     def _filler_pair(self) -> list[dict]:
@@ -361,8 +421,8 @@ class PersonaChatStream:
             f = self._sample_fact(used_slots, used_vals)
             used_slots.add(f["slot"]); used_vals.add(f["v"])
             fact_seg[f["slot"]] = len(segs)
-            segs.append(self._user(self.rng.choice(f["st"])
-                                   .format(v=f["v"], p=f["p"])))
+            segs.append(self._user_valued(self.rng.choice(f["st"])
+                                          .format(v=f["v"], p=f["p"]), f["v"]))
             if self.rng.random() < self.p_ack:
                 segs.append(self._assistant(self.rng.choice(ACK_TMPL)
                                             .format(v=f["v"])))
@@ -376,8 +436,8 @@ class PersonaChatStream:
             used_vals.add(nv)
             f["old_v"], f["v"], updated = f["v"], nv, f["slot"]
             fact_seg[f["slot"]] = len(segs)
-            segs.append(self._user(self.rng.choice(f["upd"])
-                                   .format(v=f["v"], p=f["p"])))
+            segs.append(self._user_valued(self.rng.choice(f["upd"])
+                                          .format(v=f["v"], p=f["p"]), f["v"]))
 
         beyond = self.rng.random() < self.p_beyond
         lo, hi = BEYOND_BIN if beyond else self.rng.choice(FILLER_BINS)
@@ -394,8 +454,10 @@ class PersonaChatStream:
             segs.append(self._user(q))
             # age = writes between the fact seg and this answer's decode
             ages.append(len(segs) - fact_seg[f["slot"]])
-            segs.append(self._assistant(self.rng.choice(f["ans"])
-                                        .format(v=f["v"], p=f["p"])))
+            # réponse de rappel : valeur hors contexte (le fait est dans un seg
+            # passé, pont = banque seule) => span valeur surpondéré (run 7)
+            segs.append(self._assistant_valued(
+                self.rng.choice(f["ans"]).format(v=f["v"], p=f["p"]), f["v"]))
         return {"kind": "recall", "segs": segs,
                 "info": {"truths": truths, "queries": queries, "ages": ages,
                          "q_slots": q_slots, "updated": updated,

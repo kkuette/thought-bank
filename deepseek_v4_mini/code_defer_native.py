@@ -91,51 +91,103 @@ def _greedy(model, prefix, bank, max_new, stop_id, amp):
     return out[:, prefix.size(1):]
 
 
+def _age_bucket(age):
+    for name, hi in (("<=4", 4), ("5-8", 8), ("9-16", 16)):
+        if age <= hi:
+            return name
+    return ">16"
+
+
+AGE_BUCKETS = ("<=4", "5-8", "9-16", ">16")
+
+
 @torch.no_grad()
 def evaluate_math(model, stream, tok, device, amp, n_conv, max_new=24):
-    """Math-school eval: canonical segments advance the bank (teacher-forced
-    writes); each assistant turn is greedy-decoded TWICE — from the live bank
-    and from an ABLATED (None) bank — and graded by the generator's verifiers.
+    """Chat eval (math_school | persona): canonical segments advance the bank
+    (teacher-forced writes). Only the GRADED assistant turns (the last
+    len(truths) — the answers to memory queries) are greedy-decoded TWICE —
+    live bank vs ABLATED (None) — and graded by the generator's verifiers.
     grade_live - grade_ablated per kind = the working-memory efficacy figure
-    (memory dsv6-grpo-m2-integre). Bank-only (no cascade), like evaluate()."""
+    (memory dsv6-grpo-m2-integre). Probe fine ajoutée (verdict run 5i : le
+    grade exact-match est aveugle tant que le canal n'existe pas) : nll
+    teacher-forcée du tour gradé live vs ablatée — Δnll>0 = la banque aide,
+    sensible bien avant l'exact-match. Ventilée par âge (writes fait→réponse)
+    quand le stream fournit info.ages. Bank-only (no cascade), like evaluate().
+    Kinds sans truths (smalltalk) = contrôles : nll seule, pas de décodage.
+    Returns {kind: {...}} + clé "_by_age" (à pop avant itération par kind)."""
     from .math_school_data import A_OPEN, grade_conv
+    from .persona_chat_data import grade_recall
     grade = getattr(stream, "grade_conv", grade_conv)   # persona ships its own
     model.eval()
     a_open = torch.tensor(tok(A_OPEN, add_special_tokens=False)["input_ids"],
                           dtype=torch.long, device=device).unsqueeze(0)
     stop_id = tok.convert_tokens_to_ids("<|im_end|>")
-    agg = {}                                  # kind -> [nll_sum, nll_n, gl, ga, n]
+    # kind -> [nll_sum, nll_n, gl, ga, n, ans_nll_live, ans_nll_abl, n_ans]
+    agg = {}
+    by_age = {}                               # bucket -> [n, dg_sum, dnll_sum]
     for _ in range(n_conv):
         conv = stream.next_conv()
+        info = conv.get("info", {})
+        truths = info.get("truths", []) or []
+        ages = info.get("ages", []) or []
+        a_idx = [i for i, s in enumerate(conv["segs"])
+                 if s["role"] == "assistant"]
+        graded = set(a_idx[-len(truths):]) if truths else set()
         bank = None
         live_txt, abl_txt = [], []
         nll_s, nll_n = 0.0, 0
-        for s in conv["segs"]:
+        qi = 0
+        a = agg.setdefault(conv["kind"], [0.0, 0, 0.0, 0.0, 0, 0.0, 0.0, 0])
+        for i, s in enumerate(conv["segs"]):
             x = s["input_ids"].to(device)
             lmask = s["loss_mask"].to(device)
-            if s["role"] == "assistant":
-                g_live = _greedy(model, a_open, bank, max_new, stop_id, amp)
-                g_abl = _greedy(model, a_open, None, max_new, stop_id, amp)
-                live_txt.append(tok.decode(g_live[0].tolist()))
-                abl_txt.append(tok.decode(g_abl[0].tolist()))
+            if i in graded:
+                live_txt.append(tok.decode(_greedy(
+                    model, a_open, bank, max_new, stop_id, amp)[0].tolist()))
+                abl_txt.append(tok.decode(_greedy(
+                    model, a_open, None, max_new, stop_id, amp)[0].tolist()))
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                 o = model(x, init_mem=bank)
-            bank = o["mem_bank"]
             m = lmask[:, 1:].reshape(-1)
             if float(m.sum()) > 0:
                 lg = o["logits"].float()
                 ce = F.cross_entropy(lg[:, :-1].reshape(-1, lg.size(-1)),
                                      x[:, 1:].reshape(-1), reduction="none")
-                nll_s += float((ce * m).sum() / m.sum()); nll_n += 1
-        a = agg.setdefault(conv["kind"], [0.0, 0, 0.0, 0.0, 0])
+                nll = float((ce * m).sum() / m.sum())
+                nll_s += nll; nll_n += 1
+                if i in graded:
+                    with torch.autocast("cuda", dtype=torch.bfloat16,
+                                        enabled=amp):
+                        oa = model(x, init_mem=None)
+                    lga = oa["logits"].float()
+                    cea = F.cross_entropy(
+                        lga[:, :-1].reshape(-1, lga.size(-1)),
+                        x[:, 1:].reshape(-1), reduction="none")
+                    nll_a = float((cea * m).sum() / m.sum())
+                    a[5] += nll; a[6] += nll_a; a[7] += 1
+                    if qi < len(ages):
+                        b = by_age.setdefault(_age_bucket(ages[qi]),
+                                              [0, 0.0, 0.0])
+                        b[0] += 1
+                        b[2] += nll_a - nll
+                        if qi < len(truths):
+                            b[1] += (grade_recall([live_txt[-1]], [truths[qi]])
+                                     - grade_recall([abl_txt[-1]], [truths[qi]]))
+                    qi += 1
+            bank = o["mem_bank"]
         a[0] += nll_s; a[1] += nll_n
         a[2] += grade(conv, live_txt)
         a[3] += grade(conv, abl_txt)
         a[4] += 1
     model.train()
-    return {k: {"nll": v[0] / max(v[1], 1), "grade": v[2] / v[4],
-                "grade_abl": v[3] / v[4], "n": v[4]}
-            for k, v in agg.items()}
+    out = {k: {"nll": v[0] / max(v[1], 1), "grade": v[2] / v[4],
+               "grade_abl": v[3] / v[4], "n": v[4],
+               "ans_nll": v[5] / max(v[7], 1),
+               "ans_nll_abl": v[6] / max(v[7], 1), "n_ans": v[7]}
+           for k, v in agg.items()}
+    out["_by_age"] = {k: {"n": v[0], "dgrade": v[1] / v[0],
+                          "dnll": v[2] / v[0]} for k, v in by_age.items()}
+    return out
 
 
 @torch.no_grad()
@@ -402,12 +454,20 @@ def main(cfg_path: str, resume: bool = False) -> None:
     tf_on = bool(tf_cfg.get("enabled", False))
     tf_dw = float(tf_cfg.get("distill_weight", 2.0))
     tf_a0, tf_a1 = (int(v) for v in tf_cfg.get("anneal", [200, 1000]))
+    # target: 'chunk' (défaut) = proj du gist moyen du chunk (hash de contenu) ;
+    # 'value' = proj de l'embedding des tokens VALEUR (val_mask) = code propre
+    # DISCRIMINANT par valeur (recette 47M nn.Embedding(rule_id) : 0.03→0.99).
+    # En mode 'value' le teacher ne tire QUE les segs porteurs de valeur ; les
+    # autres writes (filler, question, ack) restent natifs.
+    tf_target = str(tf_cfg.get("target", "chunk"))
     tf_proj = None
     if tf_on:
         g = torch.Generator(device="cpu").manual_seed(1789)
         tf_proj = (torch.randn(cfg.d_model, cfg.mem_dim, generator=g) / cfg.d_model ** 0.5).to(device)
-        print(f"teacher ON: distill_w {tf_dw}, anneal [{tf_a0},{tf_a1}] "
-              f"(target = proj of mean-pooled chunk gist)", flush=True)
+        print(f"teacher ON: distill_w {tf_dw}, anneal [{tf_a0},{tf_a1}], "
+              f"target={tf_target} "
+              f"({'proj embed valeur (discriminant)' if tf_target == 'value' else 'proj gist chunk'})",
+              flush=True)
 
     def _beta(s):
         if not tf_on or s >= tf_a1: return 0.0
@@ -858,6 +918,33 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 total = total + loss
                 if ce is not None:
                     ic_v += ce; ic_cnt += 1
+                # teacher par SEG (run 6) : le blend s'applique à CHAQUE seg —
+                # chat inclus — plus seulement aux segs à cible defer. Le slot
+                # fraîchement écrit est tiré vers un gist prédictible du seg :
+                # le CE de la réponse peut alors trouver le routage read→réponse
+                # (recette anti point-fixe 47M). target=value (run 7-resume) :
+                # cible = proj de l'embedding des tokens VALEUR (val_mask), code
+                # discriminant par valeur, et NE tire que les segs porteurs.
+                beta = _beta(step)
+                vmask = s.get("val_mask")
+                fire = tf_on and beta > 0.0 and (
+                    tf_target != "value" or vmask is not None)
+                if fire:
+                    with torch.no_grad():
+                        emb = model.embed.weight[x].float()          # [B,T,D]
+                        if tf_target == "value" and vmask is not None:
+                            vm = vmask.to(device).unsqueeze(-1).float()  # [B,T,1]
+                            pooled = (emb * vm).sum(dim=1) / vm.sum(dim=1).clamp_min(1.0)
+                        else:
+                            pooled = emb.mean(dim=1)
+                        gist = pooled @ tf_proj.float()
+                        gist = gist / gist.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
+                    w0 = bank[:, -1]
+                    distill = (1.0 - F.cosine_similarity(w0.float(), gist, dim=1)).mean()
+                    total = total + tf_dw * beta * distill
+                    distill_v += float(distill.detach()); distill_n += 1
+                    blended = (beta * gist.to(w0.dtype) + (1.0 - beta) * w0).unsqueeze(1)
+                    bank = torch.cat([bank[:, :-1], blended], dim=1)
                 # deferred target: batched segs carry their own defer_tgt (incl. the
                 # LAST turn's external successor, -100-padded); batch=1 derives it
                 # from the next in-conv chunk as before.
@@ -867,17 +954,6 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 if nxt is not None and bool((nxt != -100).any()):
                     nxt = nxt.to(device)
                     dl = nxt.size(1)                   # ragged: remainder chunk may be < defer_len
-                    beta = _beta(step)
-                    if tf_on and beta > 0.0:
-                        with torch.no_grad():
-                            gist = model.embed.weight[x].float().mean(dim=1) @ tf_proj.float()
-                            gist = gist / gist.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
-                        w0 = bank[:, -1]
-                        distill = (1.0 - F.cosine_similarity(w0.float(), gist, dim=1)).mean()
-                        total = total + tf_dw * beta * distill
-                        distill_v += float(distill.detach()); distill_n += 1
-                        blended = (beta * gist.to(w0.dtype) + (1.0 - beta) * w0).unsqueeze(1)
-                        bank = torch.cat([bank[:, :-1], blended], dim=1)
                     di = _fill(x, blank_id, dl)
                     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                         od = _fwd(di, init_mem=bank,
@@ -1068,8 +1144,16 @@ def main(cfg_path: str, resume: bool = False) -> None:
             mem_s = (f"mem {torch.cuda.memory_allocated()/2**30:.1f}/"
                      f"{torch.cuda.max_memory_allocated()/2**30:.1f}G  "
                      if torch.cuda.is_available() else "")
-            print(f"step {step:5d}  ic {ema_ic:.3f} (ppl {math.exp(ema_ic):.1f})  defer {ema_d:.3f}  "
-                  f"{addr_s}β {_beta(step):.2f}  lr {lr_now:.2e}  {mem_s}"
+            # probes utiles seulement : ic/defer masqués quand le step n'en a
+            # pas vu (SFT pur p_chat=1.0 : ils étaient affichés à 0.000 fixe),
+            # distill affiché dès que le teacher contribue (il n'était QUE dans
+            # tensorboard pendant que β pilotait la moitié de la loss)
+            ic_s = (f"ic {ema_ic:.3f} (ppl {math.exp(ema_ic):.1f})  "
+                    if ic_cnt else "")
+            d_s = f"defer {ema_d:.3f}  " if d_cnt else ""
+            dist_s = (f"dist {distill_v / distill_n:.3f}  " if distill_n else "")
+            print(f"step {step:5d}  {ic_s}{d_s}"
+                  f"{addr_s}{dist_s}β {_beta(step):.2f}  lr {lr_now:.2e}  {mem_s}"
                   f"{(time.time()-t0)/max(step - start_step, 1):.2f}s/step", flush=True)
             if writer is not None:
                 writer.add_scalar("train/ic_loss", ema_ic, step)
@@ -1130,21 +1214,40 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 chat_eval.rng.seed(1234)          # same conv set every eval
                 mm = evaluate_math(model, chat_eval, tok, device, amp,
                                    chat_eval_convs, chat_max_new)
+                by_age = mm.pop("_by_age", {})
                 for kind in sorted(mm):
                     v = mm[kind]
-                    print(f"[math @{step}] {kind:10s} nll {v['nll']:.3f} "
-                          f"grade {v['grade']:.2f} abl {v['grade_abl']:.2f} "
-                          f"Δ {v['grade'] - v['grade_abl']:+.2f} (n={v['n']})",
-                          flush=True)
+                    if v["n_ans"]:
+                        print(f"[math @{step}] {kind:10s} nll {v['nll']:.3f} "
+                              f"grade {v['grade']:.2f} abl {v['grade_abl']:.2f} "
+                              f"Δg {v['grade'] - v['grade_abl']:+.2f} | ans nll "
+                              f"{v['ans_nll']:.3f} abl {v['ans_nll_abl']:.3f} "
+                              f"Δnll {v['ans_nll_abl'] - v['ans_nll']:+.3f} "
+                              f"(n={v['n']})", flush=True)
+                    else:                     # contrôle sans truths (smalltalk)
+                        print(f"[math @{step}] {kind:10s} nll {v['nll']:.3f} "
+                              f"(n={v['n']}, contrôle)", flush=True)
+                if by_age:
+                    curve = "  ".join(
+                        f"{b}: Δg {by_age[b]['dgrade']:+.2f} "
+                        f"Δnll {by_age[b]['dnll']:+.3f} (n{by_age[b]['n']})"
+                        for b in AGE_BUCKETS if b in by_age)
+                    print(f"[math @{step}] recall par âge (writes fait→réponse)"
+                          f" : {curve}", flush=True)
                 if metrics_file:
                     with open(metrics_file, "a") as f:
-                        f.write(json.dumps({"step": step, "math": mm}) + "\n")
+                        f.write(json.dumps({"step": step, "math": mm,
+                                            "math_by_age": by_age}) + "\n")
                 if writer is not None:
                     for kind, v in mm.items():
                         writer.add_scalar(f"eval_math/{kind}/nll", v["nll"], step)
                         writer.add_scalar(f"eval_math/{kind}/grade", v["grade"], step)
                         writer.add_scalar(f"eval_math/{kind}/grade_abl",
                                           v["grade_abl"], step)
+                        if v["n_ans"]:
+                            writer.add_scalar(
+                                f"eval_math/{kind}/ans_dnll",
+                                v["ans_nll_abl"] - v["ans_nll"], step)
         if (step % save_every == 0 or step == steps) and ddp_rank == 0:
             _save_ck(step, os.path.join(save_dir,
                      "final.pt" if step == steps else f"step_{step}.pt"))
