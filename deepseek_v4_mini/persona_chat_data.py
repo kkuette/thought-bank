@@ -276,7 +276,8 @@ class PersonaChatStream:
                  real_max_tok: int = 96, p_real: float = 0.8,
                  real_cache_dir: str = None,
                  surprisal_ref: str = None, surprisal_device: str = "cpu",
-                 surprisal_alpha: float = 2.0, seed: int = 0) -> None:
+                 surprisal_alpha: float = 2.0, surprisal_mode: str = "nll",
+                 sif_a: float = 1e-4, seed: int = 0) -> None:
         self.tok = tok
         self.rng = random.Random(seed)
         self.p_smalltalk = float(p_smalltalk)
@@ -301,15 +302,54 @@ class PersonaChatStream:
         self.surp_ref_name = surprisal_ref
         self.surp_device = surprisal_device
         self.surp_alpha = float(surprisal_alpha)
+        # mode 'sif' (décision user 2026-07-21, verdict analysis/freq_vs_surp*) :
+        # poids = a/(a+p(token)) sur table unigram AUTO (300 convs du stream,
+        # rng dédié) — zéro modèle ref, borné (typos plafonnés), bat la nll^2
+        # sur les 2 axes (persona ET mix 14 sources). alpha ignoré en sif.
+        assert surprisal_mode in ("nll", "sif"), surprisal_mode
+        self.surp_mode = surprisal_mode
+        self.sif_a = float(sif_a)
+        self.surp_on = bool(surprisal_ref) or surprisal_mode == "sif"
+        self._sif_p = None
+        self._table_pass = False
         self._surp_model = None
         self._surp_cache = {}
 
+    def _sif_table(self) -> dict:
+        """Table unigram p(token) construite sur 300 convs du stream lui-même
+        (rng dédié figé => identique entre instances train/eval)."""
+        if self._sif_p is not None:
+            return self._sif_p
+        saved = self.rng
+        self.rng = random.Random(4242)
+        self._table_pass = True
+        from collections import Counter
+        cnt, tot = Counter(), 0
+        for _ in range(300):
+            for seg in self.next_conv()["segs"]:
+                t = seg["input_ids"][0].tolist()
+                cnt.update(t); tot += len(t)
+        self._table_pass = False
+        self.rng = saved
+        self._sif_p = {t: c / tot for t, c in cnt.items()}
+        self._sif_unseen = 0.5 / tot
+        print(f"surprisal SIF: table unigram 300 convs ({tot} tokens, "
+              f"{len(self._sif_p)} types, a={self.sif_a:g})", flush=True)
+        return self._sif_p
+
     def _surp_weights(self, ids: torch.Tensor) -> torch.Tensor:
-        """[T] float : poids de saillance par token (nll de référence ^ alpha).
-        Le token 0 hérite du poids moyen (pas de prédiction pour lui)."""
+        """[T] float : poids de saillance par token — mode 'nll' : nll de la
+        ref gelée ^ alpha (token 0 = poids moyen) ; mode 'sif' : a/(a+p)."""
         key = tuple(ids.tolist())
         w = self._surp_cache.get(key)
         if w is not None:
+            return w
+        if self.surp_mode == "sif":
+            p = self._sif_table()
+            a = self.sif_a
+            w = torch.tensor([a / (a + p.get(t, self._sif_unseen))
+                              for t in key])
+            self._surp_cache[key] = w
             return w
         if self._surp_model is None:
             from transformers import AutoModelForCausalLM
@@ -370,7 +410,7 @@ class PersonaChatStream:
         seg = {"input_ids": ids.unsqueeze(0), "loss_mask": mask.unsqueeze(0),
                "attention_mask": torch.ones(1, ids.numel(), dtype=torch.long),
                "role": role, "write": True}
-        if self.surp_ref_name:
+        if self.surp_on and not self._table_pass:
             # l'échafaudage ChatML est injecté par la machine, pas du contenu :
             # exclu du pooling (sinon <|im_end|>/user, très surprenants pour une
             # ref base, dominent TOUTES les cibles -> zéro discriminabilité)
@@ -436,7 +476,7 @@ class PersonaChatStream:
         seg = {"input_ids": ids.unsqueeze(0), "loss_mask": mask.unsqueeze(0),
                "attention_mask": torch.ones(1, ids.numel(), dtype=torch.long),
                "role": "assistant", "write": True}
-        if self.surp_ref_name:
+        if self.surp_on and not self._table_pass:
             keep = torch.cat([torch.zeros(pre.numel()), torch.ones(body.numel()),
                               torch.zeros(suf.numel() + cl.numel())])
             seg["surp_w"] = (self._surp_weights(ids) * keep).unsqueeze(0)
