@@ -6,6 +6,8 @@
 # SFT sif_hot a montré que des cibles SIF donnent un gradient utilisable dès
 # le step 1. Ici on paie ~3000 steps (~280M tokens, ~3h de 8xA100, ~$40) pour
 # donner au 386M des codes contenu-discriminants en poids propres.
+# RECETTE POD = la prod 10B volée (b8e4a1a) : B32+GC+compile+depth_sync,
+# ~550k tokens/step, ~5.4 s/step => 3000 steps ≈ 1.65B tokens ≈ 4.5h ≈ $54.
 #
 # LANCEMENT (pod 8xA100, DDP) :
 #   torchrun --nproc_per_node=8 -m deepseek_v4_mini.code_defer_native \
@@ -159,7 +161,8 @@ data:
   seq_len: 512
   chunks_per_conv: 8
   defer_len: 16
-  batch_size: 6                            # par GPU, recette 10B éprouvée
+  depth_sync: true                         # DDP : m identique sur les 8 rangs
+  batch_size: 32                           # recette prod 10B (B32+GC+compile)
   n_files: 1000000
   stream_cap: 90000
 
@@ -184,7 +187,8 @@ training:
   wsd_decay_start: 1500                    # = fin d'anneal (décision user) :
   wsd_decay_shape: linear                  #   consolidation en refroidissement
   tf32: true
-  grad_checkpoint: false
+  grad_checkpoint: true                    # OBLIGATOIRE à 386M B32 (recette 10B)
+  compile: true                            # torch>=2.6 (image cuda12.4 devel min)
   skip_final_eval: true
   log_every: 10
   # PAS d'éval sur le pod (décision user 2026-07-22) : les évals se font en
