@@ -181,14 +181,16 @@ training:
   defer_weight: 1.0
   wsd_decay: true
   wsd_floor: 0.0
-  wsd_decay_start: 2500                    # = fin d'anneal : consolidation en
-  wsd_decay_shape: linear                  #   refroidissement
+  wsd_decay_start: 1500                    # = fin d'anneal (décision user) :
+  wsd_decay_shape: linear                  #   consolidation en refroidissement
   tf32: true
   grad_checkpoint: false
-  skip_final_eval: false
+  skip_final_eval: true
   log_every: 10
-  eval_every: 100                          # décision user 2026-07-22 (50-100) ;
-  eval_convs: 8                            #   ~30 évals ≈ +1h pod, assumé
+  # PAS d'éval sur le pod (décision user 2026-07-22) : les évals se font en
+  # local sur la 3090 depuis les ckpts (save_every 250), harnais GAP habituel.
+  eval_every: 999999
+  eval_convs: 8
   eval_depths:
   - 2
   - 4
@@ -208,6 +210,7 @@ teacher:
   enabled: true
   distill_weight: 2.0
   target: surprisal                        # cibles SIF via surp_w du stream
-  anneal:                                  # 50-83% des steps : β=1 jusqu'à
-  - 1500                                   # 1500, fondu 1000 steps, 500 steps
-  - 2500                                   # natifs en refroidissement WSD
+  anneal:                                  # décision user : β=1 jusqu'à 1000,
+  - 1000                                   # fondu 500 steps, puis 1500 steps
+  - 1500                                   # natifs sous WSD (départ = fin
+                                           # d'anneal, step 1500)
