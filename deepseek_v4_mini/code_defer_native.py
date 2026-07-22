@@ -492,6 +492,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
               stream_skip=int(d.get("stream_skip", 0)),
               sources=d.get("sources"),
               var_chunk=d.get("var_chunk"),
+              surprisal_mode=d.get("surprisal_mode", "none"),
+              sif_a=float(d.get("sif_a", 1e-4)),
               seed=int(t.get("seed", 0)))
     # DDP: per-rank seed offset => each rank samples different convs (random
     # sampling with per-rank RNG — no distributed sampler needed). Rank0 builds
@@ -501,7 +503,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
     if ddp_world > 1 and ddp_rank != 0:
         torch.distributed.barrier()
     train_stream = CodeChunkStream(tok, split="train", **{**sd, "seed": train_seed})
-    eval_stream  = CodeChunkStream(tok, split="held", **{**sd, "batch": 1})  # eval = batch=1 paths
+    eval_stream  = CodeChunkStream(tok, split="held",
+                                   **{**sd, "batch": 1, "surprisal_mode": "none"})  # eval = batch=1 paths
     if ddp_world > 1 and ddp_rank == 0:
         torch.distributed.barrier()               # cache built — release the other ranks
     print(f"corpus: train {train_stream.n_chunk} chunks / held {eval_stream.n_chunk} | "

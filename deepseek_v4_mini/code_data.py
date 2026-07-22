@@ -192,7 +192,8 @@ class CodeChunkStream:
                  content_key: str = "content", config_name: str = "",
                  min_chunks: int = 1, stream_skip: int = 0,
                  sources: list[dict] | None = None,
-                 var_chunk: list | tuple | None = None) -> None:
+                 var_chunk: list | tuple | None = None,
+                 surprisal_mode: str = "none", sif_a: float = 1e-4) -> None:
         self.tok = tokenizer
         self.L = int(seq_len); self.K = int(chunks_per_conv); self.B = int(batch)
         self.rng = random.Random(seed + (0 if split == "train" else 101))
@@ -242,6 +243,26 @@ class CodeChunkStream:
             mix = " + ".join(f"{n} {len(fl)}f/{sum(len(f) for f in fl)}c (w={w:g})"
                              for n, fl, w in zip(self.src_names, self.src_files, self.src_weights))
             print(f"mix[{split}]: {mix}", flush=True)
+
+        # ── SIF pooling weights (teacher target 'surprisal' sur le stream chunks) :
+        # table unigram sur le cache tokenisé (proxy corpus), poids a/(a+p) par
+        # token, précalculés en table [V] — le gather par seg est gratuit. Même
+        # recette que persona_chat_data (validée offline : intra-source 0.023 vs
+        # uniform 0.388 sur ce mix) ; les tokens jamais vus prennent p=0.5/total.
+        assert surprisal_mode in ("none", "sif"), surprisal_mode
+        self.surp_mode = surprisal_mode
+        self.sif_a = float(sif_a)
+        self._sif_w: torch.Tensor | None = None
+        if surprisal_mode == "sif":
+            V = len(tokenizer)
+            flat = torch.cat([c.flatten().long() for f in self.files for c in f])
+            cnt = torch.bincount(flat, minlength=V).double()
+            tot = int(flat.numel())
+            p = cnt / max(tot, 1)
+            p = torch.where(p > 0, p, torch.full_like(p, 0.5 / max(tot, 1)))
+            self._sif_w = (self.sif_a / (self.sif_a + p)).float()
+            print(f"sif[{split}]: table unigram {tot} tokens "
+                  f"({int((cnt > 0).sum())} types, a={self.sif_a:g})", flush=True)
 
         # ── Batched-conv index (B>1): windows over FULL chunks only (uniform [B, L]
         # shapes, no padding/mask — the ragged tail chunk is excluded as an INPUT but
@@ -310,7 +331,10 @@ class CodeChunkStream:
         segs = []
         for j in range(st, st + m):
             ids = f[j].long().unsqueeze(0)             # [1, Lj] (cache is uint16)
-            segs.append({"input_ids": ids, "attention_mask": torch.ones_like(ids)})
+            seg = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+            if self._sif_w is not None:
+                seg["surp_w"] = self._sif_w[ids]
+            segs.append(seg)
         return segs
 
     def next_conv_batch(self, defer_len: int = 16) -> list[dict]:
@@ -361,8 +385,11 @@ class CodeChunkStream:
                 if st + j + 1 < len(f):                            # successor exists
                     nx = f[st + j + 1][:dl].long()                 # ragged tail ok
                     tgt[b, :nx.numel()] = nx
-            segs.append({"input_ids": ids, "attention_mask": torch.ones_like(ids),
-                         "defer_tgt": tgt})
+            seg = {"input_ids": ids, "attention_mask": torch.ones_like(ids),
+                   "defer_tgt": tgt}
+            if self._sif_w is not None:
+                seg["surp_w"] = self._sif_w[ids]
+            segs.append(seg)
         return segs
 
     def next_conv_interleaved(self, n_streams: int, defer_len: int = 16,

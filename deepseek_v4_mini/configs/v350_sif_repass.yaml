@@ -1,0 +1,213 @@
+# v350_sif_repass — passe de continued-pretrain SIF sur le release phase 1
+# (décision user 2026-07-22) : re-former les codes de write avec le teacher
+# SIF (pooling a/(a+p), table unigram du mix, zéro ref) AVANT de re-greffer le
+# SFT persona. Rationale : la phase 1 a été kickée au teacher 'chunk' (average
+# — réfuté : DC component, intra-source 0.388 vs SIF 0.023 sur CE mix) ; le
+# SFT sif_hot a montré que des cibles SIF donnent un gradient utilisable dès
+# le step 1. Ici on paie ~3000 steps (~280M tokens, ~3h de 8xA100, ~$40) pour
+# donner au 386M des codes contenu-discriminants en poids propres.
+#
+# LANCEMENT (pod 8xA100, DDP) :
+#   torchrun --nproc_per_node=8 -m deepseek_v4_mini.code_defer_native \
+#     deepseek_v4_mini/configs/v350_sif_repass.yaml
+#
+# PRÉREQUIS POD : /workspace/data_cache = cache uint16 de la 10B (tar HF privé)
+# + le release AVEC optim à /workspace/ckpts/v350_phase1_release_final.pt.
+# Verdict de la passe : dist [surp] descend (le write imite des cibles SIF sur
+# data réelle) + GAP code/fineweb ne recule pas (la capacité phase 1 tient) ;
+# ensuite SFT persona local depuis le ckpt final => le juge réel.
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v350_phase1_10b (386M), inchangé
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: /workspace/data_cache
+  # Mix divmix officiel — poids et pools IDENTIQUES à v350_phase1_10b (cache
+  # déjà construit) ; seule addition : surprisal_mode sif => chaque seg chunk
+  # porte surp_w, la table unigram se construit au chargement (~1 s).
+  surprisal_mode: sif
+  sif_a: 1.0e-04
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.20
+    n_files: 90000
+    stream_cap: 150000
+  - name: stack_c
+    dataset: bigcode/the-stack
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    n_files: 60000
+    stream_cap: 200000
+  - name: stack_rust
+    dataset: bigcode/the-stack
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    n_files: 60000
+    stream_cap: 200000
+  - name: stack_js
+    dataset: bigcode/the-stack
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    n_files: 60000
+    stream_cap: 200000
+  - name: stack_sql
+    dataset: bigcode/the-stack
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    n_files: 40000
+    stream_cap: 150000
+  - name: stack_html
+    dataset: bigcode/the-stack
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    n_files: 40000
+    stream_cap: 150000
+  - name: stack_css
+    dataset: bigcode/the-stack
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    n_files: 40000
+    stream_cap: 150000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.10
+    n_files: 140000
+    stream_cap: 1200000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    n_files: 110000
+    stream_cap: 1000000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    n_files: 130000
+    stream_cap: 900000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    n_files: 130000
+    stream_cap: 800000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    n_files: 24000
+    stream_cap: 40000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    n_files: 100000
+    stream_cap: 200000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    n_files: 25000
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 6                            # par GPU, recette 10B éprouvée
+  n_files: 1000000
+  stream_cap: 90000
+
+training:
+  seed: 0
+  steps: 3000                              # ~280M tokens (~3% de la 10B)
+  grad_accum: 1
+  amp: true
+  init_from: /workspace/ckpts/v350_phase1_release_final.pt
+  # Warm restart : paire chaude validée au SFT sif_hot (muon 2.4e-4 / adam
+  # 1e-4, warmup 0). WSD post-anneal => le ckpt final sort FROID, prêt pour
+  # le SFT persona local.
+  lr: 1.0e-04
+  muon_lr: 2.4e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 0
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true
+  wsd_floor: 0.0
+  wsd_decay_start: 2500                    # = fin d'anneal : consolidation en
+  wsd_decay_shape: linear                  #   refroidissement
+  tf32: true
+  grad_checkpoint: false
+  skip_final_eval: false
+  log_every: 10
+  eval_every: 100                          # décision user 2026-07-22 (50-100) ;
+  eval_convs: 8                            #   ~30 évals ≈ +1h pod, assumé
+  eval_depths:
+  - 2
+  - 4
+  - 6
+  - 8
+  eval_depth_convs: 8
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 250
+  save_dir: /workspace/checkpoints/v350_sif_repass
+  metrics_file: /workspace/runs/v350_sif_repass/metrics.jsonl
+  # AUCUN flag de stack (définition phase 1) — la cascade/no_reset restent
+  # affaire du SFT.
+
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  target: surprisal                        # cibles SIF via surp_w du stream
+  anneal:                                  # 50-83% des steps : β=1 jusqu'à
+  - 1500                                   # 1500, fondu 1000 steps, 500 steps
+  - 2500                                   # natifs en refroidissement WSD
