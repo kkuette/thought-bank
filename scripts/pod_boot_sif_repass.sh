@@ -2,7 +2,7 @@
 # Boot pod v350_sif_repass — 8xA100, image pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel.
 # Prérequis : HF_TOKEN dans l'env (passé au create pod). Rejouable (idempotent).
 set -euo pipefail
-COMMIT=c0132c8
+COMMIT=${COMMIT:-c0132c8}   # surchargeable par env (le déploiement passe le sha exact)
 CFG=deepseek_v4_mini/configs/v350_sif_repass.yaml
 
 export DEBIAN_FRONTEND=noninteractive
