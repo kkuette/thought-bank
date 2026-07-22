@@ -167,6 +167,97 @@ completion; not a crash.
 ---
 
 
+## 2026-07-17 (2) — Ablations schedule au twin 97M : WSD 85% gagne partout, l'anneal teacher est une affaire de convs absolues ; prod recalée [600,1200] + 16660
+
+**Question.** Avant de payer la run 10B : l'anneal teacher [2850,4300] de
+`v350_phase1_10b.yaml` (proportion héritée du twin, ~730k convs de teacher) et
+le `wsd_decay_start` à 60% (convention DeepSeek) sont-ils bien réglés ? Deux
+ablations à une variable chacune sur GPUrig0, contre la baseline
+`v350_curr_p1` (même seed, même data — trajectoires identiques hors points de
+schedule, ic 10.863 vs 10.862 @10).
+
+**Job 121 — `v350_p1_wsd85` (decay 700→1275, soit 85%) : VERT net.**
+ic éval moyen @1500 : **5.288 vs 5.379 baseline (−0.091 nat)**, mieux sur
+**14/14 sources** (−0.03 à −0.17). defer_car +0.033 (bruit), defer_gap plat,
+headroom 0.679 vs 0.637. Le plateau prolongé à muon_lr 7.5e-04 jusqu'à 85% est
+resté stable. Cohérent avec la littérature WSD (decay sur les 10-20% finaux) :
+le decay à 60% gaspillait 40% de la run à LR décroissant.
+
+**Job 120 — `v350_p1_annealfast` (anneal [300,450]→[100,200]) : le mécanisme
+tient, le timing en progression compte.** Post-β→0 à 200, defer suit ic sur
+toute la trajectoire (gap final 1.225 vs 1.234) : **800 convs de teacher
+suffisent au kick du read**, pas de point fixe ignore-banque. Coût : ic +0.041,
+defer_car +0.048, systématique 14/14 sources, headroom 0.637→0.428 — anneal à
+step 100 = trop tôt dans la *progression* (loss encore ~8.0), pas un échec du
+mécanisme.
+
+**Verdict pour la prod (`v350_phase1_10b.yaml`, recalée ce jour).** Le kick se
+compte en convs absolues, pas en proportion de la run : [2850,4300] × 256
+convs/step = 730k convs de teacher, 300× le twin, pour un distill_weight 2.0
+qui concurrence la loss pendant 22% de la run. Recalage **anneal [600,1200]**
+(153k convs pré-anneal = 190× le [100,200] prouvé suffisant, et step 600 sera
+bien plus avancé en loss qu'un step 100 du twin grâce au batch 256) et
+**wsd_decay_start 16660** (85%). Note technique : les deux jobs ont dû passer
+`grad_checkpoint: true` (B4×512×8 OOM sur 8GB — même gradient, recompute).
+
+Repro : `deepseek_v4_mini/configs/farm/v350_p1_annealfast.yaml`,
+`.../v350_p1_wsd85.yaml`, metrics `/mnt/tb/runs/farm_v350_p1_{annealfast,wsd85}/`
+vs `/mnt/tb/runs/farm_v350_curr_p1/`.
+
+---
+
+## 2026-07-17 — Bring-up + validation 8× A100 : la phase 1 du 350M passe de $850 à ~$270 (depth_sync, compile, B32) ; GO technique acquis
+
+**Contexte.** Deux locations courtes de la même machine 8× A100 SXM4 80GB
+NVLink (Vast 44773580, $9.25/h ; contrats 45123153 puis 45132091, ~$25 + ~$13)
+pour dérisquer la run 10B de `v350_phase1_10b.yaml` (386M réels, chemin batché
+v2b_mix, aucun flag de stack).
+
+**Découverte n°1 — la taxe straggler DDP (2.6×).** Chaque rang tirait sa
+profondeur de conv m indépendamment ⇒ le step dure comme le rang le plus
+profond : mono 4.9 s/step vs DDP 12.6. Fix `data.depth_sync: true` (commit
+749c6dd) : RNG d'ancre rank-invariante, m identique sur les 8 rangs par step,
+legacy bit-identique flag OFF. Validé pod : **12.6 → 5.5 s/step eager B24**.
+
+**Découverte n°2 — le goulot est le host, pas le GPU.** 8 boucles data Python
+à 99% d'UN cœur chacune (load hôte 8/128) pendant que les GPU respirent.
+Conséquences : B12→B24→B32 à s/step ~constant (+33% de tokens gratuits à
+chaque doublement partiel), et les 256 vCPUs d'une autre offre n'apporteraient
+rien (single-core bound). Levier futur : prefetch threadé de l'assemblage.
+
+**Découverte n°3 — compile, utile mais pas pour la vitesse.** `training.
+compile` (wrap modèle seul, `dynamic=False` obligatoire — shapes statiques par
+construction, sinon le recompute du grad_checkpoint prend un graphe dynamique,
+CheckpointError, pytorch #166926). **torch 2.5.1 crashe même avec le fix**
+(variante "different metadata") ; torch ≥ 2.6 requis. Gain vitesse +5-11%
+seulement : le dispatch MoE (shapes data-dependent) sature recompile_limit et
+retombe en eager. MAIS **−29% de mémoire allouée** (31.5 → 22.3G à B24) — et
+c'est ÇA qui paie : la marge dégagée rend B32 sûr (69.5G/80 réservés, pics
+m=8 inclus). Loss identique à eager au bruit près (ic 10.939 vs 10.938 @30,
+3090 ; trajectoires saines sur pod).
+
+**Bilan économique (croisières par deltas de moyenne cumulative, fenêtres
+comparables — même séquence de m grâce à depth_sync) :**
+
+| config | s/step | tok/s | 10B |
+|---|---|---|---|
+| B24+GC legacy (straggler) | 12.6 | ~33k | ~$850 |
+| B24+GC+depth_sync eager | ~5.5 | ~75k | ~$380 |
+| B24+GC+sync+compile | ~5.2 | ~80k | ~$360 |
+| **B32+GC+sync+compile** | **~5.4** | **~100k** | **~$260-280** |
+
+Config prod recalée en conséquence (commit b8e4a1a) : batch 32, 19600 steps,
+warmup 400, wsd_start 11800, anneal teacher [2850,4300], save/eval 500.
+Divers : B6 sans grad_checkpoint = OOM step 1 (77 GiB d'activations) ; mini-
+cache de mesure embarqué dans le tar de code (2.2 MB, `v350_sync_val.yaml`,
+zéro download HF au boot des pods de test) ; image prod = pytorch 2.6.0+.
+
+**Verdict.** Tout le dérisquage technique de la phase 1 est acquis : le GO
+n'attend plus que la recharge de crédit Vast (~$150 au-dessus des $120
+restants).
+
+---
+
 ## 2026-07-14 (3) — Saturation scan (capacity_deep, jobs 113/114/115) : le registre ne meurt JAMAIS (jusqu'à 64× la capacité), la page contribue partout en milli-nats (↑ avec la profondeur, ↑ sources structurées) mais ne devient jamais adressée
 
 **Setup.** Probe `capacity_deep` sur 3 checkpoints : v3_reach (d1, job 113, 2 sources,

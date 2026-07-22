@@ -44,8 +44,8 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
                  dataset: str, data_dir: str = "", config_name: str = "",
                  content_key: str = "content", min_chunks: int = 1,
                  stream_skip: int = 0, max_chunks_per_file: int = 12,
-                 stream_cap: int = 60000, cache_dir: str = "data_cache"
-                 ) -> list[list[torch.Tensor]]:
+                 stream_cap: int = 60000, cache_dir: str = "data_cache",
+                 revision: str = "") -> list[list[torch.Tensor]]:
     """Build (or load from disk cache) ONE source's ragged chunk lists."""
     L = int(seq_len)
     label = f"{split}:{dataset.split('/')[-1]}{'/' + config_name if config_name else ''}"
@@ -58,7 +58,8 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
         key = "|".join(str(v) for v in (
             dataset, data_dir, split, L, max_chunks_per_file, n_files, stream_cap,
             content_key, config_name, min_chunks, stream_skip,
-            getattr(tokenizer, "name_or_path", "?"), len(tokenizer)))
+            getattr(tokenizer, "name_or_path", "?"), len(tokenizer))
+            + ((revision,) if revision else ()))  # appended only if set: old keys intact
         h = hashlib.md5(key.encode()).hexdigest()[:16]
         cache_path = os.path.join(cache_dir, f"chunks_{split}_{h}.pt")
         if os.path.exists(cache_path):
@@ -75,6 +76,9 @@ def _load_source(tokenizer, *, split: str, seq_len: int, n_files: int,
     kw = {}
     if data_dir: kw["data_dir"] = data_dir
     if config_name: kw["name"] = config_name            # HF *config* (e.g. fineweb dumps)
+    # revision: e.g. refs/convert/parquet — datasets>=4 dropped script datasets;
+    # the auto-converted parquet branch keeps them loadable (scientific_papers).
+    if revision: kw["revision"] = revision
     ds = load_dataset(dataset, split="train", streaming=True, **kw)
     if stream_skip:
         ds = ds.skip(int(stream_skip))                  # per-pod shard offset
@@ -193,10 +197,19 @@ class CodeChunkStream:
                  min_chunks: int = 1, stream_skip: int = 0,
                  sources: list[dict] | None = None,
                  var_chunk: list | tuple | None = None,
-                 surprisal_mode: str = "none", sif_a: float = 1e-4) -> None:
+                 surprisal_mode: str = "none", sif_a: float = 1e-4,
+                 depth_sync_seed: int | None = None) -> None:
         self.tok = tokenizer
         self.L = int(seq_len); self.K = int(chunks_per_conv); self.B = int(batch)
         self.rng = random.Random(seed + (0 if split == "train" else 101))
+        # depth_sync_seed (DDP, batched path): rank-INVARIANT rng for the anchor/m
+        # draw of next_conv_batch, so every rank runs the same conv depth per step.
+        # Step time is ~linear in m, and a DDP step lasts as long as the deepest
+        # rank: independent m draws cost ~2.6x the mean (measured 12.6 vs 4.9
+        # s/step, 8x A100). File lists are identical across ranks (the shard is
+        # the sampling seed only), so a shared seed keeps the draws in lockstep.
+        self.rng_m = (random.Random(depth_sync_seed + (0 if split == "train" else 101))
+                      if depth_sync_seed is not None else self.rng)
         # var_chunk=[lo, hi]: VARIABLE chunk lengths ~ U[lo, hi], re-cut at sampling
         # time from the cached fixed-L slices (contiguous, so cat() reconstructs the
         # token stream — the tokenized cache is untouched). Breaks the fixed-512
@@ -225,6 +238,7 @@ class CodeChunkStream:
                     content_key=s.get("content_key", "content"),
                     min_chunks=int(s.get("min_chunks", 1)),
                     stream_skip=int(s.get("stream_skip", 0)),
+                    revision=s.get("revision", ""),
                     stream_cap=int(s.get("stream_cap", stream_cap)), **common))
                 self.src_weights.append(w)
                 self.src_names.append(s.get("name") or s["dataset"].split("/")[-1])
@@ -354,16 +368,20 @@ class CodeChunkStream:
         mix); a source with no file deep enough for this m is renormalized away."""
         assert self.B > 1, "next_conv_batch requires batch>1 (use next_conv)"
         dl = int(defer_len)
-        # anchor: source by weight, then any file with a defer pair (by_depth[1])
+        # anchor: source by weight, then any file with a defer pair (by_depth[1]).
+        # rng_m == rng unless depth_sync_seed is set (then the anchor/m draw is
+        # rank-invariant — same source pick, same candidate, same m everywhere).
         while True:
-            si = self._pick_source()
+            si = self._pick_source(self.rng_m)
             cands = self.src_by_depth[si].get(1)
             if cands:
                 break
-        f_a, nfull_a = cands[self.rng.randrange(len(cands))]
-        m = self.rng.randint(2, min(self.K, nfull_a)) if nfull_a >= 2 else 1
-        # fill the batch: anchor + B-1 files admitting depth m (weighted sources)
-        picks = [(f_a, nfull_a)]
+        f_a, nfull_a = cands[self.rng_m.randrange(len(cands))]
+        m = self.rng_m.randint(2, min(self.K, nfull_a)) if nfull_a >= 2 else 1
+        # fill the batch: anchor + B-1 files admitting depth m (weighted sources).
+        # depth_sync: the anchor is identical on every rank, so it must NOT enter
+        # the batch (B-fold cross-rank duplication) — all B slots fill locally.
+        picks = [] if self.rng_m is not self.rng else [(f_a, nfull_a)]
         ok = [i for i in range(len(self.src_files)) if self.src_by_depth[i].get(m)]
         wk = [self.src_weights[i] for i in ok]; wsum = sum(wk)
         while len(picks) < self.B:
@@ -482,10 +500,11 @@ class CodeChunkStream:
                 segs[pos]["addr_tgt"] = at
         return segs
 
-    def _pick_source(self) -> int:
+    def _pick_source(self, rng: random.Random | None = None) -> int:
+        rng = rng or self.rng
         if len(self.src_files) == 1:
             return 0
-        r = self.rng.random() * self._wsum
+        r = rng.random() * self._wsum
         for i, w in enumerate(self.src_weights):
             r -= w
             if r <= 0:

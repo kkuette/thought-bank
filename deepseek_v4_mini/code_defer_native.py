@@ -377,8 +377,23 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # drives it. Opt-in; graph breaks (MoE/sinkhorn/einsum) measured in the sweep.
     base = model
     if bool(t.get("compile", False)):
-        model = torch.compile(model)
-        print("compile: torch.compile(model) enabled", flush=True)
+        # dynamic=False : nos shapes sont statiques par construction ([B,512] et
+        # [B,16] ; m ne change que le NOMBRE d'appels) — un graphe statique par
+        # shape. Sans ça, la transition automatique statique->dynamique fait
+        # choisir au recompute du grad_checkpoint un graphe différent du forward
+        # (CheckpointError "different number of tensors", pytorch #166926).
+        # cache_size_limit relevé : le mem_bank flippe requires_grad (write on/off)
+        # => dynamo recompile a chaque flip ; la limite par defaut (8) est crevee
+        # vers step 60 (observe pod 45185048 2026-07-17) et le fallback eager
+        # desynchronise les graphes entre rangs DDP => deadlock NCCL (100% util,
+        # ~95W). On monte la limite pour que les 8 rangs recompilent en lockstep
+        # (depth_sync garantit m identique) sans jamais tomber en fallback.
+        from torch._dynamo import config as _dynamo_config
+        _dynamo_config.cache_size_limit = 256
+        _dynamo_config.accumulated_cache_size_limit = 1024
+        model = torch.compile(model, dynamic=False)
+        print("compile: torch.compile(model, dynamic=False) enabled "
+              "(dynamo cache_size_limit=256)", flush=True)
 
     # grad_checkpoint (opt-in): rematerialize each model forward during backward.
     # The conv loop keeps EVERY chunk's graph alive until the single end-of-conv
@@ -500,9 +515,14 @@ def main(cfg_path: str, resume: bool = False) -> None:
     # the tokenized cache alone first (concurrent misses race on the .tmp
     # rename), the barrier releases the others onto a guaranteed cache hit.
     train_seed = sd["seed"] + 9973 * ddp_rank
+    # depth_sync (opt-in): rank-invariant anchor/m rng in next_conv_batch, so all
+    # ranks run the same conv depth per step (a DDP step lasts as long as the
+    # deepest rank — independent draws cost ~2.6x the mean step time).
+    depth_sync = bool(d.get("depth_sync", False))
     if ddp_world > 1 and ddp_rank != 0:
         torch.distributed.barrier()
-    train_stream = CodeChunkStream(tok, split="train", **{**sd, "seed": train_seed})
+    train_stream = CodeChunkStream(tok, split="train", **{**sd, "seed": train_seed},
+                                   depth_sync_seed=sd["seed"] if depth_sync else None)
     eval_stream  = CodeChunkStream(tok, split="held",
                                    **{**sd, "batch": 1, "surprisal_mode": "none"})  # eval = batch=1 paths
     if ddp_world > 1 and ddp_rank == 0:
@@ -803,7 +823,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
             ema_ic, ema_d = ck.get("ema_ic"), ck.get("ema_d")
             if ck.get("rng_torch") is not None: torch.set_rng_state(ck["rng_torch"])
             if ck.get("rng_cuda") is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(ck["rng_cuda"])
+                # migration de world size (ex. 8->6 GPUs) : le ck porte un état
+                # RNG par device du node d'origine — ne restaurer que les nôtres
+                torch.cuda.set_rng_state_all(ck["rng_cuda"][:torch.cuda.device_count()])
             # DDP: the checkpoint holds rank0's stream RNG — restoring it on every
             # rank would make them all sample the SAME convs. Rank0 resumes its
             # exact stream; other ranks re-seed on (rank, start_step) instead.
@@ -811,6 +833,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 train_stream.rng.setstate(ck["rng_train_stream"])
             elif ddp_rank != 0:
                 train_stream.rng.seed(train_seed + start_step)
+            # depth_sync: rng_m must stay in LOCKSTEP across ranks after resume —
+            # deterministic re-seed on (base seed, start_step), same everywhere.
+            if train_stream.rng_m is not train_stream.rng:
+                train_stream.rng_m.seed(sd["seed"] + start_step)
             if ck.get("rng_eval_stream") is not None:
                 eval_stream.rng.setstate(ck["rng_eval_stream"])
             if ck.get("rng_chat_stream") is not None and chat_stream is not None:
@@ -1069,6 +1095,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
             (total / grad_accum).backward()          # mean over the G accumulated convs
             if no_reset_files > 1 or nrf_never:
                 # graph freed per file; the carried bank is data, not gradient path
+                # guard local (supersède le nan_to_num du pod) : banque non
+                # finie => carry RESET vie neuve, sinon carry propre
                 nb = bank.detach() if bank is not None else None
                 if nb is not None and not bool(torch.isfinite(nb).all()):
                     print(f"[nan-guard] step {step} conv {_g}: banque non finie, "
@@ -1110,28 +1138,36 @@ def main(cfg_path: str, resume: bool = False) -> None:
             torch.cuda.synchronize(); _t_ar = time.time()
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(),
                                             float(t.get("grad_clip", 1.0)))
+        # DDP-safe (pod 10B) : après l'all-reduce les grads sont identiques sur
+        # tous les ranks => ce check prend la même branche partout (pas de désync).
         if not bool(torch.isfinite(gn)):
             # LE cas intéressant pour l'hypothèse GC : loss finie mais grads NaN
             # (recompute qui diverge du forward). Dump du step complet + poids
             # (encore sains puisque le step est sauté).
-            _dp = os.path.join(save_dir, f"nan_gradstep_{step}.pt")
-            try:
-                torch.save({"step": step,
-                            "convs": [{"segs": [{k: (v.cpu() if torch.is_tensor(v)
-                                                     else v) for k, v in s.items()}
-                                                for s in c["segs"]],
-                                       "bank_in": None if c["bank_in"] is None
-                                       else c["bank_in"].cpu(),
-                                       "casc": c["casc"],
-                                       "n_evict": c["n_evict"]}
-                                      for c in _step_convs]}, _dp)
-            except Exception as e:
-                _dp = f"dump raté: {e}"
-            _wp = os.path.join(save_dir, "nan_weights.pt")
-            if not os.path.exists(_wp):
-                torch.save({"step": step, "model": base.state_dict()}, _wp)
-            print(f"[nan-guard] step {step}: grad norm non finie, opt.step SAUTÉ "
-                  f"— repro {_dp}", flush=True)
+            if ddp_rank == 0:
+                # dump rank0 seulement : les convs diffèrent par rank, 8 writes
+                # concurrents du même fichier = corruption
+                _dp = os.path.join(save_dir, f"nan_gradstep_{step}.pt")
+                try:
+                    torch.save({"step": step,
+                                "convs": [{"segs": [{k: (v.cpu() if torch.is_tensor(v)
+                                                         else v) for k, v in s.items()}
+                                                    for s in c["segs"]],
+                                           "bank_in": None if c["bank_in"] is None
+                                           else c["bank_in"].cpu(),
+                                           "casc": c["casc"],
+                                           "n_evict": c["n_evict"]}
+                                          for c in _step_convs]}, _dp)
+                except Exception as e:
+                    _dp = f"dump raté: {e}"
+                _wp = os.path.join(save_dir, "nan_weights.pt")
+                if not os.path.exists(_wp):
+                    torch.save({"step": step, "model": base.state_dict()}, _wp)
+                # diagnostic pod 10B : quels modules portent les grads non finis
+                bad = [n for n, p in model.named_parameters()
+                       if p.grad is not None and not torch.isfinite(p.grad).all()]
+                print(f"[nan-guard] step {step}: grad norm non finie ({len(bad)} "
+                      f"tenseurs: {bad[:6]}), opt.step SAUTÉ — repro {_dp}", flush=True)
             opt.zero_grad(set_to_none=True)
         else:
             opt.step()
@@ -1141,8 +1177,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
                   f"allreduce {_t_ar - _t_bwd:.2f}s  clip+opt {time.time() - _t_ar:.2f}s",
                   flush=True)
         ic_v /= max(ic_cnt, 1); d_v /= max(d_cnt, 1)
-        ema_ic = ic_v if ema_ic is None else 0.95 * ema_ic + 0.05 * ic_v
-        ema_d  = d_v  if ema_d  is None else 0.95 * ema_d  + 0.05 * d_v
+        if ic_v == ic_v:   # un batch NaN isolé ne doit pas polluer l'EMA à vie
+            ema_ic = ic_v if ema_ic is None else 0.95 * ema_ic + 0.05 * ic_v
+        if d_v == d_v:
+            ema_d  = d_v  if ema_d  is None else 0.95 * ema_d  + 0.05 * d_v
         if a_cnt:
             a_v /= a_cnt
             ema_a = a_v if ema_a is None else 0.95 * ema_a + 0.05 * a_v
@@ -1213,7 +1251,10 @@ def main(cfg_path: str, resume: bool = False) -> None:
             for src_name, es in eval_views:
                 tag = f" [{src_name}]" if src_name else ""
                 pfx = f"{src_name}/" if src_name else ""
-                m = evaluate(model, es, device, think_id, blank_id, defer_len,
+                # eval sur `base` (non-compile) : les convs d'eval ont des largeurs
+                # B=1 toutes differentes => un graphe dynamo par shape, premier
+                # eval bloque >13 min a step 500 (pod 45191495). Eager = 1-2 min.
+                m = evaluate(base, es, device, think_id, blank_id, defer_len,
                              int(t.get("eval_convs", 8)), balw, amp, delta=delta)
                 print(f"[eval @{step}]{tag} ic_ppl {m['ic_ppl']:.1f} | defer car {m['defer_car']:.3f} "
                       f"res {m['defer_res']:.3f} GAP {m['defer_gap']:+.3f} GAP0 {m['defer_gap0']:+.3f} "
@@ -1228,7 +1269,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         writer.add_scalar(f"eval/{pfx}{k}", v, step)
                 if eval_depths and (depth_srcs is None or not src_name
                                     or src_name in depth_srcs):
-                    bd = evaluate_by_depth(model, es, device, think_id, blank_id,
+                    bd = evaluate_by_depth(base, es, device, think_id, blank_id,
                                            defer_len, eval_depths, eval_depth_convs, amp,
                                            delta=delta)
                     curve = "  ".join(f"d{d}:{bd[d]['gap']:+.3f}(n{bd[d]['n']})" for d in eval_depths)
