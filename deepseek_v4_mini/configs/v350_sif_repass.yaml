@@ -191,6 +191,7 @@ training:
   wsd_decay_shape: linear                  #   consolidation en refroidissement
   tf32: true
   grad_checkpoint: true                    # OBLIGATOIRE à 386M B32 (recette 10B)
+  gc_save_topk: false                      # OFF (décision user post-fix clamp) : +35% step
   compile: true                            # torch>=2.6 (image cuda12.4 devel min)
   skip_final_eval: true
   log_every: 10
