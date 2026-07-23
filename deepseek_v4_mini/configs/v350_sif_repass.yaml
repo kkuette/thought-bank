@@ -172,7 +172,10 @@ data:
 
 training:
   seed: 0
-  steps: 6000                              # 4 rangs : ≈1.65B tokens
+  steps: 3750                              # GABARIT 8x (reprise step_1500 tirée en
+                                           # 4 rangs) : les 4500 steps restants du plan
+                                           # 4x deviennent 2250 à 256 convs/step —
+                                           # mêmes convs absolues, moitié du temps mur
   grad_accum: 1
   amp: true
   init_from: /workspace/ckpts/v350_phase1_release_final.pt
@@ -188,7 +191,7 @@ training:
   defer_weight: 1.0
   wsd_decay: true
   wsd_floor: 0.0
-  wsd_decay_start: 2500                    # = fin d'anneal (décision user) :
+  wsd_decay_start: 2000                    # = fin d'anneal (décision user) :
   wsd_decay_shape: linear                  #   consolidation en refroidissement
   tf32: true
   grad_checkpoint: true                    # OBLIGATOIRE à 386M B32 (recette 10B)
@@ -212,7 +215,7 @@ training:
   eval_depth_sources:
   - codeparrot
   - fineweb
-  save_every: 500                          # 12 jalons x 3.2G ≈ 38G volume
+  save_every: 250                          # même intervalle en tokens que 500@4x
   save_dir: /workspace/checkpoints/v350_sif_repass
   metrics_file: /workspace/runs/v350_sif_repass/metrics.jsonl
   # AUCUN flag de stack (définition phase 1) — la cascade/no_reset restent
@@ -223,6 +226,6 @@ teacher:
   distill_weight: 2.0
   target: surprisal                        # cibles SIF via surp_w du stream
   anneal:                                  # décision user 2026-07-23 (reprise du
-  - 1500                                   # step_1500 : defer plafonne dès ~500,
-  - 2500                                   # le β=1 restant n'achète rien) —
-                                           # fondu 1500→2500, WSD dès 2500
+  - 1500                                   # step_1500 : defer plafonne dès ~500) ;
+  - 2000                                   # échelle 8x : fondu 1500→2000 (=1500→2500
+                                           # du plan 4x), WSD dès 2000
