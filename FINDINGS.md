@@ -37,6 +37,65 @@ test this — before scale.
 
 ---
 
+## 2026-07-23 — fastpath phase 1 : 4 flags budget-compute (prefetch, chunk_budget, allreduce_bf16, compile_cache_dir) — smokes 97M VERTS, gains à chiffrer au prochain bring-up
+
+Suite directe des découvertes n°1-3 du pod 10B (2026-07-17) : le host-bound
+(8 boucles data single-core à 99%) et le m variable (moyenne ~3.9 vs K=8 ⇒
+coûts fixes Muon+all-reduce+host amortis sur moitié moins de tokens que le
+pire cas qui dimensionne la VRAM). Constat préalable : le chemin batché n'a
+AUCUN padding à éliminer (chunks pleins [B, L] uniformes) — le gain d'une
+« concaténation » est dans l'amortissement des coûts fixes, pas dans les
+tokens perdus. Quatre flags dans `code_defer_native.py`, tous OPT-IN,
+défauts = comportement historique bit-identique :
+
+- **`training.prefetch: true`** — thread producteur unique qui tire les convs
+  batchées en avance (queue FIFO depth 2, `pin_memory`, H2D `non_blocking`) :
+  le host tourne PENDANT le compute GPU au lieu de le sérialiser. Chemin
+  batché pur seulement (asserts : pas de chat/reset_announce/interleave/
+  no_reset). L'ordre des tirages rng est préservé (producteur unique, FIFO) —
+  vérifié : séquence de convs identique à la baseline sur 20 steps. Nota :
+  la rng du stream sauvée en ckpt court ≤2 convs en avance du step exécuté.
+- **`training.chunk_budget: N`** — accumulation DYNAMIQUE : on enchaîne des
+  convs (banque reset entre elles, distribution d'entraînement INTACTE)
+  jusqu'à N chunks par step ⇒ step time uniforme au pire-cas VRAM, ~m̄/N fois
+  moins d'opt-steps par token, grads /= nb convs (sémantique grad_accum).
+  Requiert depth_sync (la suite des m est rank-invariante ⇒ même nb de convs
+  sur tous les rangs — lockstep DDP vérifié sur 2 rangs simulés × 50 steps).
+  ATTENTION : tokens/opt-step monte (~N/m̄ ×) ⇒ re-checker lr/schedules.
+- **`training.allreduce_bf16: true`** — buckets de grads cast bf16 pour
+  l'all-reduce (÷2 le volume NCCL), recast fp32 avant division. À valider
+  par A/B court en DDP réel avant un long run (précision : somme de W grads).
+- **`training.compile_cache_dir: <dir>`** — cache inductor+triton PERSISTANT
+  (TORCHINDUCTOR_CACHE_DIR + TRITON_CACHE_DIR, setdefault ⇒ l'export shell
+  garde la main). Smoke 3090/97M : à froid ~12 min (cache 429 MB écrits), à
+  chaud 4 min 20 total — ~2.7×, et le s/step cumulatif fond au fil des hits
+  (85→41 s/step sur 6 steps). Clé de cache = arch GPU + version torch : un
+  cache A100 ne sert PAS sur une autre arch ; protocole pod = warmer un node,
+  tar avec le data cache, réchauffer restarts et nodes frères.
+- **Instrumentation toujours active** (gratuite) : `chunks/step` + `data`
+  (attente réelle du tirage) dans la ligne de log, `perf/chunks_per_step`,
+  `perf/data_wait_s`, `perf/s_per_step` dans tensorboard, ligne TB_DDP_PROF
+  enrichie (`data-wait`, `chunks (n convs)`). C'est le harnais pour régresser
+  s/step = intercept + pente×m au prochain bring-up et trancher combien
+  chunk_budget paie réellement.
+
+Smokes (3090, twin 97M dims v2b_mix, B4, 20 steps, config
+`v350_fastpath_smoke.yaml` + variantes scratchpad) : baseline vs prefetch =
+mêmes convs (chunks/step 2.0/2.8/3.0/3.2 identiques), le jitter de loss
+résiduel est le non-déterminisme d'init (une baseline re-run diverge PLUS du
+run 1 que le run prefetch — l'init modèle n'est pas torch-seedée) ; budget 8
+⇒ chunks/step 8.4-9.8 (léger overshoot = la dernière conv finit), losses
+saines, VRAM stable. Les s/chunk locaux ne sont PAS des mesures (charge GPU
+concurrente, WSL2) — verdict chiffré au prochain pod via TB_DDP_PROF.
+
+**Non fait, déclencheurs notés** : overlap all-reduce/backward (seulement si
+le split prof montre la comm dominante après bf16+budget), pool d'assemblage
+multi-thread (seulement si data-wait > 0 avec prefetch au B et s/step réels),
+fp8/ns_steps/save asynchrone (après mesure). Repro :
+`python -m deepseek_v4_mini.code_defer_native deepseek_v4_mini/configs/v350_fastpath_smoke.yaml`
+
+---
+
 ## 2026-07-17 — SFT école de maths (marche 2 phase 2, jobs 117→119) : le protocole s'apprend en 200 steps, l'arithmétique n'émerge pas en 800 — verdict Δ ILLISIBLE (plancher), pas ROUGE ; le mécanisme code ne paie rien
 
 **Setup.** `sft_school.yaml` : SFT-chaud 800 steps sur `v350_rehearsal/final.pt`

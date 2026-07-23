@@ -391,6 +391,20 @@ def main(cfg_path: str, resume: bool = False) -> None:
         from torch._dynamo import config as _dynamo_config
         _dynamo_config.cache_size_limit = 256
         _dynamo_config.accumulated_cache_size_limit = 1024
+        # compile_cache_dir (opt-in) : cache inductor+triton PERSISTANT — les
+        # kernels compilés survivent aux restarts (préemption pod, resume) au
+        # lieu de repayer la compilation à froid à chaque boot. Sur pod :
+        # pointer sous /workspace (volume persistant), tar-able vers HF avec le
+        # data cache pour réchauffer un pod NEUF (clé de cache = arch GPU +
+        # version torch : A100+même image => hits). Env lues à la PREMIÈRE
+        # compilation (premier forward), donc les poser ici suffit ; setdefault
+        # => un export shell garde la main.
+        _cc = t.get("compile_cache_dir")
+        if _cc:
+            os.makedirs(os.path.join(_cc, "triton"), exist_ok=True)
+            os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _cc)
+            os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_cc, "triton"))
+            print(f"compile: cache persistant → {_cc}", flush=True)
         model = torch.compile(model, dynamic=False)
         print("compile: torch.compile(model, dynamic=False) enabled "
               "(dynamo cache_size_limit=256)", flush=True)
@@ -706,6 +720,43 @@ def main(cfg_path: str, resume: bool = False) -> None:
         assert cascade_depth > 0, "reach_prob: il faut une page (cascade_depth >= 1)"
         assert int(t.get("no_reset_files", 1)) > 1, \
             "reach_prob: le pool vit dans le carry (no_reset_files > 1)"
+    # ── Optimisations budget-compute (2026-07-23, tous OPT-IN, défauts =
+    # comportement historique bit-identique). Contexte pod 10B : 8 boucles data
+    # single-core à 99% (host-bound — B24→B32 était gratuit), m moyen ~3.9 vs
+    # K=8 => coûts fixes par step (Muon + all-reduce + host) amortis sur moitié
+    # moins de tokens que le pire cas dimensionnant la VRAM.
+    #   prefetch        : thread producteur qui tire les convs batchées EN AVANCE
+    #                     (queue depth 2, pin_memory) — le host tourne pendant le
+    #                     compute GPU au lieu de le sérialiser. Chemin batché PUR.
+    #                     NB resume : la rng du stream sauvée court <=2 convs en
+    #                     avance du step exécuté (les dumps nan portent les segs
+    #                     eux-mêmes, la repro d'incident n'en dépend pas).
+    #   chunk_budget N  : accumulation DYNAMIQUE — on enchaîne des convs (banque
+    #                     reset entre elles, distribution d'entraînement INTACTE)
+    #                     jusqu'à N chunks par step avant l'opt.step => step time
+    #                     uniforme au pire-cas VRAM, ~m̄/N fois moins d'opt-steps
+    #                     par token (grads normalisés par le nb de convs, =
+    #                     sémantique grad_accum). depth_sync requis : la suite
+    #                     des m est rank-invariante => même nb de convs partout,
+    #                     DDP reste en lockstep. tokens/step change (~N/m̄ x) :
+    #                     re-checker lr/schedules au moment de config.
+    #   allreduce_bf16  : all-reduce des buckets de grads en bf16 (÷2 le volume
+    #                     NCCL). Perte de précision ~1 ULP bf16 sur la somme de
+    #                     W grads fp32 — à valider par A/B court avant un long run.
+    prefetch = bool(t.get("prefetch", False))
+    chunk_budget = int(t.get("chunk_budget", 0) or 0)
+    ar_bf16 = bool(t.get("allreduce_bf16", False))
+    if prefetch:
+        assert train_stream.B > 1, "prefetch: chemin batché (batch_size > 1) uniquement"
+        assert (chat_stream is None and ra_prob == 0.0 and not ilv_on
+                and no_reset_files == 1), \
+            "prefetch: chemin batché PUR (pas de chat/reset_announce/interleave/no_reset)"
+    if chunk_budget:
+        assert train_stream.B > 1 and depth_sync, \
+            "chunk_budget: chemin batché + depth_sync requis (lockstep du nb de convs)"
+        assert grad_accum == 1, "chunk_budget remplace grad_accum (laisser grad_accum: 1)"
+        assert chat_stream is None and ra_prob == 0.0, \
+            "chunk_budget: chemin batché pur (pas de chat/reset_announce)"
     lam = float(t.get("defer_weight", 1.0))
     wsd = bool(t.get("wsd_decay", True)); wsd_floor = float(t.get("wsd_floor", 0.0))
     decay_start = int(t.get("wsd_decay_start", int(steps * 0.66)))
@@ -853,7 +904,32 @@ def main(cfg_path: str, resume: bool = False) -> None:
         else:
             print("resume: no checkpoint found, starting fresh.", flush=True)
 
+    _pf_q = None
+    if prefetch:
+        # Producteur UNIQUE de train_stream à partir d'ici (l'ordre des tirages
+        # rng est préservé : queue FIFO, un seul thread). Démarré APRÈS le
+        # resume pour produire depuis l'état rng restauré. Daemon : meurt avec
+        # le process (fin de run / préemption).
+        import threading, queue as _pyqueue
+        _pf_q = _pyqueue.Queue(maxsize=2)
+
+        def _pf_worker():
+            while True:
+                segs_ = train_stream.next_conv_batch(defer_len)
+                for s_ in segs_:
+                    for k_, v_ in s_.items():
+                        if torch.is_tensor(v_):
+                            s_[k_] = v_.pin_memory()
+                _pf_q.put(segs_)
+
+        threading.Thread(target=_pf_worker, daemon=True).start()
+        print(f"prefetch: ON (queue 2, pin_memory, H2D non_blocking)", flush=True)
+    if chunk_budget:
+        print(f"chunk_budget: {chunk_budget} chunks/step (accumulation dynamique, "
+              f"grads /= nb convs)", flush=True)
+
     model.train(); t0 = time.time()
+    _win_data = 0.0; _win_chunks = 0    # fenêtre log_every : temps d'attente data + chunks vus
     # carries hoisted out of the step loop: with nrf_never they persist across
     # optimizer steps (une vie = le run entier) ; sinon ils sont reset par step.
     bank_carry = _bank_loaded
@@ -880,15 +956,28 @@ def main(cfg_path: str, resume: bool = False) -> None:
             casc_carry, nev_carry = None, 0
             dstate_carry = None
             rpool_carry, wt_carry = [], 0
-        for _g in range(grad_accum):
+        n_conv = 0; step_chunks = 0; data_t = 0.0
+        while (step_chunks < chunk_budget) if chunk_budget else (n_conv < grad_accum):
+            _g = n_conv
+            _t_d = time.time()
             is_chat = (chat_stream is not None
                        and train_stream.rng.random() < p_chat)
-            segs = (chat_stream.next_conv()["segs"] if is_chat
-                    else train_stream.next_conv_batch(defer_len) if train_stream.B > 1
-                    else train_stream.next_conv_interleaved(
-                        interleave_files, defer_len,
-                        label=addr_label, addr_prob=addr_prob, addr_max=addr_max)
-                    if ilv_on else train_stream.next_conv())
+            if _pf_q is not None:
+                # data_t mesure l'ATTENTE réelle (0 si le producteur est en
+                # avance) ; H2D non_blocking depuis la mémoire pinnée, ordonné
+                # sur le stream par défaut donc sûr vis-à-vis des forwards.
+                segs = [{k: (v.to(device, non_blocking=True)
+                             if torch.is_tensor(v) else v) for k, v in s.items()}
+                        for s in _pf_q.get()]
+            else:
+                segs = (chat_stream.next_conv()["segs"] if is_chat
+                        else train_stream.next_conv_batch(defer_len) if train_stream.B > 1
+                        else train_stream.next_conv_interleaved(
+                            interleave_files, defer_len,
+                            label=addr_label, addr_prob=addr_prob, addr_max=addr_max)
+                        if ilv_on else train_stream.next_conv())
+            data_t += time.time() - _t_d
+            step_chunks += len(segs)
             # B2 : la vie se termine à la fin de la DERNIÈRE conv du groupe
             # no_reset ((_g+1) % nrf == 0 ; nrf=1 => chaque conv est une vie).
             if (ra_ids is not None and not is_chat
@@ -1092,7 +1181,9 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 print(f"[nan-guard] step {step} conv {_g}: loss non finie, "
                       f"conv sautée (carry préservé) — repro {_dp}", flush=True)
                 continue
-            (total / grad_accum).backward()          # mean over the G accumulated convs
+            # mean over the accumulated convs ; en mode chunk_budget le nb de
+            # convs n'est connu qu'en fin de step => division des grads après.
+            (total / (1.0 if chunk_budget else grad_accum)).backward()
             if no_reset_files > 1 or nrf_never:
                 # graph freed per file; the carried bank is data, not gradient path
                 # guard local (supersède le nan_to_num du pod) : banque non
@@ -1110,6 +1201,14 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         rpool_carry, wt_carry = reach_pool, w_total
                 if delta is not None:
                     dstate_carry = dstate.detach()
+            n_conv += 1
+        if chunk_budget and n_conv > 1:
+            # sémantique grad_accum restaurée : grads = moyenne sur les convs
+            _gs = [p.grad for p in base.parameters() if p.grad is not None]
+            if delta is not None:
+                _gs += [p.grad for p in delta.parameters() if p.grad is not None]
+            torch._foreach_div_(_gs, float(n_conv))
+        _win_data += data_t; _win_chunks += step_chunks
         _prof = os.environ.get("TB_DDP_PROF")
         if _prof:
             torch.cuda.synchronize(); _t_bwd = time.time()
@@ -1127,7 +1226,12 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 if g_ is None or nbytes + g_.numel() * g_.element_size() > 64 << 20:
                     if bucket:
                         flat = _flatten_dense_tensors(bucket)
-                        torch.distributed.all_reduce(flat)
+                        if ar_bf16:
+                            f16 = flat.to(torch.bfloat16)
+                            torch.distributed.all_reduce(f16)
+                            flat = f16.to(flat.dtype)
+                        else:
+                            torch.distributed.all_reduce(flat)
                         flat.div_(ddp_world)
                         for b_, s_ in zip(bucket, _unflatten_dense_tensors(flat, bucket)):
                             b_.copy_(s_)
@@ -1174,7 +1278,8 @@ def main(cfg_path: str, resume: bool = False) -> None:
         if _prof:
             torch.cuda.synchronize()
             print(f"[prof step {step}] fwd+bwd {_t_bwd - _t_step0:.2f}s  "
-                  f"allreduce {_t_ar - _t_bwd:.2f}s  clip+opt {time.time() - _t_ar:.2f}s",
+                  f"allreduce {_t_ar - _t_bwd:.2f}s  clip+opt {time.time() - _t_ar:.2f}s  "
+                  f"data-wait {data_t:.2f}s  chunks {step_chunks} ({n_conv} convs)",
                   flush=True)
         ic_v /= max(ic_cnt, 1); d_v /= max(d_cnt, 1)
         if ic_v == ic_v:   # un batch NaN isolé ne doit pas polluer l'EMA à vie
@@ -1216,9 +1321,12 @@ def main(cfg_path: str, resume: bool = False) -> None:
                 dist_s += ("[fait " + (f"{dist_c / dist_cn:.3f}" if dist_cn else "—")
                            + "/fill " + (f"{dist_f / dist_fn:.3f}" if dist_fn else "—")
                            + "]  ")
+            _n_log = min(log_every, step - start_step)
             print(f"step {step:5d}  {ic_s}{d_s}"
                   f"{addr_s}{dist_s}β {_beta(step):.2f}  lr {lr_now:.2e}  {mem_s}"
-                  f"{(time.time()-t0)/max(step - start_step, 1):.2f}s/step", flush=True)
+                  f"{(time.time()-t0)/max(step - start_step, 1):.2f}s/step  "
+                  f"chunks {_win_chunks / max(_n_log, 1):.1f}/step  "
+                  f"data {_win_data / max(_n_log, 1):.2f}s", flush=True)
             if writer is not None:
                 writer.add_scalar("train/ic_loss", ema_ic, step)
                 writer.add_scalar("train/ic_ppl", math.exp(ema_ic), step)
@@ -1232,12 +1340,19 @@ def main(cfg_path: str, resume: bool = False) -> None:
                         writer.add_scalar(f"train/reach_s{_s + 1}", _v, step)
                 writer.add_scalar("sched/lr", lr_now, step)
                 writer.add_scalar("sched/beta", _beta(step), step)
+                # perf : chunks/step + attente data (fenêtre log_every) — pour
+                # régresser s/step = intercept + pente*m et chiffrer le host-bound
+                writer.add_scalar("perf/chunks_per_step", _win_chunks / max(_n_log, 1), step)
+                writer.add_scalar("perf/data_wait_s", _win_data / max(_n_log, 1), step)
+                writer.add_scalar("perf/s_per_step",
+                                  (time.time() - t0) / max(step - start_step, 1), step)
                 if distill_n:
                     writer.add_scalar("train/distill", distill_v / distill_n, step)
                 if dist_cn:
                     writer.add_scalar("train/distill_fait", dist_c / dist_cn, step)
                 if dist_fn:
                     writer.add_scalar("train/distill_fill", dist_f / dist_fn, step)
+            _win_data = 0.0; _win_chunks = 0
         if (step % eval_every == 0
                 or (step == steps and not skip_final_eval)) and ddp_rank == 0:
             # eval_depth_sources (mix large, ex. divmix 13 sources) : la courbe

@@ -1,0 +1,94 @@
+# v350_fastpath_smoke — smoke LOCAL (3090) des flags budget-compute,
+# sur le TWIN 97M (dims v2b_mix) : itération rapide, VRAM tranquille
+# (prefetch / chunk_budget / allreduce_bf16 — ce dernier ne s'exerce qu'en DDP,
+# ici on valide juste que le flag ne casse rien en mono).
+#
+# Protocole (baseline = ce yaml avec les 3 flags OFF, même seed) :
+#   1) baseline        : prefetch false, chunk_budget 0  → losses de référence
+#   2) prefetch seul   : l'ordre des tirages rng est préservé (queue FIFO,
+#      producteur unique) => MÊMES convs par step, losses identiques au bruit
+#      kernel près ; data-wait ~0 attendu (host masqué par le compute GPU)
+#   3) prefetch+budget : chunks/step ~= chunk_budget, s/step uniforme,
+#      moins d'opt-steps par token — losses NON comparables step-à-step
+#      (accumulation différente), on vérifie juste sain + stable.
+#
+#   python -m deepseek_v4_mini.code_defer_native \
+#       deepseek_v4_mini/configs/v350_fastpath_smoke.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v2b_mix (twin 97M)
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: data_cache_smoke              # partagé avec v350_compile_smoke
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 1.0
+    n_files: 300
+    stream_cap: 1200
+  depth_sync: true                         # requis par chunk_budget
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 4                            # 97M : B4 validé 24GB (v2b_mix)
+  n_files: 300
+  stream_cap: 1200
+
+training:
+  seed: 0
+  steps: 20
+  grad_accum: 1
+  amp: true
+  lr: 3.0e-04
+  muon_lr: 7.5e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 2000
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  tf32: true
+  grad_checkpoint: true
+  compile: false                           # itération rapide ; re-smoke compile:true avant pod
+  skip_final_eval: true
+  log_every: 5
+  eval_every: 100000
+  eval_convs: 2
+  save_every: 100000
+  save_dir: data_cache_smoke/ckpt_fastpath
+  metrics_file: data_cache_smoke/metrics_fastpath.jsonl
+  # ── LES flags sous test (OFF => baseline bit-identique à l'historique) ──
+  prefetch: true
+  chunk_budget: 8                          # ~2x le m moyen (~3.9) => 2 convs/step typ.
+  allreduce_bf16: false                    # mono-GPU : pas d'all-reduce à exercer
+
+teacher:
+  enabled: true
+  distill_weight: 2.0
+  anneal:
+  - 16000
+  - 24000
