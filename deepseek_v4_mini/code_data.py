@@ -308,6 +308,7 @@ class CodeChunkStream:
         v.src_files = [self.src_files[i]]; v.src_weights = [1.0]
         v.src_names = [self.src_names[i]]; v._wsum = 1.0
         v.var_chunk = self.var_chunk
+        v._sif_w = self._sif_w
         v.files = self.src_files[i]
         v.n_files = len(v.files); v.n_chunk = sum(len(f) for f in v.files)
         return v
