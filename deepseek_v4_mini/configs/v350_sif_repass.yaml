@@ -194,6 +194,9 @@ training:
   grad_checkpoint: true                    # OBLIGATOIRE à 386M B32 (recette 10B)
   gc_save_topk: false                      # OFF (décision user post-fix clamp) : +35% step
   compile: true                            # torch>=2.6 (image cuda12.4 devel min)
+  compile_cache_dir: /workspace/compile_cache  # inductor+triton persistant (fastpath
+                                           #   af3f4a5) : warmé 1x A100, resservi 4x/8x
+  prefetch: true                           # producteur host // compute (ordre rng intact)
   skip_final_eval: true
   log_every: 10
   # PAS d'éval sur le pod (décision user 2026-07-22) : les évals se font en
