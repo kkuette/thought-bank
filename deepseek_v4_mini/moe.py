@@ -15,6 +15,7 @@ default for large models; here we use a small explicit balance loss for clarity)
 from __future__ import annotations
 
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -107,7 +108,12 @@ class DeepSeekMoE(nn.Module):
                 mask = expert_ids == ei
                 if not mask.any():
                     continue
-                out = expert(flat[mask])     # [n_tokens, d]
+                sel = flat[mask]             # [n_tokens, d] — n_tokens is
+                # data-dependent (routing); without this hint dynamo (with
+                # dynamic=False) specialises one graph per distinct count and
+                # thrashes the 256-entry recompile cache into eager fallback
+                torch._dynamo.mark_dynamic(sel, 0)
+                out = expert(sel)
                 routed_out[mask] = routed_out[mask] + weights[mask].unsqueeze(-1) * out
 
         # ── Sequence-wise load balance loss ───────────────────────────────────
