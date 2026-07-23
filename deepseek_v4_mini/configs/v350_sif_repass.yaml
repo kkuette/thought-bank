@@ -188,7 +188,7 @@ training:
   defer_weight: 1.0
   wsd_decay: true
   wsd_floor: 0.0
-  wsd_decay_start: 3000                    # = fin d'anneal (décision user) :
+  wsd_decay_start: 2500                    # = fin d'anneal (décision user) :
   wsd_decay_shape: linear                  #   consolidation en refroidissement
   tf32: true
   grad_checkpoint: true                    # OBLIGATOIRE à 386M B32 (recette 10B)
@@ -219,7 +219,7 @@ teacher:
   enabled: true
   distill_weight: 2.0
   target: surprisal                        # cibles SIF via surp_w du stream
-  anneal:                                  # décision user (gabarit 4 rangs) :
-  - 2000                                   # β=1 jusqu'à 2000, fondu 1000 steps,
-  - 3000                                   # puis 3000 steps natifs sous WSD
-                                           # (départ = fin d'anneal, step 3000)
+  anneal:                                  # décision user 2026-07-23 (reprise du
+  - 1500                                   # step_1500 : defer plafonne dès ~500,
+  - 2500                                   # le β=1 restant n'achète rien) —
+                                           # fondu 1500→2500, WSD dès 2500
