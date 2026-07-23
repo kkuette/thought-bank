@@ -693,7 +693,13 @@ def main(cfg_path: str, resume: bool = False) -> None:
         assert len(cascade_map) == cfg.n_layers and max(cascade_map) <= cascade_depth
         assert not bool(getattr(cfg, "mem_write_gate_merge", False)), \
             "cascade: gate_merge réordonne les slots, la capture d'éviction suppose FIFO pur"
-        assert train_stream.B == 1, "cascade v1 = mode ragged batch=1 (alignement conv)"
+        # ragged batch=1 (alignement conv historique) OU batché AVEC pack_convs :
+        # à profondeur constante K les B vies sont en lockstep — l'éviction du
+        # slot j tombe au même tour partout, CascadeMemory porte le batch tel
+        # quel ([B,D] slots). Batché SANS pack refusé (m variable => vies
+        # désalignées dans le batch).
+        assert train_stream.B == 1 or getattr(train_stream, "pack", False), \
+            "cascade batchée : exige pack_convs (vies alignées, K constant)"
         _seed_slots = int(getattr(cfg, "mem_seed_slots", cfg.max_mem))
     if delta is not None:
         assert cascade_depth == 0, "delta_channel remplace le canal — pas de cascade"
