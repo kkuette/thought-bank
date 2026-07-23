@@ -524,6 +524,7 @@ def main(cfg_path: str, resume: bool = False) -> None:
               surprisal_mode=d.get("surprisal_mode", "none"),
               sif_a=float(d.get("sif_a", 1e-4)),
               pack_convs=bool(d.get("pack_convs", False)),
+              pack_same_source=bool(d.get("pack_same_source", False)),
               seed=int(t.get("seed", 0)))
     # DDP: per-rank seed offset => each rank samples different convs (random
     # sampling with per-rank RNG — no distributed sampler needed). Rank0 builds

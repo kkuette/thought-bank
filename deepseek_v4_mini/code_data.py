@@ -199,7 +199,8 @@ class CodeChunkStream:
                  var_chunk: list | tuple | None = None,
                  surprisal_mode: str = "none", sif_a: float = 1e-4,
                  depth_sync_seed: int | None = None,
-                 pack_convs: bool = False) -> None:
+                 pack_convs: bool = False,
+                 pack_same_source: bool = False) -> None:
         self.tok = tokenizer
         self.L = int(seq_len); self.K = int(chunks_per_conv); self.B = int(batch)
         self.rng = random.Random(seed + (0 if split == "train" else 101))
@@ -288,7 +289,11 @@ class CodeChunkStream:
         # banque portée à travers les frontières de docs (pression de distracteurs),
         # cibles defer strictement intra-doc (-100 à la frontière : le doc A ne
         # prédit jamais le doc B). Zéro doc filtré : les courts remplissent.
+        # pack_same_source : la source est tirée UNE fois par chaîne (au poids),
+        # tous les docs de la conv en proviennent — distracteurs intra-domaine
+        # (session homogène) au lieu du cross-domaine par défaut. Ablation future.
         self.pack = bool(pack_convs)
+        self.pack_same_source = bool(pack_same_source)
         if self.pack and self.B > 1:
             self.src_packable: list[list] = []
             for fl in self.src_files:
@@ -438,16 +443,26 @@ class CodeChunkStream:
         frontières (régime d'éviction au-delà de max_mem + distracteurs inter-docs) ;
         defer_tgt reste INTRA-doc : successeur même-doc (queue ragged incluse),
         sinon -100 (frontière). depth_sync trivialement satisfait (m == K partout,
-        rng_m non consommé) ; sources tirées par poids PAR document."""
+        rng_m non consommé) ; sources tirées par poids PAR document
+        (pack_same_source : par CHAÎNE — docs homogènes intra-conv)."""
         K = self.K
         chains: list[list] = []                       # par élément : [(chunk, tgt|None)]
         for _ in range(self.B):
             ch = []
-            while len(ch) < K:
+            si_chain = -1
+            if self.pack_same_source:
                 while True:
-                    si = self._pick_source()
-                    if self.src_packable[si]:
+                    si_chain = self._pick_source()
+                    if self.src_packable[si_chain]:
                         break
+            while len(ch) < K:
+                if si_chain >= 0:
+                    si = si_chain
+                else:
+                    while True:
+                        si = self._pick_source()
+                        if self.src_packable[si]:
+                            break
                 cl = self.src_packable[si]
                 f, nfull = cl[self.rng.randrange(len(cl))]
                 take = min(nfull, K - len(ch))
