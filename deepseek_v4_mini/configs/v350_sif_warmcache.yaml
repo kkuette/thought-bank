@@ -1,0 +1,81 @@
+# v350_sif_warmcache — warmup du cache compile (inductor+triton) pour la
+# repass SIF, pod 1x A100 ($1.49/h). Les graphes ne dépendent que des shapes
+# (B32, L512, dims 386M) : ni la data ni les poids n'entrent dans la clé —
+# une seule petite source streamée suffit, pas de data_cache 9G ni de ckpt.
+# ~60 steps couvrent les profondeurs 1..8 + les flips requires_grad de la
+# banque, puis : tar /workspace/compile_cache -> HF, resservi aux nodes
+# 4x/8x (clé = arch GPU sm_80 + torch 2.6.0+cu124 = image identique).
+#   torchrun --nproc_per_node=1 -m deepseek_v4_mini.code_defer_native <cfg>
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v350_sif_repass (386M), inchangé
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: /workspace/data_cache
+  sources:
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 1.0
+    n_files: 1500
+    stream_cap: 3000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  depth_sync: true
+  batch_size: 32
+  n_files: 1500
+  stream_cap: 3000
+
+training:
+  seed: 0
+  steps: 60
+  grad_accum: 1
+  amp: true
+  lr: 1.0e-04
+  muon_lr: 2.4e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 0
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  tf32: true
+  grad_checkpoint: true
+  gc_save_topk: false
+  compile: true
+  compile_cache_dir: /workspace/compile_cache
+  prefetch: true
+  skip_final_eval: true
+  log_every: 5
+  eval_every: 999999
+  eval_convs: 8
+  save_every: 999999
+  save_dir: /workspace/checkpoints/v350_sif_warmcache
+  metrics_file: /workspace/runs/v350_sif_warmcache/metrics.jsonl
