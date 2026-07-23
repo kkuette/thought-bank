@@ -6,8 +6,11 @@
 # SFT sif_hot a montré que des cibles SIF donnent un gradient utilisable dès
 # le step 1. Ici on paie ~3000 steps (~280M tokens, ~3h de 8xA100, ~$40) pour
 # donner au 386M des codes contenu-discriminants en poids propres.
-# RECETTE POD = la prod 10B volée (b8e4a1a) : B32+GC+compile+depth_sync,
-# ~550k tokens/step, ~5.4 s/step => 3000 steps ≈ 1.65B tokens ≈ 4.5h ≈ $54.
+# RECETTE POD = la prod 10B volée (b8e4a1a) : B32+GC+compile+depth_sync.
+# GABARIT 4x A100 SXM (2026-07-22, le seul hôte 8x dispo = citron) : mêmes
+# convs ABSOLUES que le plan 8x en doublant les steps — 6000 steps à ~275k
+# tokens/step (B32 x 4 rangs) ≈ 1.65B tokens, ~$5.96/h, ~9h ≈ $54.
+#   torchrun --nproc_per_node=4 -m deepseek_v4_mini.code_defer_native <cfg>
 #
 # LANCEMENT (pod 8xA100, DDP) :
 #   torchrun --nproc_per_node=8 -m deepseek_v4_mini.code_defer_native \
@@ -168,7 +171,7 @@ data:
 
 training:
   seed: 0
-  steps: 3000                              # ~280M tokens (~3% de la 10B)
+  steps: 6000                              # 4 rangs : ≈1.65B tokens
   grad_accum: 1
   amp: true
   init_from: /workspace/ckpts/v350_phase1_release_final.pt
@@ -184,7 +187,7 @@ training:
   defer_weight: 1.0
   wsd_decay: true
   wsd_floor: 0.0
-  wsd_decay_start: 1500                    # = fin d'anneal (décision user) :
+  wsd_decay_start: 3000                    # = fin d'anneal (décision user) :
   wsd_decay_shape: linear                  #   consolidation en refroidissement
   tf32: true
   grad_checkpoint: true                    # OBLIGATOIRE à 386M B32 (recette 10B)
@@ -204,7 +207,7 @@ training:
   eval_depth_sources:
   - codeparrot
   - fineweb
-  save_every: 250
+  save_every: 500                          # 12 jalons x 3.2G ≈ 38G volume
   save_dir: /workspace/checkpoints/v350_sif_repass
   metrics_file: /workspace/runs/v350_sif_repass/metrics.jsonl
   # AUCUN flag de stack (définition phase 1) — la cascade/no_reset restent
@@ -214,7 +217,7 @@ teacher:
   enabled: true
   distill_weight: 2.0
   target: surprisal                        # cibles SIF via surp_w du stream
-  anneal:                                  # décision user : β=1 jusqu'à 1000,
-  - 1000                                   # fondu 500 steps, puis 1500 steps
-  - 1500                                   # natifs sous WSD (départ = fin
-                                           # d'anneal, step 1500)
+  anneal:                                  # décision user (gabarit 4 rangs) :
+  - 2000                                   # β=1 jusqu'à 2000, fondu 1000 steps,
+  - 3000                                   # puis 3000 steps natifs sous WSD
+                                           # (départ = fin d'anneal, step 3000)
