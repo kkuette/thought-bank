@@ -198,7 +198,8 @@ class CodeChunkStream:
                  sources: list[dict] | None = None,
                  var_chunk: list | tuple | None = None,
                  surprisal_mode: str = "none", sif_a: float = 1e-4,
-                 depth_sync_seed: int | None = None) -> None:
+                 depth_sync_seed: int | None = None,
+                 pack_convs: bool = False) -> None:
         self.tok = tokenizer
         self.L = int(seq_len); self.K = int(chunks_per_conv); self.B = int(batch)
         self.rng = random.Random(seed + (0 if split == "train" else 101))
@@ -281,6 +282,23 @@ class CodeChunkStream:
         # ── Batched-conv index (B>1): windows over FULL chunks only (uniform [B, L]
         # shapes, no padding/mask — the ragged tail chunk is excluded as an INPUT but
         # stays in self.files for the batch=1 eval paths). nfull = #leading full chunks.
+        # ── pack_convs (user 2026-07-23) : chaque conv batchée = CHAÎNE de
+        # documents concaténés jusqu'à K chunks pleins — profondeur CONSTANTE K
+        # (visée : K = 2x max_mem => moitié de la conv en banque saturée/éviction),
+        # banque portée à travers les frontières de docs (pression de distracteurs),
+        # cibles defer strictement intra-doc (-100 à la frontière : le doc A ne
+        # prédit jamais le doc B). Zéro doc filtré : les courts remplissent.
+        self.pack = bool(pack_convs)
+        if self.pack and self.B > 1:
+            self.src_packable: list[list] = []
+            for fl in self.src_files:
+                pk = []
+                for f in fl:
+                    nfull = len(f) if f[-1].numel() == self.L else len(f) - 1
+                    if nfull >= 1:
+                        pk.append((f, nfull))
+                self.src_packable.append(pk)
+            assert any(self.src_packable), "pack_convs: no file with a full chunk"
         if self.B > 1:
             self.src_by_depth: list[dict[int, list]] = []
             for fl in self.src_files:
@@ -369,6 +387,8 @@ class CodeChunkStream:
         mix); a source with no file deep enough for this m is renormalized away."""
         assert self.B > 1, "next_conv_batch requires batch>1 (use next_conv)"
         dl = int(defer_len)
+        if self.pack:
+            return self._next_conv_batch_packed(dl)
         # anchor: source by weight, then any file with a defer pair (by_depth[1]).
         # rng_m == rng unless depth_sync_seed is set (then the anchor/m draw is
         # rank-invariant — same source pick, same candidate, same m everywhere).
@@ -403,6 +423,45 @@ class CodeChunkStream:
             for b, ((f, _), st) in enumerate(zip(picks, starts)):
                 if st + j + 1 < len(f):                            # successor exists
                     nx = f[st + j + 1][:dl].long()                 # ragged tail ok
+                    tgt[b, :nx.numel()] = nx
+            seg = {"input_ids": ids, "attention_mask": torch.ones_like(ids),
+                   "defer_tgt": tgt}
+            if self._sif_w is not None:
+                seg["surp_w"] = self._sif_w[ids]
+            segs.append(seg)
+        return segs
+
+    def _next_conv_batch_packed(self, dl: int) -> list[dict]:
+        """pack_convs : B convs de profondeur CONSTANTE K, chacune = chaîne de
+        documents (chunks pleins, depuis le début du doc) concaténés jusqu'à K —
+        le dernier doc est tronqué à K. La banque est portée à travers les
+        frontières (régime d'éviction au-delà de max_mem + distracteurs inter-docs) ;
+        defer_tgt reste INTRA-doc : successeur même-doc (queue ragged incluse),
+        sinon -100 (frontière). depth_sync trivialement satisfait (m == K partout,
+        rng_m non consommé) ; sources tirées par poids PAR document."""
+        K = self.K
+        chains: list[list] = []                       # par élément : [(chunk, tgt|None)]
+        for _ in range(self.B):
+            ch = []
+            while len(ch) < K:
+                while True:
+                    si = self._pick_source()
+                    if self.src_packable[si]:
+                        break
+                cl = self.src_packable[si]
+                f, nfull = cl[self.rng.randrange(len(cl))]
+                take = min(nfull, K - len(ch))
+                for j in range(take):
+                    nx = f[j + 1][:dl].long() if j + 1 < len(f) else None
+                    ch.append((f[j].long(), nx))
+            chains.append(ch)
+        segs = []
+        for j in range(K):
+            ids = torch.stack([chains[b][j][0] for b in range(self.B)])   # [B, L]
+            tgt = torch.full((self.B, dl), -100, dtype=torch.long)
+            for b in range(self.B):
+                nx = chains[b][j][1]
+                if nx is not None:
                     tgt[b, :nx.numel()] = nx
             seg = {"input_ids": ids, "attention_mask": torch.ones_like(ids),
                    "defer_tgt": tgt}
