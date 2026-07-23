@@ -153,9 +153,10 @@ data:
     weight: 0.06
     n_files: 100000
     stream_cap: 200000
-  - name: arxiv
-    dataset: armanc/scientific_papers
-    config_name: arxiv
+  - name: arxiv                            # dataset à script (mort en datasets>=4)
+    dataset: armanc/scientific_papers      # => branche parquet auto-convertie
+    data_dir: arxiv                        # (partielle : ~150k articles, assez)
+    revision: refs/convert/parquet
     content_key: article
     min_chunks: 2
     weight: 0.06
