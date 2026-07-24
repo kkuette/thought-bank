@@ -122,7 +122,7 @@ rl:
     max_lag: 2
     keep_weights: 3
     poll_s: 2.0
-    max_pending: 24
+    max_pending: 8                         # = gps x max_lag (anti-stale)
     lives_save_every: 20
     xdom_every: 50
     max_groups: 0

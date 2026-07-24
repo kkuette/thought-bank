@@ -116,7 +116,8 @@ rl:
     max_lag: 2                             # staleness tolérée (itérations)
     keep_weights: 3
     poll_s: 2.0
-    max_pending: 24                        # au-delà : les workers attendent
+    max_pending: 8                         # = gps x max_lag : la file ne peut
+                                           # pas vieillir au-delà de la garde
     lives_save_every: 20
     xdom_every: 50                         # probe adversité banque étrangère
     max_groups: 0                          # 0 = jusqu'au STOP / fin learner
