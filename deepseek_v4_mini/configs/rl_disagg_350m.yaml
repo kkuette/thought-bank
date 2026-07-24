@@ -76,9 +76,11 @@ data:
     weight: 0.40
     lambda_write: 0.0
     gen:
-      datasets:
-      - Salesforce/xlam-function-calling-60k
+      datasets:                          # CC-BY-4.0 / Apache — libres pour
+      - 'nvidia/Nemotron-Agentic-v1#tool_calling'   # l'option open-core
       - glaiveai/glaive-function-calling-v2
+      # (xlam-60k = gated ; Salesforce/APIGen-MT-5k = CC-BY-NC + clause
+      #  anti-OpenAI : JAMAIS dans le train, éval éventuelle seulement)
       episode_cap: 6000
       max_turn_tok: 192
       max_schema_tok: 256

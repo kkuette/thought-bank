@@ -42,6 +42,68 @@ from .rl_rewards import _balanced_spans, extract_calls, grade_calls
 
 # ── glaive chat mining ───────────────────────────────────────────────────────
 
+# ── nemotron mining ──────────────────────────────────────────────────────────
+
+def parse_nemotron_row(row: dict):
+    """(schemas, query, calls) or None — nvidia/Nemotron-Agentic-v1 layout:
+    tools = [{"type": "function", "function": {...}}], calls in the first
+    tool-calling assistant turn as a JSON-STRING list of
+    {"function": {"name", "arguments"}} (arguments dict OR string)."""
+    schemas = [json.dumps(t["function"]) for t in (row.get("tools") or [])
+               if isinstance(t, dict) and isinstance(t.get("function"), dict)
+               and t["function"].get("name")]
+    query = None
+    for m in row.get("messages") or []:
+        role, content = m.get("role"), m.get("content")
+        if role == "user" and query is None and isinstance(content, str) \
+                and content.strip():
+            query = content.strip()
+        elif role == "assistant" and m.get("tool_calls"):
+            if query is None:
+                return None                    # call before any user turn
+            tc = m["tool_calls"]
+            if isinstance(tc, str):
+                try:
+                    tc = json.loads(tc)
+                except json.JSONDecodeError:
+                    return None
+            calls = []
+            for c in tc if isinstance(tc, list) else []:
+                fn = c.get("function") if isinstance(c, dict) else None
+                if not (isinstance(fn, dict) and fn.get("name")):
+                    continue
+                args = fn.get("arguments", {}) or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        continue
+                if isinstance(args, dict):
+                    calls.append({"name": fn["name"], "arguments": args})
+            if calls and schemas:
+                return schemas, query, calls
+            return None
+    return None
+
+
+def _iter_nemotron(name: str):
+    """Raw line streaming via HfFileSystem — the datasets json loader chokes
+    on this jsonl (tool-message content is an OBJECT, pyarrow bails, the
+    json.load fallback tries to slurp 5 GB). Spec: 'repo#split_file'."""
+    from huggingface_hub import HfFileSystem
+    repo, _, split_file = name.partition("#")
+    fs = HfFileSystem()
+    with fs.open(f"datasets/{repo}/data/{split_file or 'tool_calling'}.jsonl",
+                 "r") as fh:
+        for line in fh:
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+# ── glaive mining ────────────────────────────────────────────────────────────
+
 _G_USER = re.compile(r"USER:\s*(.*?)(?=ASSISTANT:|$)", re.S)
 _G_CALL = re.compile(r"<functioncall>\s*(.*?)(?:<\|endoftext\|>|FUNCTION RESPONSE|USER:|$)", re.S)
 _G_ARGS = re.compile(r"(\"arguments\"\s*:\s*)'(.*)'", re.S)
@@ -118,12 +180,21 @@ class ToolSessionStream(PersonaChatStream):
             pool = torch.load(path)
             print(f"tool sessions: cache hit {path} — {len(pool)} episodes")
             return pool
-        from datasets import load_dataset
-        rows = load_dataset(name, split=split, streaming=True)
+        is_nemotron = "nemotron" in name.lower()
         is_glaive = "glaive" in name.lower()
+        if is_nemotron:
+            rows = _iter_nemotron(name)
+        else:
+            from datasets import load_dataset
+            rows = load_dataset(name, split=split, streaming=True)
         pool = []
         for row in rows:
-            if is_glaive:
+            if is_nemotron:
+                got = parse_nemotron_row(row)
+                if got is None:
+                    continue
+                schemas, query, calls = got
+            elif is_glaive:
                 got = parse_glaive_row(row.get("system") or "",
                                        row.get("chat") or "")
                 if got is None:
@@ -236,6 +307,24 @@ if __name__ == "__main__":
               '{"name": "get_time", "arguments": \'{"tz": "Asia/Tokyo"}\'} '
               '<|endoftext|> FUNCTION RESPONSE: {"time": "12:00"} '
               'ASSISTANT: It is noon. <|endoftext|>')
+    n_row = {"tools": [{"type": "function",
+                        "function": {"name": "get_btc",
+                                     "parameters": {"type": "object"}}}],
+             "messages": [
+                 {"role": "system", "content": ""},
+                 {"role": "user", "content": "check balance of addr X"},
+                 {"role": "assistant", "content": "", "tool_calls":
+                  '[{"id": "c1", "type": "function", "function": '
+                  '{"name": "get_btc", "arguments": {"address": "X"}}}]'},
+                 {"role": "tool", "content": {"balance": "0.1"}}]}
+    got = parse_nemotron_row(n_row)
+    assert got is not None and got[1].startswith("check balance")
+    assert got[2] == [{"name": "get_btc", "arguments": {"address": "X"}}]
+    assert parse_nemotron_row({"tools": [], "messages": []}) is None
+    # call before any user turn => rejected
+    assert parse_nemotron_row({"tools": n_row["tools"], "messages":
+                               n_row["messages"][2:]}) is None
+
     got = parse_glaive_row(g_sys, g_chat)
     assert got is not None
     _, q, calls = got

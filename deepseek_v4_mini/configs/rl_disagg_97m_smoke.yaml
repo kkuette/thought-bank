@@ -74,7 +74,8 @@ data:
     weight: 0.3                            # est DANS le reward (n_max + floor)
     lambda_write: 0.0
     gen:
-      datasets: [Salesforce/xlam-function-calling-60k]
+      datasets: ['nvidia/Nemotron-Agentic-v1#tool_calling']  # CC-BY-4.0, non gated
+      # (xlam = gated ; APIGen-MT = CC-BY-NC, exclu de l'entraînement)
       episode_cap: 6000
       max_turn_tok: 192
       max_schema_tok: 256
