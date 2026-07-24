@@ -1,0 +1,121 @@
+# dsv6 GRPO DÉSAGRÉGÉ — smoke 97M sur la ferme (validation du protocole,
+# pas un run de verdict). Rollouts sur les 3070Ti (1 worker/GPU, vies
+# partitionnées par worker), updates sur la 3090 (learner unique).
+#
+# = rl_lives_97m.yaml (hyperparams v1 post-mortem : think_row, temp 3.0,
+# clip asym DAPO, kl 1e-2) + bloc rl.disagg + env tools (xlam, grader
+# vérifiable rl_rewards : name gate x args F1 x économie think).
+#
+# Ce que le smoke doit montrer avant tout 350M :
+#   - débit : s/group par worker, s/step learner, stale% ~0 avec max_lag 2 ;
+#   - les groupes tools ont des rewards dans [0,1] et une variance intra-groupe
+#     (sinon dynamic sampling les jette : compter les 'degenerate' aux logs) ;
+#   - reprise : STOP, relance learner+workers, les vies CONTINUENT (w*_lives.pt).
+#
+# learner (3090) :
+#   python -m deepseek_v4_mini.rl_disagg learner deepseek_v4_mini/configs/rl_disagg_97m_smoke.yaml
+# worker (job ferme, WORKER fourni par le systemd du rig) :
+#   python -m deepseek_v4_mini.rl_disagg worker deepseek_v4_mini/configs/rl_disagg_97m_smoke.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v2h 97M, verbatim (init_from doit matcher)
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 512
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 16
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  var_chunk: [128, 512]
+  cache_dir: /mnt/tb/data_cache
+  envs:
+  - name: code
+    kind: code
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.4
+    n_files: 3000
+    stream_cap: 90000
+    lambda_write: 0.03
+  - name: web
+    kind: code
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.3
+    n_files: 3000
+    stream_cap: 250000
+    lambda_write: 0.03
+  - name: tools                            # rubric vérifiable (rl_rewards) ;
+    kind: tool                             # lambda_write 0 : l'économie think
+    weight: 0.3                            # est DANS le reward (n_max + floor)
+    lambda_write: 0.0
+    gen:
+      datasets: [Salesforce/xlam-function-calling-60k]
+      episode_cap: 6000
+      max_turn_tok: 192
+      max_schema_tok: 256
+      eps_per_session: [2, 5]
+      real_cache_dir: /mnt/tb/data_cache
+      surprisal_mode: sif
+      sif_a: 1.0e-04
+
+rl:
+  seed: 0
+  train_scope: think_row
+  init_from: /mnt/tb/checkpoints/farm/v2h_stack/final.pt
+  n_lives_per_worker: 2                    # 6 workers x 2 = 12 vies au total
+  max_episodes_per_life: 0
+  cascade_depth: 0
+  steps: 300
+  group_size: 8
+  groups_per_step: 4
+  lr: 3.0e-04
+  temp: 3.0
+  lambda_write: 0.03
+  clip_low: 0.2
+  clip_high: 0.28
+  kl_coef: 1.0e-2
+  min_reward_std: 1.0e-4
+  max_resample: 4
+  grad_clip: 1.0
+  save_every: 50
+  # économie think (tools) : timeout dur au-delà de n_max, bonus linéaire
+  # 1 -> floor conditionné au succès (plancher jamais -> 0, règle 07-23)
+  think_nmax: 8
+  think_floor: 0.4
+  max_new: 64                              # décodage du tour d'appel (rubric)
+  amp: true
+  disagg:
+    root: /mnt/tb/rl/disagg_97m_smoke
+    publish_every: 1                       # poids publiés à chaque step learner
+    max_lag: 2                             # staleness tolérée (itérations)
+    keep_weights: 3
+    poll_s: 2.0
+    max_pending: 24                        # au-delà : les workers attendent
+    lives_save_every: 20
+    xdom_every: 50                         # probe adversité banque étrangère
+    max_groups: 0                          # 0 = jusqu'au STOP / fin learner

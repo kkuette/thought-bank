@@ -1,0 +1,126 @@
+# dsv6 GRPO DÉSAGRÉGÉ 350M — cliquet RL depuis le ckpt SFT data-SOTA
+# (pivot user 2026-07-24 : SFT sota depuis step_650 rearm, PUIS cliquet RL).
+#
+# NE PAS LANCER avant : (1) le smoke VRAM 350M rollout sur 3070Ti est vert
+# (vram_smoke_350m.job), (2) le protocole est validé au 97M
+# (rl_disagg_97m_smoke.yaml), (3) le SFT sota a produit son ckpt final
+# (init_from ci-dessous — ajuster le step).
+#
+# Désagrégation : 6 rollout-workers 3070Ti (inférence 386M bf16 ~0.8 GB
+# poids), learner 3090 (update think_row = une ligne de lm_head, léger).
+# Pipeline du cliquet : pendant la passe distill/SFT de l'itération N sur la
+# 3090, les workers génèrent déjà les rollouts de N+1 sur le ckpt N (le
+# learner absorbe le retard via max_lag).
+#
+# learner : python -m deepseek_v4_mini.rl_disagg learner deepseek_v4_mini/configs/rl_disagg_350m.yaml
+# workers : jobs ferme (voir scripts/farm/README + queue/)
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v350 386M (sft_sota_350m verbatim)
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  var_chunk: [128, 512]
+  cache_dir: /mnt/tb/data_cache
+  envs:
+  - name: code
+    kind: code
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.30
+    n_files: 3000
+    stream_cap: 90000
+    lambda_write: 0.03
+  - name: sota                             # sessions réelles longues (dense) :
+    kind: sota                             # la pression mémoire du SFT continue
+    weight: 0.30                           # d'exister dans le mix RL
+    lambda_write: 0.03
+    gen:
+      real_cache_dir: /mnt/tb/data_cache
+      conv_cap: 8000
+      max_turn_tok: 192
+      max_conv_msgs: 10
+      convs_per_session: [2, 6]
+      p_requote: 0.5
+      n_requote: [1, 2]
+      surprisal_mode: sif
+      sif_a: 1.0e-04
+  - name: tools                            # LA cible du cliquet : grader
+    kind: tool                             # vérifiable + économie think
+    weight: 0.40
+    lambda_write: 0.0
+    gen:
+      datasets:
+      - Salesforce/xlam-function-calling-60k
+      - glaiveai/glaive-function-calling-v2
+      episode_cap: 6000
+      max_turn_tok: 192
+      max_schema_tok: 256
+      eps_per_session: [2, 5]
+      real_cache_dir: /mnt/tb/data_cache
+      surprisal_mode: sif
+      sif_a: 1.0e-04
+
+rl:
+  seed: 0
+  train_scope: think_row                   # ancre du cliquet ; élargir SEULEMENT
+                                           # sur verdict (post-mortem v1 : le
+                                           # full-model RL érode le backbone)
+  init_from: /mnt/tb/checkpoints/v350_sft_sota/step_800.pt   # AJUSTER au ckpt final SFT
+  n_lives_per_worker: 2
+  max_episodes_per_life: 0
+  cascade_depth: 4                         # banque complète V3 (comme le SFT)
+  cascade_map: [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]
+  steps: 1000
+  group_size: 8
+  groups_per_step: 4
+  lr: 3.0e-04
+  temp: 3.0
+  lambda_write: 0.03
+  clip_low: 0.2
+  clip_high: 0.28
+  kl_coef: 1.0e-2
+  min_reward_std: 1.0e-4
+  max_resample: 4
+  grad_clip: 1.0
+  save_every: 50
+  think_nmax: 8
+  think_floor: 0.4
+  max_new: 64
+  amp: true
+  disagg:
+    root: /mnt/tb/rl/disagg_350m
+    publish_every: 1
+    max_lag: 2
+    keep_weights: 3
+    poll_s: 2.0
+    max_pending: 24
+    lives_save_every: 20
+    xdom_every: 50
+    max_groups: 0

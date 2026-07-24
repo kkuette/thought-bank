@@ -1,0 +1,224 @@
+# sft_sota_350m_MIXED — variante multi-datasets du SFT data SOTA :
+# pools smol-smoltalk + Tulu 3 concaténés (conv_cap PAR dataset ; les convs
+# Tulu ouvrant par un tour system sont filtrées par le loader — alternance
+# user/assistant stricte). Même recette que sft_sota_350m sinon.
+#
+# Verdict arc persona (rearm @550) : canal OUVERT (Δnll +0.332 à β=0,
+# uniforme en âge) mais grade 0 = répertoire fermé du jouet (lookup 6
+# formes × 8-15 valeurs, valeurs insensibles à la session). On ne paye pas
+# pools ×5 : on passe aux répertoires OUVERTS = vraies conversations.
+#
+# Stream sota_session (sota_session_data.py) :
+#   - kind session : 2-6 convs réelles smol-smoltalk packées en une vie de
+#     banque (éviction + distracteurs cross-topic sur du vrai texte) ;
+#   - kind requote : question d'une conv du DÉBUT reposée verbatim en fin
+#     de session, cible = la réponse originale (hors contexte par
+#     construction, âges en unités persona) — le recall à répertoire ouvert.
+#
+# TEACHER OFF au départ (principe amorçage minimal : le canal read est déjà
+# ouvert dans les poids step_650 — empilement warm-restart, on ne ré-échafaude
+# pas ce qui existe). Repli si Δnll requote reste nul @150-300 : ré-armer
+# (rampe courte, recette rearm). Probe = Δnll live/ablaté par âge sur les
+# tours requote ; grade = token-F1 (report-only).
+#
+# LANCEMENT :
+#   python -m deepseek_v4_mini.code_defer_native \
+#     deepseek_v4_mini/configs/sft_sota_350m_mixed.yaml
+tokenizer: HuggingFaceTB/SmolLM2-135M
+
+model:                                     # = v350_phase1_10b (386M)
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_head: 64
+  dropout: 0.0
+  max_seq_len: 640
+  n_hc: 2
+  sinkhorn_iters: 20
+  csa_m: 4
+  hca_m: 16
+  top_k_csa: 8
+  n_win: 16
+  d_latent_q: 64
+  n_groups: 2
+  n_experts: 4
+  n_shared: 1
+  top_k_experts: 2
+  d_ff: 1536
+  mem_dim: 512
+  max_mem: 8
+  mem_seed_slots: 4
+  mem_read_rank: 8
+  mem_read_swiglu: true
+  use_dual_stream: true
+  balance_loss_weight: 1.0e-4
+
+data:
+  cache_dir: /mnt/tb/data_cache
+  # --- identique au bloc sft_school (cache hit garanti, ancres GAP code/web)
+  sources:
+  - name: codeparrot
+    dataset: codeparrot/codeparrot-clean
+    weight: 0.20
+    stream_cap: 90000
+  - name: stack_c
+    dataset: bigcode/the-stack-smol
+    data_dir: data/c
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_rust
+    dataset: bigcode/the-stack-smol
+    data_dir: data/rust
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_js
+    dataset: bigcode/the-stack-smol
+    data_dir: data/javascript
+    weight: 0.06
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_sql
+    dataset: bigcode/the-stack-smol
+    data_dir: data/sql
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_html
+    dataset: bigcode/the-stack-smol
+    data_dir: data/html
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: stack_css
+    dataset: bigcode/the-stack-smol
+    data_dir: data/css
+    weight: 0.04
+    min_chunks: 2
+    stream_cap: 10000
+  - name: fineweb
+    dataset: HuggingFaceFW/fineweb
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.10
+    stream_cap: 250000
+  - name: fineweb_edu
+    dataset: HuggingFaceFW/fineweb-edu
+    config_name: sample-10BT
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: wikipedia
+    dataset: wikimedia/wikipedia
+    config_name: 20231101.en
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 60000
+  - name: finemath
+    dataset: HuggingFaceTB/finemath
+    config_name: finemath-4plus
+    content_key: text
+    min_chunks: 2
+    weight: 0.08
+    stream_cap: 250000
+  - name: khanacademy
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: khanacademy
+    content_key: text
+    min_chunks: 2
+    weight: 0.04
+    stream_cap: 60000
+  - name: openstax
+    dataset: HuggingFaceTB/cosmopedia
+    config_name: openstax
+    content_key: text
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  - name: arxiv
+    dataset: armanc/scientific_papers
+    config_name: arxiv
+    content_key: article
+    min_chunks: 2
+    weight: 0.06
+    stream_cap: 60000
+  seq_len: 512
+  chunks_per_conv: 8
+  defer_len: 16
+  batch_size: 1
+  var_chunk:
+  - 128
+  - 512
+  n_files: 6000
+  stream_cap: 90000
+
+training:
+  seed: 0
+  steps: 800
+  grad_accum: 4
+  amp: true
+  # Base = step_550 du run rearm (run coupé @581 sur décision user — 550 =
+  # le ckpt du verdict Δnll +0.332, registre + canal read payés ; le junk
+  # persona (lookup argmax) est superficiel, la data réelle l'écrase).
+  # Poids seuls, schedule/optim frais, step→0. Banque fraîche.
+  init_from: /mnt/tb/checkpoints/v350_sft_persona_sif_repass_rearm/step_550.pt
+  lr: 1.0e-04
+  muon_lr: 2.4e-04
+  muon_ref_mem_dim: 64
+  warmup_steps: 0                          # LR plein dès step 1 (recette validée)
+  no_reset_files: 0                        # une seule vie de banque pour tout le run
+  cascade_depth: 4                         # banque complète V3
+  weight_decay: 0.01
+  grad_clip: 1.0
+  defer_weight: 1.0
+  wsd_decay: true                          # consolidation validée au rearm
+  wsd_decay_start: 500                     # plat 500 puis decay linéaire → 0
+  wsd_decay_shape: linear
+  grad_checkpoint: true
+  gc_save_topk: false
+  log_every: 1
+  eval_every: 50
+  eval_convs: 8
+  eval_sources:
+  - codeparrot
+  - fineweb
+  eval_depths: [2, 8]
+  eval_depth_convs: 8
+  eval_depth_sources:
+  - codeparrot
+  - fineweb
+  save_every: 50
+  save_dir: /mnt/tb/checkpoints/v350_sft_sota_mixed
+  metrics_file: /mnt/tb/runs/v350_sft_sota_mixed/metrics.jsonl
+
+chat:
+  stream: sota_session
+  p_chat: 1.0
+  weight: 1.0
+  eval_convs: 12
+  max_new: 64                              # réponses réelles > valeurs persona
+  gen:
+    dataset:
+    - HuggingFaceTB/smol-smoltalk
+    - allenai/tulu-3-sft-mixture
+    real_cache_dir: /mnt/tb/data_cache
+    conv_cap: 6000                           # PAR dataset => pool ~12k convs
+    max_turn_tok: 192
+    max_conv_msgs: 10
+    convs_per_session: [2, 6]
+    p_requote: 0.5
+    n_requote: [1, 2]
+    requote_weight: 1.0                    # OFF au 1er run (décision user
+                                           # 2026-07-24 : d'abord sans) —
+                                           # levier codé en réserve : mask =
+                                           # 1+(w-1)·sif sur la réponse requote
+    surprisal_mode: sif                    # poids SIF posés sur les segs
+    sif_a: 1.0e-04                         # (teacher OFF : inertes, prêts
+                                           # pour un ré-armement éventuel)
+
+teacher:
+  enabled: false

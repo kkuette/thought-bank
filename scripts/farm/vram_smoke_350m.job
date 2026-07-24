@@ -1,0 +1,7 @@
+# Smoke VRAM : rollout GRPO 386M (inférence seule) sur une 3070Ti 8 GB.
+# Copier dans /mnt/tb/queue/ (priorité haute : préfixer 00_). Verdict dans le
+# workerlog : peak GB fp32 et bf16 pour un groupe G=8 au pire cas de session
+# (rl_disagg_350m.yaml). Vert = le plan désagrégé 350M tient sur la ferme.
+python -m deepseek_v4_mini.vram_smoke_350m \
+  deepseek_v4_mini/configs/rl_disagg_350m.yaml \
+  2>&1 | tee $TB_MNT/runs/vram_smoke_350m_w${WORKER}.log

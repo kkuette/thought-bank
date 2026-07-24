@@ -1,0 +1,9 @@
+# Rollout-worker GRPO désagrégé — smoke 97M. Un exemplaire par GPU : copier
+# 6x dans /mnt/tb/queue/ (p.ex. 20_rl_worker_a.job ... 20_rl_worker_f.job) ;
+# chaque worker prend son identité de la variable WORKER du rig (vies
+# partitionnées, pas de collision). Le learner tourne sur la 3090 :
+#   python -m deepseek_v4_mini.rl_disagg learner deepseek_v4_mini/configs/rl_disagg_97m_smoke.yaml
+# Arrêt propre de tout le monde : touch /mnt/tb/rl/disagg_97m_smoke/STOP
+python -m deepseek_v4_mini.rl_disagg worker \
+  deepseek_v4_mini/configs/rl_disagg_97m_smoke.yaml \
+  2>&1 | tee $TB_MNT/runs/rl_disagg_97m_w${WORKER}.log
