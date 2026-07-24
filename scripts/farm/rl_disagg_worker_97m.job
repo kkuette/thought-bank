@@ -4,6 +4,7 @@
 # partitionnées, pas de collision). Le learner tourne sur la 3090 :
 #   python -m deepseek_v4_mini.rl_disagg learner deepseek_v4_mini/configs/rl_disagg_97m_smoke.yaml
 # Arrêt propre de tout le monde : touch /mnt/tb/rl/disagg_97m_smoke/STOP
+set -o pipefail
 python -m deepseek_v4_mini.rl_disagg worker \
   deepseek_v4_mini/configs/rl_disagg_97m_smoke.yaml \
   2>&1 | tee $TB_MNT/runs/rl_disagg_97m_w${WORKER}.log

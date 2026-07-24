@@ -34,13 +34,16 @@ from .rl_disagg import decode_lb
 from .rl_lives import mem_fork
 
 
-def measure(raw: dict, dtype: torch.dtype, device) -> dict:
+def measure(raw: dict, autocast: bool, device) -> dict:
+    """Weights stay fp32 (model.to(bf16) trips fp32 buffers deep in the
+    attention — and the worker runs fp32 weights anyway); autocast=True
+    measures the bf16-compute path the trainer uses."""
     r, d, mcfg = raw["rl"], raw["data"], dict(raw["model"])
     torch.manual_seed(0)
     rng = _random.Random(0)
     mcfg["vocab_size"] = int(raw.get("vocab_size", 49154))  # SmolLM2 + 2 spéciaux
-    model = ThoughtBankLM(ThoughtBankConfig(**mcfg)).to(device=device,
-                                                        dtype=dtype).eval()
+    model = ThoughtBankLM(ThoughtBankConfig(**mcfg)).to(device).eval()
+    dtype = torch.float32
     for p in model.parameters():
         p.requires_grad_(False)
     n_par = model.num_params()
@@ -75,12 +78,13 @@ def measure(raw: dict, dtype: torch.dtype, device) -> dict:
     torch.cuda.reset_peak_memory_stats(device)
     t0 = time.time()
     forks = mem_fork(bank, casc, G)
-    outs = [rollout(model, chunks, tgt, 8.0, 0.03, ids, rng, fb, fc, 0,
-                    seed_slots, max_mem, cmap) for fb, fc in forks]
-    a_open = torch.tensor([[5]], dtype=torch.long, device=device)
-    txt_ids = decode_lb(model, a_open, outs[0]["bank"],
-                        _lb(outs[0]["casc"], outs[0]["bank"], cmap),
-                        int(r.get("max_new", 64)), -1, amp=False)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
+        outs = [rollout(model, chunks, tgt, 8.0, 0.03, ids, rng, fb, fc, 0,
+                        seed_slots, max_mem, cmap) for fb, fc in forks]
+        a_open = torch.tensor([[5]], dtype=torch.long, device=device)
+        txt_ids = decode_lb(model, a_open, outs[0]["bank"],
+                            _lb(outs[0]["casc"], outs[0]["bank"], cmap),
+                            int(r.get("max_new", 64)), -1, amp=False)
     dt = time.time() - t0
     peak = torch.cuda.max_memory_allocated(device) / 2**30
     del model, outs, forks, chunks
@@ -97,18 +101,18 @@ def main(cfg_path: str) -> None:
     raw = yaml.safe_load(open(cfg_path))
     print(f"device {torch.cuda.get_device_name(device)} ({total:.1f} GB) | "
           f"config {cfg_path}", flush=True)
-    for dtype in (torch.float32, torch.bfloat16):
+    for tag, autocast in (("fp32", False), ("autocast_bf16", True)):
         try:
-            m = measure(raw, dtype, device)
+            m = measure(raw, autocast, device)
             verdict = "OK" if m["peak_gb"] < total * 0.85 else "TIGHT"
-            print(f"{str(dtype):>14}: peak {m['peak_gb']:.2f} GB / {total:.1f} GB "
+            print(f"{tag:>14}: peak {m['peak_gb']:.2f} GB / {total:.1f} GB "
                   f"[{verdict}] | {m['params']:,} params | "
                   f"group G={m['G']} x {m['turns']} turns x {m['chunk_len']} tok "
                   f"+ decode {m['decoded']} in {m['s_group']:.1f}s "
                   f"({m['s_group']/m['G']:.1f}s/rollout)", flush=True)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
-            print(f"{str(dtype):>14}: OOM — does not fit", flush=True)
+            print(f"{tag:>14}: OOM — does not fit", flush=True)
 
 
 if __name__ == "__main__":
