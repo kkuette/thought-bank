@@ -576,9 +576,14 @@ def main(cfg_path: str, resume: bool = False) -> None:
             from .math_school_data import MathSchoolStream as _ChatStream
         elif sname == "persona":
             from .persona_chat_data import PersonaChatStream as _ChatStream
+        elif sname == "sota_session":
+            from .sota_session_data import SotaSessionStream as _ChatStream
+        elif sname == "chat_mix":
+            from .chat_mix import ChatMixStream as _ChatStream
         else:
             raise ValueError(f"chat.stream: unknown stream {sname!r} "
-                             "(math_school | persona)")
+                             "(math_school | persona | sota_session | "
+                             "chat_mix)")
         gen_kw = dict(chat_cfg.get("gen", {}) or {})
         chat_stream = _ChatStream(tok, seed=train_seed + 1, **gen_kw)
         chat_eval = _ChatStream(tok, seed=1234, **gen_kw)
