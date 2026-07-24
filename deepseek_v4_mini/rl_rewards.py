@@ -161,6 +161,26 @@ def grade_calls(pred_text: str, golds: List[dict]) -> float:
     return tot / len(golds)
 
 
+# ── code extraction (exec envs) ──────────────────────────────────────────────
+
+_CODE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
+
+
+def extract_code(text: str) -> str:
+    """Candidate solution from rollout text: first fenced block wins (python
+    fences first, then any fence with a def/class/import inside); bare text
+    that LOOKS like code (starts a def/class/import somewhere) is the
+    fallback. Returns "" when nothing code-like is found."""
+    fences = _CODE_FENCE.findall(text)
+    for f in fences:
+        if re.search(r"^\s*(def |class |import |from )", f, re.M):
+            return f.strip()
+    if fences:
+        return fences[0].strip()
+    m = re.search(r"^(?:def |class |import |from )", text, re.M)
+    return text[m.start():].strip() if m else ""
+
+
 # ── think economy ────────────────────────────────────────────────────────────
 
 def think_economy(success: float, n_think: int, n_max: int,
@@ -183,6 +203,22 @@ def make_tool_reward(n_max: int, floor: float = 0.4
     info: {"text": str, "gold_calls": [..], "n_think": int}"""
     def fn(ce, info):
         s = grade_calls(info["text"], info["gold_calls"])
+        return think_economy(s, int(info.get("n_think", 0)), n_max, floor)
+    return fn
+
+
+def make_exec_reward(n_max: int, floor: float = 0.4, timeout: float = 6.0
+                     ) -> Callable[[Optional[float], dict], float]:
+    """EnvSpec.reward_fn for code-exec envs: extract the solution from the
+    rollout text, run the episode's unit tests in the sandbox, success =
+    fraction passed, then the same think economy as tool envs.
+
+    info: {"text": str, "tests": [assert-str, ...], "n_think": int}"""
+    from .exec_sandbox import pass_frac
+
+    def fn(ce, info):
+        s = pass_frac(extract_code(info["text"]), info["tests"],
+                      timeout=timeout)
         return think_economy(s, int(info.get("n_think", 0)), n_max, floor)
     return fn
 
@@ -239,7 +275,29 @@ def _self_test() -> None:
     r = fn(None, {"text": t, "gold_calls": [g], "n_think": 4})
     assert abs(r - think_economy(1.0, 4, 8)) < 1e-9
 
-    print("rl_rewards self-test: OK (extraction, grading, matching, economy)")
+    # code extraction: fenced python, generic fence with code, bare, none
+    body = "def add(a, b):\n    return a + b"
+    assert extract_code(f"Sure!\n```python\n{body}\n```\ndone") == body
+    assert extract_code(f"```\n{body}\n```") == body
+    assert extract_code(f"chat chat\n{body}\nmore chat").startswith("def add")
+    assert extract_code("no code at all") == ""
+    # prefers the fence that actually contains code
+    two_f = f"```\njust text\n```\n```python\n{body}\n```"
+    assert extract_code(two_f) == body
+
+    # exec reward end-to-end (real sandbox)
+    fx = make_exec_reward(n_max=8)
+    txt = f"Here you go:\n```python\n{body}\n```"
+    ts = ["assert add(1, 2) == 3", "assert add(0, 0) == 0"]
+    assert abs(fx(None, {"text": txt, "tests": ts, "n_think": 2})
+               - think_economy(1.0, 2, 8)) < 1e-9
+    half = fx(None, {"text": txt, "tests": ts + ["assert add(1, 1) == 3"] * 2,
+                     "n_think": 0})
+    assert abs(half - 0.5) < 1e-9              # 2/4 tests, eff=1 at n_think 0
+    assert fx(None, {"text": "no code", "tests": ts, "n_think": 0}) == 0.0
+    assert fx(None, {"text": txt, "tests": ts, "n_think": 9}) == 0.0
+
+    print("rl_rewards self-test: OK (extraction, grading, matching, economy, code+exec)")
 
 
 if __name__ == "__main__":

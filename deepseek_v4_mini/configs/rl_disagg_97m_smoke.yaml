@@ -55,7 +55,7 @@ data:
   - name: code
     kind: code
     dataset: codeparrot/codeparrot-clean
-    weight: 0.4
+    weight: 0.3
     n_files: 3000
     stream_cap: 90000
     lambda_write: 0.03
@@ -65,13 +65,13 @@ data:
     config_name: sample-10BT
     content_key: text
     min_chunks: 2
-    weight: 0.3
+    weight: 0.2
     n_files: 3000
     stream_cap: 250000
     lambda_write: 0.03
   - name: tools                            # rubric vérifiable (rl_rewards) ;
     kind: tool                             # lambda_write 0 : l'économie think
-    weight: 0.3                            # est DANS le reward (n_max + floor)
+    weight: 0.25                           # est DANS le reward (n_max + floor)
     lambda_write: 0.0
     gen:
       datasets: ['nvidia/Nemotron-Agentic-v1#tool_calling']  # CC-BY-4.0, non gated
@@ -80,6 +80,21 @@ data:
       max_turn_tok: 192
       max_schema_tok: 256
       eps_per_session: [2, 5]
+      real_cache_dir: /mnt/tb/data_cache
+      surprisal_mode: sif
+      sif_a: 1.0e-04
+  - name: exec                             # rubric exec_sandbox (tests passés
+    kind: exec                             # x économie think) — valide le
+    weight: 0.25                           # chemin subprocess sur les rigs
+    lambda_write: 0.0
+    max_new: 128                           # budget décodage tour code (smoke)
+    gen:
+      dataset: nvidia/OpenCodeInstruct     # CC-BY-4.0 (open-r1/PrimeIntellect
+      problem_cap: 6000                    # = sans licence déclarée : exclus)
+      max_problem_tok: 256                 # params = cache semé sur le NAS
+      max_code_tok: 224
+      max_tests: 8
+      probs_per_session: [2, 4]
       real_cache_dir: /mnt/tb/data_cache
       surprisal_mode: sif
       sif_a: 1.0e-04

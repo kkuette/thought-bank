@@ -10,8 +10,8 @@ trainer only learns one new name ("chat_mix").
 
   gen:
     streams:
-    - stream: sota_session        # sota_session | tool_session | persona |
-      weight: 0.8                 #   math_school
+    - stream: sota_session        # sota_session | tool_session | code_exec |
+      weight: 0.8                 #   persona | math_school
       gen: {...}                  # kwargs of that stream
     - stream: tool_session
       weight: 0.2
@@ -66,6 +66,8 @@ def _build(name: str, tok, seed: int, gen: dict):
         from .sota_session_data import SotaSessionStream as C
     elif name == "tool_session":
         from .tool_env_data import ToolSessionStream as C
+    elif name == "code_exec":
+        from .code_exec_data import CodeExecStream as C
     elif name == "persona":
         from .persona_chat_data import PersonaChatStream as C
     elif name == "math_school":

@@ -61,7 +61,7 @@ from .rl_defer_grpo import pos_write_corr
 from .rl_defer_grpo_lives import (_lb, boundary_step, defer_ce, forced_reward,
                                   grpo_backward, rollout)
 from .rl_lives import EnvMixer, EnvSpec, Life, LivesState, mem_fork
-from .rl_rewards import make_tool_reward
+from .rl_rewards import make_exec_reward, make_tool_reward
 
 
 # ── shared-FS primitives ─────────────────────────────────────────────────────
@@ -214,9 +214,10 @@ def group_to_device(g: dict, device, dtype):
 
 def build_envs(d: dict, r: dict, tok, seed: int):
     """EnvSpecs from the config's data.envs. kind: code (CodeChunkStream,
-    dense -ce), tool (ToolSessionStream + verifiable rubric), sota
-    (SotaSessionStream, dense). Chat-kind streams return conv DICTS —
-    sample_episode below normalizes both shapes."""
+    dense -ce), tool (ToolSessionStream + verifiable rubric), exec
+    (CodeExecStream + sandboxed unit tests), sota (SotaSessionStream, dense).
+    Chat-kind streams return conv DICTS — sample_episode below normalizes
+    both shapes."""
     from .code_data import CodeChunkStream
     envs = []
     for i, e in enumerate(d["envs"]):
@@ -242,6 +243,14 @@ def build_envs(d: dict, r: dict, tok, seed: int):
                                        **(e.get("gen") or {}))
             fn = make_tool_reward(int(r.get("think_nmax", 8)),
                                   float(r.get("think_floor", 0.4)))
+            envs.append(EnvSpec(e["name"], stream, weight=w, reward_fn=fn))
+        elif kind == "exec":
+            from .code_exec_data import CodeExecStream
+            stream = CodeExecStream(tok, seed=seed + 31 * i,
+                                    **(e.get("gen") or {}))
+            fn = make_exec_reward(int(r.get("think_nmax", 8)),
+                                  float(r.get("think_floor", 0.4)),
+                                  float(e.get("exec_timeout", 6.0)))
             envs.append(EnvSpec(e["name"], stream, weight=w, reward_fn=fn))
         elif kind == "sota":
             from .sota_session_data import SotaSessionStream
@@ -347,6 +356,9 @@ class Worker:
         self.max_mem = int(self.mcfg["max_mem"])
         self.seed_slots = int(self.mcfg.get("mem_seed_slots", 0))
         self.max_new = int(r.get("max_new", 64))
+        # per-env decode budget (code turns need more than call turns)
+        self.max_new_env = {e["name"]: int(e.get("max_new", self.max_new))
+                            for e in d["envs"]}
         self.amp = bool(r.get("amp", True))
         stop = "<|im_end|>"
         self.stop_id = (self.tok.convert_tokens_to_ids(stop)
@@ -408,12 +420,16 @@ class Worker:
         if env.reward_fn is None:
             return -ro["ce"] - lam * ro["n_writes"]
         lb = _lb(ro["casc"], ro["bank"], self.cmap)
+        max_new = self.max_new_env.get(env.name, self.max_new)
         txt = self.tok.decode(decode_lb(self.model, self.a_open, ro["bank"],
-                                        lb, self.max_new, self.stop_id,
+                                        lb, max_new, self.stop_id,
                                         self.amp)[0].tolist())
-        golds = info.get("gold_calls") or [[]]
-        return env.reward(ro["ce"], {"text": txt, "gold_calls": golds[-1],
-                                     "n_think": ro["n_writes"]})
+        # rubric payload: the LAST episode's gold, whichever family (tool
+        # envs read gold_calls, exec envs read tests)
+        return env.reward(ro["ce"], {
+            "text": txt, "n_think": ro["n_writes"],
+            "gold_calls": (info.get("gold_calls") or [[]])[-1],
+            "tests": (info.get("tests") or [[]])[-1]})
 
     # ── one group ────────────────────────────────────────────────────────────
     def one_group(self):
@@ -709,13 +725,15 @@ def _self_test():
                             use_dual_stream=True)
     model = ThoughtBankLM(cfg)
 
-    class _Tok:                                # decode returns a gradeable call
+    class _Tok:                                # decode: call / code / garbage
         def __init__(self, rng):
             self._r = rng
 
         def decode(self, ids):
-            return ('{"name": "fn_0", "arguments": {"x": 0}}'
-                    if self._r.random() < 0.5 else "not a call")
+            return self._r.choice(
+                ['{"name": "fn_0", "arguments": {"x": 0}}',
+                 "```python\ndef add(a, b):\n    return a + b\n```",
+                 "not a call"])
 
         def get_vocab(self):
             return {"<think>": THINK, "<blank>": BLANK, "<|im_end|>": IM_END}
@@ -740,6 +758,19 @@ def _self_test():
                     "info": {"gold_calls":
                              [[{"name": "fn_0", "arguments": {"x": 0}}]]}}
 
+    class ExecStub:
+        """Chat-shaped conv dicts with tests (exec bridge, REAL sandbox)."""
+
+        def __init__(self, seed):
+            self.rng = _random.Random(seed)
+
+        def next_conv(self):
+            n = self.rng.randint(3, 5)
+            segs = [{"input_ids": torch.randint(4, V, (1, 12))}
+                    for _ in range(n)]
+            return {"kind": "codeexec", "segs": segs,
+                    "info": {"tests": [["assert add(1, 2) == 3"]]}}
+
     class CodeStub:
         def __init__(self, seed):
             self.rng = _random.Random(seed)
@@ -751,7 +782,9 @@ def _self_test():
     raw = {"model": {"n_layers": 2, "max_mem": 4, "mem_seed_slots": 2},
            "data": {"defer_len": 8,
                     "envs": [{"name": "code", "lambda_write": 0.03},
-                             {"name": "tools", "lambda_write": 0.0}]},
+                             {"name": "tools", "lambda_write": 0.0},
+                             {"name": "exec", "lambda_write": 0.0,
+                              "max_new": 4}]},
            "rl": {"seed": 0, "steps": 3, "group_size": 4,
                   # temp 8: a random tiny model has p(think) ~ 1/V => every
                   # group degenerates (no writes anywhere); flattening the
@@ -781,7 +814,9 @@ def _self_test():
     tok = _Tok(_random.Random(3))
     envs = [EnvSpec("code", CodeStub(1), weight=1.0),
             EnvSpec("tools", StubStream(2), weight=1.0,
-                    reward_fn=make_tool_reward(8))]
+                    reward_fn=make_tool_reward(8)),
+            EnvSpec("exec", ExecStub(4), weight=1.0,
+                    reward_fn=make_exec_reward(8))]
     w = Worker(raw, 0, tok=tok, model=copy.deepcopy(model), envs=envs,
                device=torch.device("cpu"))
     w.ids = (THINK, BLANK)
@@ -790,13 +825,13 @@ def _self_test():
     w.wait_weights()
     assert w.wstep == 0
     lines = []
-    while len(lines) < 6:
+    while len(lines) < 9 or \
+            {ln["env"] for ln in lines} != {"code", "tools", "exec"}:
         got = w.one_group()
         if got:
             lines.append(got)
-    assert w.store.pending() == 6
-    envs_seen = {ln["env"] for ln in lines}
-    assert envs_seen == {"code", "tools"}      # both reward paths exercised
+    assert w.store.pending() == len(lines)
+    envs_seen = {ln["env"] for ln in lines}    # all three reward paths
     assert lines[0]["turns"] > 0
 
     # 4. staleness: a group tagged far behind gets quarantined
@@ -806,16 +841,16 @@ def _self_test():
     w.store.put(g_old, weights_step=-10, worker=9)
 
     # 5. learner consumes (quarantining the stale one), steps, republishes
-    groups, n_stale = learner.store.take(8, -5)
-    assert n_stale == 1 and len(groups) == 6
+    groups, n_stale = learner.store.take(len(lines) + 2, -5)
+    assert n_stale == 1 and len(groups) == len(lines)
     line = learner.step_once(groups)
-    assert line["step"] == 1 and line["groups"] == 6
+    assert line["step"] == 1 and line["groups"] == len(lines)
     assert hub.latest_step() == 1
     assert w.refresh() and w.wstep == 1
 
-    # 6. rewards sane: tool rewards within [0, 1]
+    # 6. rewards sane: rubric rewards (tools AND exec) within [0, 1]
     for g in groups:
-        if g["env"] == "tools":
+        if g["env"] in ("tools", "exec"):
             assert all(0.0 <= ro["reward"] <= 1.0 for ro in g["rollouts"])
 
     # 7. lives persisted + xdom probe returns the four figures

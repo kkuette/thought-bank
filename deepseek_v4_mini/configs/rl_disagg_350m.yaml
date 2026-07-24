@@ -53,13 +53,13 @@ data:
   - name: code
     kind: code
     dataset: codeparrot/codeparrot-clean
-    weight: 0.30
+    weight: 0.20
     n_files: 3000
     stream_cap: 90000
     lambda_write: 0.03
   - name: sota                             # sessions réelles longues (dense) :
     kind: sota                             # la pression mémoire du SFT continue
-    weight: 0.30                           # d'exister dans le mix RL
+    weight: 0.25                           # d'exister dans le mix RL
     lambda_write: 0.03
     gen:
       real_cache_dir: /mnt/tb/data_cache
@@ -71,9 +71,9 @@ data:
       n_requote: [1, 2]
       surprisal_mode: sif
       sif_a: 1.0e-04
-  - name: tools                            # LA cible du cliquet : grader
+  - name: tools                            # cible cliquet 1 : grader
     kind: tool                             # vérifiable + économie think
-    weight: 0.40
+    weight: 0.30
     lambda_write: 0.0
     gen:
       datasets:                          # CC-BY-4.0 / Apache — libres pour
@@ -88,13 +88,31 @@ data:
       real_cache_dir: /mnt/tb/data_cache
       surprisal_mode: sif
       sif_a: 1.0e-04
+  - name: exec                             # cible cliquet 2 : exécution de
+    kind: exec                             # code — le juge = l'interpréteur
+    weight: 0.25                           # (exec_sandbox, tests passés x
+    lambda_write: 0.0                      # économie think)
+    max_new: 240                           # tour code complet (code 224 tok +
+                                           # fence) : ~4x le coût décodage du
+                                           # tour d'appel tools — compté dans
+                                           # le débit s/group des workers
+    gen:
+      dataset: nvidia/OpenCodeInstruct     # CC-BY-4.0 ; golds vérifiés en
+      problem_cap: 6000                    # sandbox au seed (grade(gold)=1)
+      max_problem_tok: 256                 # (open-r1/PrimeIntellect : pas de
+      max_code_tok: 224                    # licence déclarée => exclus, même
+      max_tests: 8                         # règle qu'APIGen-MT)
+      probs_per_session: [2, 4]
+      real_cache_dir: /mnt/tb/data_cache
+      surprisal_mode: sif
+      sif_a: 1.0e-04
 
 rl:
   seed: 0
   train_scope: think_row                   # ancre du cliquet ; élargir SEULEMENT
                                            # sur verdict (post-mortem v1 : le
                                            # full-model RL érode le backbone)
-  init_from: /mnt/tb/checkpoints/v350_sft_sota/step_800.pt   # AJUSTER au ckpt final SFT
+  init_from: /mnt/tb/checkpoints/v350_sft_sota_rw4_tools_exec/step_800.pt   # AJUSTER au ckpt final SFT
   n_lives_per_worker: 2
   max_episodes_per_life: 0
   cascade_depth: 4                         # banque complète V3 (comme le SFT)
